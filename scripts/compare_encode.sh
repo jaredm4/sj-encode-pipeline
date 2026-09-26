@@ -1,13 +1,20 @@
 #!/bin/bash
 # compare_encode.sh - score an existing encode against its original with VMAF.
 #
-# Usage:  ./compare_encode.sh ORIGINAL ENCODE [offset_seconds ...]
+# Usage:  ./compare_encode.sh [--full] ORIGINAL ENCODE [offset_seconds ...]
 #   No offsets given: 5 clips at 10/30/50/70/90% of the duration.
 #   Example matching earlier tests: ./compare_encode.sh orig.mkv enc.mkv 600 1500 2100 2250
+#   --full: score the ENTIRE file in one pass instead of sampling clips. Any trailing
+#           offset_seconds arguments are ignored in this mode. Alignment is checked once,
+#           at the file's midpoint, and that single shift is applied across the whole file
+#           -- it will NOT catch drift that starts partway through (use the default
+#           clip-sampling mode with offsets spanning the file to find that first). This is
+#           much slower: expect close to real-time-per-frame-decoded x2 (both files decode
+#           the whole runtime), so a 2-hour film can take a couple of hours.
 #
-# Env overrides: VMAF (libvmaf ffmpeg path), FPS (default 24000/1001), CLIP (seconds, 60),
-#                SUB (n_subsample, 5), THREADS (4),
-#                WORK (scratch dir)
+# Env overrides: FFMPEG (ffmpeg binary with libvmaf built in; default: "ffmpeg" via $PATH),
+#                FPS (default 24000/1001), CLIP (seconds, 60), SUB (n_subsample, 5),
+#                THREADS (4), WORK (scratch dir)
 #
 # Uses frame-order timestamps (setpts=N/fps/TB) and checks alignment INDEPENDENTLY at each
 # clip (not just once globally), since drift can start partway through a file even when the
@@ -21,20 +28,28 @@
 
 set -u
 
-VMAF=${VMAF:-/scripts/ffmpeg-vmaf}
+FFMPEG=${FFMPEG:-ffmpeg}
 FPS=${FPS:-24000/1001}
 CLIP=${CLIP:-60}
 SUB=${SUB:-5}
 THREADS=${THREADS:-4}
 WORK=${WORK:-/tmp/vmaf_compare}
 
+FULL=0
+if [ "${1:-}" = "--full" ]; then FULL=1; shift; fi
+
 if [ $# -lt 2 ]; then
-  echo "usage: $0 ORIGINAL ENCODE [offset_seconds ...]"; exit 1
+  echo "usage: $0 [--full] ORIGINAL ENCODE [offset_seconds ...]"; exit 1
 fi
 ORIG=$1; ENC=$2; shift 2
+if [ "$FULL" -eq 1 ] && [ $# -gt 0 ]; then
+  echo "note: --full ignores the offset_seconds arguments ($*); scoring the whole file."
+  shift $#
+fi
 [ -f "$ORIG" ] || { echo "not found: $ORIG"; exit 1; }
 [ -f "$ENC" ]  || { echo "not found: $ENC"; exit 1; }
-[ -x "$VMAF" ] || { echo "VMAF binary not executable: $VMAF"; exit 1; }
+command -v "$FFMPEG" >/dev/null 2>&1 || { echo "ffmpeg not found: $FFMPEG (set FFMPEG=/path/to/ffmpeg-with-libvmaf, or put one on \$PATH)"; exit 1; }
+"$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q libvmaf || echo "WARNING: '$FFMPEG -filters' does not list libvmaf; scoring will likely fail."
 command -v python3 >/dev/null || { echo "python3 is required for the statistics"; exit 1; }
 
 mkdir -p "$WORK"
@@ -43,7 +58,7 @@ TS="setpts=N/(${FPS})/TB"
 
 # duration in whole seconds, read via ffmpeg
 dur() {
-  "$VMAF" -hide_banner -i "$1" 2>&1 | awk '/Duration:/ {
+  "$FFMPEG" -hide_banner -i "$1" 2>&1 | awk '/Duration:/ {
     gsub(",", "", $2); split($2, t, ":"); printf "%d", t[1]*3600 + t[2]*60 + t[3]; exit }'
 }
 
@@ -60,7 +75,7 @@ if [ "$DIFF" -gt 2 ]; then
 fi
 
 # ---- Frame sizes: handle cropped or scaled encodes ----
-size_of() { "$VMAF" -hide_banner -i "$1" 2>&1 | grep -m1 'Video:' | grep -oE '[0-9]{3,5}x[0-9]{3,5}' | head -1; }
+size_of() { "$FFMPEG" -hide_banner -i "$1" 2>&1 | grep -m1 'Video:' | grep -oE '[0-9]{3,5}x[0-9]{3,5}' | head -1; }
 SO=$(size_of "$ORIG"); SE=$(size_of "$ENC")
 OW=${SO%x*}; OH=${SO#*x}; EW=${SE%x*}; EH=${SE#*x}
 DSCALE=""; RCROP=""
@@ -85,14 +100,18 @@ if [ -n "${CROP:-}" ]; then
   echo "CROP=${CROP}: comparing the center ${CROP} region of both files."
 fi
 
-if [ $# -gt 0 ]; then
-  OFFS=("$@")
+if [ "$FULL" -eq 1 ]; then
+  OFFS=()   # unused in full mode; kept for messages below
 else
-  OFFS=()
-  for p in 10 30 50 70 90; do
-    o=$(( DO * p / 100 - CLIP / 2 )); [ "$o" -lt 0 ] && o=0
-    OFFS+=("$o")
-  done
+  if [ $# -gt 0 ]; then
+    OFFS=("$@")
+  else
+    OFFS=()
+    for p in 10 30 50 70 90; do
+      o=$(( DO * p / 100 - CLIP / 2 )); [ "$o" -lt 0 ] && o=0
+      OFFS+=("$o")
+    done
+  fi
 fi
 
 # run_score <enc_trim> <ref_trim> <offset> <length> <subsample> [json_path]
@@ -101,7 +120,7 @@ run_score() {
   local dt="$1" rt="$2" off="$3" len="$4" sub="$5" json="${6:-}"
   local opts="n_subsample=${sub}:n_threads=${THREADS}"
   [ -n "$json" ] && opts="${opts}:log_fmt=json:log_path=${json}"
-  "$VMAF" -hide_banner -nostats \
+  "$FFMPEG" -hide_banner -nostats \
     -ss "$off" -t "$len" -i "$ENC" \
     -ss "$off" -t "$len" -i "$ORIG" -an -sn \
     -lavfi "[0:v:0]${dt}${DSCALE}${TS},format=yuv420p10le[d];[1:v:0]${rt}${RCROP}${TS},format=yuv420p10le[r];[d][r]libvmaf=${opts}" \
@@ -143,12 +162,21 @@ align_and_score() {
 }
 
 echo
-for off in "${OFFS[@]}"; do
-  read -r DT RT <<< "$(align_and_score "$off")"
-  echo -n "Scoring ${CLIP}s @ ${off}s ... "
-  run_score "$DT" "$RT" "$off" "$CLIP" "$SUB" "$WORK/clip_${off}.json" 2>>"$WORK/errors.log"
-  if [ -s "$WORK/clip_${off}.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
-done
+if [ "$FULL" -eq 1 ]; then
+  probe_off=$(( DO / 2 ))
+  echo "Full-file mode: checking alignment at the midpoint (${probe_off}s) ..."
+  read -r DT RT <<< "$(align_and_score "$probe_off")"
+  echo -n "Scoring the entire file (${DO}s) ... "
+  run_score "$DT" "$RT" 0 "$DO" "$SUB" "$WORK/clip_0.json" 2>>"$WORK/errors.log"
+  if [ -s "$WORK/clip_0.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
+else
+  for off in "${OFFS[@]}"; do
+    read -r DT RT <<< "$(align_and_score "$off")"
+    echo -n "Scoring ${CLIP}s @ ${off}s ... "
+    run_score "$DT" "$RT" "$off" "$CLIP" "$SUB" "$WORK/clip_${off}.json" 2>>"$WORK/errors.log"
+    if [ -s "$WORK/clip_${off}.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
+  done
+fi
 
 shopt -s nullglob
 JSONS=("$WORK"/clip_*.json)
