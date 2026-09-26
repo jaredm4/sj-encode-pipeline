@@ -5,12 +5,14 @@
 #   No offsets given: 5 clips at 10/30/50/70/90% of the duration.
 #   Example matching earlier tests: ./compare_encode.sh orig.mkv enc.mkv 600 1500 2100 2250
 #   --full: score the ENTIRE file in one pass instead of sampling clips. Any trailing
-#           offset_seconds arguments are ignored in this mode. Alignment is checked once,
-#           at the file's midpoint, and that single shift is applied across the whole file
-#           -- it will NOT catch drift that starts partway through (use the default
-#           clip-sampling mode with offsets spanning the file to find that first). This is
-#           much slower: expect close to real-time-per-frame-decoded x2 (both files decode
-#           the whole runtime), so a 2-hour film can take a couple of hours.
+#           offset_seconds arguments are ignored in this mode. Alignment is checked at the
+#           10%, 50%, and 90% marks; if all three agree on the same frame shift, that shift
+#           is applied across the whole file with high (but not absolute) confidence nothing
+#           drifts in between. If they disagree, the midpoint's shift is used with a warning
+#           -- this means something changes between those points, and the default clip-
+#           sampling mode with offsets spanning the file should be used to find where. This
+#           mode is much slower: expect close to real-time-per-frame-decoded x2 (both files
+#           decode the whole runtime), so a 2-hour film can take a couple of hours.
 #
 # Env overrides: FFMPEG (ffmpeg binary with libvmaf built in; default: "ffmpeg" via $PATH),
 #                FPS (default 24000/1001), CLIP (seconds, 60), SUB (n_subsample, 5),
@@ -131,12 +133,10 @@ quick() {  # prints mean VMAF or nothing
   run_score "$1" "$2" "$3" 20 4 2>&1 | grep -o 'VMAF score: [0-9.]*' | awk '{print $3}'
 }
 
-# ---- Per-clip alignment check + score ----
-# For each offset, try shift -2..+2 frames on a quick 20s window and keep whichever the
-# scores say is best aligned (score > all others by a clear margin), then score the full
-# clip with that shift. Drift beyond +/-2 frames at a given offset is reported as unresolved
-# rather than guessed at.
-align_and_score() {
+# ---- Alignment probing (shared by per-clip mode and --full mode) ----
+# Tries shift -2..+2 frames on a quick 20s window at a given offset and reports which
+# scores best. Prints "<best_shift> <best_score>" on stdout; diagnostics go to stderr.
+probe_shift() {
   local off="$1"
   local best_shift=0 best_score=-1 s score
   local results=""
@@ -148,24 +148,61 @@ align_and_score() {
     results="${results}${s}:${score} "
     awk -v sc="$score" -v best="$best_score" 'BEGIN{exit !(sc>best)}' && { best_score=$score; best_shift=$s; }
   done
-  echo "  shift scores @ ${off}s: ${results}-> using shift ${best_shift} (score ${best_score})" >&2
+  echo "  shift scores @ ${off}s: ${results}-> best shift ${best_shift} (score ${best_score})" >&2
+  echo "$best_shift $best_score"
+}
+
+# Given a frame-shift integer, echoes "<enc_trim> <ref_trim>" filter-chain fragments
+# (either may be empty) that compensate for it.
+trim_for_shift() {
+  local shift="$1"
+  if [ "$shift" -gt 0 ]; then
+    echo "trim=start_frame=$shift,setpts=PTS-STARTPTS," ""
+  elif [ "$shift" -lt 0 ]; then
+    echo "" "trim=start_frame=$(( -shift )),setpts=PTS-STARTPTS,"
+  else
+    echo "" ""
+  fi
+}
+
+# ---- Per-clip alignment check + score ----
+# For each offset, find the best shift with probe_shift() and echo the corresponding
+# "<enc_trim> <ref_trim>" pair. Drift beyond +/-2 frames at a given offset is flagged as
+# unresolved rather than guessed at.
+align_and_score() {
+  local off="$1"
+  local best_shift best_score
+  read -r best_shift best_score <<< "$(probe_shift "$off")"
   if awk -v b="$best_score" 'BEGIN{exit !(b<50)}'; then
     echo "  WARNING: no shift in -2..+2 scored above 50 at ${off}s; drift here exceeds what this" >&2
     echo "           script compensates for, or there is a genuine content difference. Treat this" >&2
     echo "           clip's score as unreliable." >&2
   fi
-  if [ "$best_shift" -ge 0 ]; then
-    echo "trim=start_frame=$best_shift,setpts=PTS-STARTPTS," ""
-  else
-    echo "" "trim=start_frame=$(( -best_shift )),setpts=PTS-STARTPTS,"
-  fi
+  trim_for_shift "$best_shift"
 }
 
 echo
 if [ "$FULL" -eq 1 ]; then
-  probe_off=$(( DO / 2 ))
-  echo "Full-file mode: checking alignment at the midpoint (${probe_off}s) ..."
-  read -r DT RT <<< "$(align_and_score "$probe_off")"
+  P10=$(( DO * 10 / 100 )); P50=$(( DO / 2 )); P90=$(( DO * 90 / 100 ))
+  echo "Full-file mode: checking alignment at 10% (${P10}s), 50% (${P50}s), and 90% (${P90}s) ..."
+  read -r S10 SC10 <<< "$(probe_shift "$P10")"
+  read -r S50 SC50 <<< "$(probe_shift "$P50")"
+  read -r S90 SC90 <<< "$(probe_shift "$P90")"
+  echo "  10%: shift ${S10} (score ${SC10})   50%: shift ${S50} (score ${SC50})   90%: shift ${S90} (score ${SC90})"
+
+  if [ "$S10" = "$S50" ] && [ "$S50" = "$S90" ]; then
+    echo "  -> consistent shift (${S10}) at all three points; applying it across the whole file."
+    CHOSEN=$S10
+  else
+    echo "  WARNING: alignment differs across the file (10%=${S10}, 50%=${S50}, 90%=${S90})."
+    echo "           This means drift starts somewhere between these points, or one of them is a"
+    echo "           genuine content mismatch. Using the midpoint's shift (${S50}) for the whole-"
+    echo "           file score, but treat this result with real caution -- run without --full and"
+    echo "           sample offsets between these three points to find where it actually changes."
+    CHOSEN=$S50
+  fi
+  read -r DT RT <<< "$(trim_for_shift "$CHOSEN")"
+
   echo -n "Scoring the entire file (${DO}s) ... "
   run_score "$DT" "$RT" 0 "$DO" "$SUB" "$WORK/clip_0.json" 2>>"$WORK/errors.log"
   if [ -s "$WORK/clip_0.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
