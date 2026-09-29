@@ -1,21 +1,20 @@
 <#
 .SYNOPSIS
-    Combines a FastFlix/NVEncC video encode with Blu-ray audio: every lossless master track,
-    each paired with an AC-3 compatibility track.
+    Combines a FastFlix/NVEncC video encode with the main Blu-ray audio track, plus an
+    AC-3 compatibility track for surround or an AAC encode for stereo.
 
 .DESCRIPTION
-    1. Every lossless audio track (TrueHD, DTS-HD MA, PCM, FLAC) is kept as a master.
-       TrueHD, DTS-HD MA and FLAC are copied; PCM is converted to FLAC (still lossless,
-       and MP4-friendly). If there is no lossless track, the largest lossy track is kept.
-    2. For each master, an AC-3 track is added according to -Ac3Mode. An existing AC-3
-       track is reused if it comes after the master, has the matching layout (5.1 for
-       5.1/6.1/7.1 masters, 2.0 for stereo, etc.), is at least -Ac3Bitrate, and hasn't
-       already been claimed by another master. Otherwise a new AC-3 track is encoded
-       from the master.
-    3. Output order: the primary master's AC-3 track first (default), then the primary
-       master, then the same pair for any other masters. All other source audio tracks
-       are dropped.
-    4. Prints the plan and the ffmpeg command, runs it, then checks the result
+    1. Picks the source audio track: the one flagged Default (first one if several),
+       else the first lossless track, else the first track. -SourceTrack overrides this.
+    2. Stereo or mono source: encoded to AAC (-AacBitrate). Nothing else is kept.
+       (An AAC source is copied instead of re-encoded.)
+    3. Surround source:
+         - Already AC-3: copied as the only audio track.
+         - Anything else: a new AC-3 5.1 track (-Ac3Bitrate) is encoded from it and
+           becomes the default, and the source itself is kept as the second track
+           (copied; PCM is converted to FLAC, which is still lossless).
+    4. All other source audio tracks are dropped.
+    5. Prints the plan and the ffmpeg command, runs it, then checks the result
        (audio tracks and the Dolby Vision configuration record).
 
     Only the first video stream of -VideoFile is used; any audio in it is ignored.
@@ -27,16 +26,12 @@
     The source MKV to take audio and chapters from.
 .PARAMETER OutputFile
     Defaults to "<VideoFile name>.muxed.mp4" next to VideoFile.
-.PARAMETER Ac3Mode
-    Always : add an AC-3 track for every master (default).
-    NoCore : skip AC-3 for DTS masters, whose DTS core already works on Roku, Shield
-             and most Android TV boxes. TrueHD, PCM and FLAC masters still get one.
-    Never  : no AC-3 tracks; masters only.
-.PARAMETER PrimaryTrack
-    Source audio track (0-based, as in ffmpeg's 1:a:N) to make the primary master.
-    Default: the master with the most channels, then the largest stream.
+.PARAMETER SourceTrack
+    Use this source audio track (0-based, as in ffmpeg's 1:a:N) instead of auto-detection.
+.PARAMETER AacBitrate
+    AAC bitrate in kbps for stereo sources (mono sources are capped at 256).
 .PARAMETER Ac3Bitrate
-    Bitrate in kbps for new AC-3 tracks, and the minimum for an existing one to be reused.
+    AC-3 bitrate in kbps for surround sources.
 .PARAMETER AudioLanguage
     ISO 639-2 language tag written on every audio track. Default 'eng'.
 .PARAMETER Force
@@ -45,17 +40,14 @@
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -VideoFile '.\S01E01.mp4' -SourceFile 'S:\Sources\S01E01.mkv' -WhatIf
     Shows the analysis, the plan and the ffmpeg command without running it.
-.EXAMPLE
-    .\Add-BluRayAudio.ps1 -VideoFile '.\Movie.mp4' -SourceFile 'S:\Sources\Movie.mkv' -PrimaryTrack 0
-    Makes the first source audio track (e.g. the original stereo mix) the default.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)][string]$VideoFile,
     [Parameter(Mandatory)][string]$SourceFile,
     [string]$OutputFile,
-    [ValidateSet('Always', 'NoCore', 'Never')][string]$Ac3Mode = 'Always',
-    [int]$PrimaryTrack = -1,
+    [int]$SourceTrack = -1,
+    [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
     [switch]$Force
@@ -86,31 +78,6 @@ function ConvertTo-Number($Value) {
     if ($ok) { return $n } else { return 0.0 }
 }
 
-function Get-AudioKind([string]$Format, [string]$Features) {
-    switch -Regex ($Format) {
-        '^MLP'    { return 'TrueHD' }
-        '^DTS'    { if ("$Format $Features" -match 'XLL') { return 'DTS-HD MA' } else { return 'DTS' } }
-        '^PCM'    { return 'PCM' }
-        '^FLAC'   { return 'FLAC' }
-        '^AC-3'   { return 'AC-3' }
-        '^E-AC-3' { return 'E-AC-3' }
-    }
-    return $Format
-}
-
-function Get-FfCodecPattern([string]$Kind) {
-    switch ($Kind) {
-        'TrueHD'    { return '^truehd$' }
-        'DTS-HD MA' { return '^dts$' }
-        'DTS'       { return '^dts$' }
-        'PCM'       { return '^pcm_' }
-        'FLAC'      { return '^flac$' }
-        'AC-3'      { return '^ac3$' }
-        'E-AC-3'    { return '^eac3$' }
-    }
-    return '.'
-}
-
 function Get-ChannelLabel([int]$Channels) {
     switch ($Channels) {
         8 { return '7.1' }
@@ -120,6 +87,28 @@ function Get-ChannelLabel([int]$Channels) {
         1 { return '1.0' }
     }
     return "$Channels ch"
+}
+
+function Get-FriendlyName([string]$Codec, [string]$Profile) {
+    if ($Codec -in @('dts', 'truehd') -and $Profile -and $Profile -ne 'unknown' -and $Profile -notmatch '^-?\d+$') {
+        return $Profile   # e.g. "DTS-HD MA", "DTS-HD MA + DTS:X", "Dolby TrueHD + Dolby Atmos"
+    }
+    switch -Regex ($Codec) {
+        '^truehd$' { return 'Dolby TrueHD' }
+        '^dts$'    { return 'DTS' }
+        '^ac3$'    { return 'Dolby Digital' }
+        '^eac3$'   { return 'Dolby Digital Plus' }
+        '^flac$'   { return 'FLAC' }
+        '^aac$'    { return 'AAC' }
+        '^pcm_'    { return 'PCM' }
+    }
+    return $Codec.ToUpper()
+}
+
+function Test-Lossless([string]$Codec, [string]$Profile) {
+    if ($Codec -match '^(truehd|mlp|flac|alac|pcm_.*)$') { return $true }
+    if ($Codec -eq 'dts' -and $Profile -like 'DTS-HD MA*') { return $true }
+    return $false
 }
 
 function Format-Arg([string]$Arg) {
@@ -138,15 +127,14 @@ function Test-DolbyVision($VideoStream) {
     return [bool](@($sideData | Where-Object { (Get-Field $_ 'side_data_type') -like 'DOVI*' }).Count)
 }
 
-function New-OutputTrack($SrcPos, [string]$Codec, [int]$Ac, [string]$Title, [string]$Note) {
-    return [pscustomobject]@{ SrcPos = $SrcPos; Codec = $Codec; Ac = $Ac; Title = $Title; Note = $Note }
+function New-OutputTrack([int]$SrcPos, [string]$Codec, [int]$Kbps, [int]$Ac, [string]$Title, [string]$Note) {
+    return [pscustomobject]@{ SrcPos = $SrcPos; Codec = $Codec; Kbps = $Kbps; Ac = $Ac; Title = $Title; Note = $Note }
 }
 
 # ---------------------------------------------------------------- setup
 
 $script:ffmpeg = Get-Tool 'ffmpeg'
 $script:ffprobe = Get-Tool 'ffprobe'
-$mediainfo = Get-Tool 'mediainfo'
 
 $VideoFile = (Resolve-Path -LiteralPath $VideoFile).ProviderPath
 $SourceFile = (Resolve-Path -LiteralPath $SourceFile).ProviderPath
@@ -171,123 +159,81 @@ if (-not (Test-DolbyVision $videoStreams[0])) {
 
 # ---------------------------------------------------------------- inspect audio
 
-$miRaw = & $mediainfo --Output=JSON $SourceFile | Out-String
-if ([string]::IsNullOrWhiteSpace($miRaw)) {
-    throw 'MediaInfo returned nothing. Make sure the MediaInfo CLI (not the GUI) is on PATH.'
-}
-$miAudio = @((ConvertFrom-Json $miRaw).media.track | Where-Object { (Get-Field $_ '@type') -eq 'Audio' })
-$fpAudio = @(Get-Streams $SourceFile | Where-Object { $_.codec_type -eq 'audio' })
+$srcAudio = @(Get-Streams $SourceFile | Where-Object { $_.codec_type -eq 'audio' })
+if ($srcAudio.Count -eq 0) { throw "No audio tracks found in $SourceFile" }
 
-if ($miAudio.Count -eq 0) { throw "No audio tracks found in $SourceFile" }
-if ($miAudio.Count -ne $fpAudio.Count) {
-    throw "MediaInfo sees $($miAudio.Count) audio tracks but ffprobe sees $($fpAudio.Count); refusing to guess the mapping."
-}
-
-$audio = @(for ($i = 0; $i -lt $miAudio.Count; $i++) {
-    $t = $miAudio[$i]
-    $kind = Get-AudioKind (Get-Field $t 'Format') (Get-Field $t 'Format_AdditionalFeatures')
-    $bitrate = ConvertTo-Number (Get-Field $t 'BitRate')
-    $size = ConvertTo-Number (Get-Field $t 'StreamSize')
-    if ($size -le 0) { $size = $bitrate * (ConvertTo-Number (Get-Field $t 'Duration')) / 8 }
-    $name = Get-Field $t 'Format_Commercial_IfAny'
-    if (-not $name) { $name = $kind }
+$audio = @(for ($i = 0; $i -lt $srcAudio.Count; $i++) {
+    $s = $srcAudio[$i]
+    $codec = [string]$s.codec_name
+    $profile = [string](Get-Field $s 'profile')
+    $tags = Get-Field $s 'tags'
+    $bitrate = ConvertTo-Number (Get-Field $s 'bit_rate')
+    if ($bitrate -le 0) { $bitrate = ConvertTo-Number (Get-Field $tags 'BPS') }
+    if ($bitrate -le 0) { $bitrate = ConvertTo-Number (Get-Field $tags 'BPS-eng') }
 
     [pscustomobject]@{
         Pos      = $i
-        Kind     = $kind
-        Name     = $name
-        Channels = [int](ConvertTo-Number (Get-Field $t 'Channels'))
+        Codec    = $codec
+        Name     = Get-FriendlyName $codec $profile
+        Channels = [int](ConvertTo-Number (Get-Field $s 'channels'))
         BitRate  = $bitrate
-        Size     = $size
-        Title    = [string](Get-Field $t 'Title')
-        Lossless = $kind -in @('TrueHD', 'DTS-HD MA', 'PCM', 'FLAC')
-        HasCore  = $kind -in @('DTS-HD MA', 'DTS')
-        FfCodec  = $fpAudio[$i].codec_name
+        Default  = ((ConvertTo-Number (Get-Field (Get-Field $s 'disposition') 'default')) -eq 1)
+        Lossless = Test-Lossless $codec $profile
+        Title    = [string](Get-Field $tags 'title')
     }
 })
-
-foreach ($a in $audio) {
-    if ($a.FfCodec -notmatch (Get-FfCodecPattern $a.Kind)) {
-        throw "Track order mismatch at audio $($a.Pos): MediaInfo says $($a.Kind), ffprobe says $($a.FfCodec)."
-    }
-}
 
 Write-Host "`nAudio tracks in source:"
 $audio | Format-Table -AutoSize Pos, Name,
     @{ n = 'Ch';   e = { Get-ChannelLabel $_.Channels } },
-    @{ n = 'kbps'; e = { [math]::Round($_.BitRate / 1000) } },
-    @{ n = 'MB';   e = { [math]::Round($_.Size / 1MB) } },
-    Title | Out-Host
+    @{ n = 'kbps'; e = { if ($_.BitRate -gt 0) { [math]::Round($_.BitRate / 1000) } else { '?' } } },
+    Default, Lossless, Title | Out-Host
 
-# ---------------------------------------------------------------- choose masters
+# ---------------------------------------------------------------- choose source track
 
-function Select-Best($Tracks) {
-    $best = $Tracks[0]
-    foreach ($t in $Tracks) {
-        if ($t.Channels -gt $best.Channels -or ($t.Channels -eq $best.Channels -and $t.Size -gt $best.Size)) {
-            $best = $t
-        }
+$defaults = @($audio | Where-Object Default)
+if ($SourceTrack -ge 0) {
+    if ($SourceTrack -ge $audio.Count) { throw "There is no audio track $SourceTrack (0-$($audio.Count - 1))." }
+    $pick = $audio[$SourceTrack]
+    $why = 'chosen with -SourceTrack'
+} elseif ($defaults.Count -gt 0) {
+    $pick = $defaults[0]
+    $why = 'flagged Default'
+    if ($defaults.Count -gt 1) {
+        Write-Warning "Several audio tracks are flagged Default ($(($defaults | ForEach-Object Pos) -join ', ')); using the first."
     }
-    return $best
-}
-
-$masters = @($audio | Where-Object Lossless)
-if ($masters.Count -eq 0) {
-    Write-Warning 'No lossless audio track found; keeping the best lossy track as the master.'
-    $masters = @(Select-Best $audio)
-}
-
-if ($PrimaryTrack -ge 0) {
-    $primary = @($masters | Where-Object { $_.Pos -eq $PrimaryTrack })
-    if ($primary.Count -eq 0) {
-        throw "Audio track $PrimaryTrack is not a master track. Masters: $(($masters | ForEach-Object Pos) -join ', ')"
-    }
-    $primary = $primary[0]
 } else {
-    $primary = Select-Best $masters
+    $pick = @($audio | Where-Object Lossless) | Select-Object -First 1
+    $why = 'first lossless track (none flagged Default)'
+    if (-not $pick) {
+        $pick = $audio[0]
+        $why = 'first track (none flagged Default, none lossless)'
+    }
 }
-$orderedMasters = @($primary) + @($masters | Where-Object { $_.Pos -ne $primary.Pos })
 
 # ---------------------------------------------------------------- plan output tracks
 
-$claimed = @{}
 $outputs = [Collections.Generic.List[object]]::new()
+$srcLabel = "$($pick.Name) $(Get-ChannelLabel $pick.Channels)"
 
-foreach ($m in $orderedMasters) {
-    $targetCh = 6
-    if ($m.Channels -gt 0) { $targetCh = [Math]::Min($m.Channels, 6) }
-
-    $wantAc3 = $false
-    switch ($Ac3Mode) {
-        'Always' { $wantAc3 = $true }
-        'NoCore' { $wantAc3 = -not $m.HasCore }
-    }
-    if ($m.Kind -in @('AC-3', 'E-AC-3')) { $wantAc3 = $false }
-
-    if ($wantAc3) {
-        $match = $audio | Where-Object {
-            $_.Pos -gt $m.Pos -and $_.Kind -eq 'AC-3' -and -not $claimed.ContainsKey($_.Pos) -and
-            $_.Channels -eq $targetCh -and $_.BitRate -ge $Ac3Bitrate * 1000
-        } | Select-Object -First 1
-
-        if ($match) {
-            $claimed[$match.Pos] = $true
-            $outputs.Add((New-OutputTrack $match.Pos 'copy' 0 `
-                "$($match.Name) $(Get-ChannelLabel $match.Channels)" "copied from audio $($match.Pos)"))
-        } else {
-            $ac = 0
-            if ($m.Channels -gt 6) { $ac = 6 }
-            $outputs.Add((New-OutputTrack $m.Pos 'ac3' $ac `
-                "Dolby Digital $(Get-ChannelLabel $targetCh)" "encoded from audio $($m.Pos) at $Ac3Bitrate kbps"))
-        }
-    }
-
-    if ($m.Kind -eq 'PCM') {
-        $outputs.Add((New-OutputTrack $m.Pos 'flac' 0 `
-            "FLAC $(Get-ChannelLabel $m.Channels)" "audio $($m.Pos) PCM converted to FLAC (lossless)"))
+if ($pick.Channels -le 2) {
+    if ($pick.Codec -eq 'aac') {
+        $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 "AAC $(Get-ChannelLabel $pick.Channels)" 'copied (already AAC)'))
     } else {
-        $outputs.Add((New-OutputTrack $m.Pos 'copy' 0 `
-            "$($m.Name) $(Get-ChannelLabel $m.Channels)" "copied from audio $($m.Pos)"))
+        $kbps = $AacBitrate
+        if ($pick.Channels -eq 1) { $kbps = [Math]::Min($AacBitrate, 256) }
+        $outputs.Add((New-OutputTrack $pick.Pos 'aac' $kbps 0 "AAC $(Get-ChannelLabel $pick.Channels)" "encoded from $srcLabel at $kbps kbps"))
+    }
+} elseif ($pick.Codec -eq 'ac3') {
+    $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied (already AC-3)'))
+} else {
+    $ac = 0
+    if ($pick.Channels -gt 6) { $ac = 6 }
+    $outputs.Add((New-OutputTrack $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel ([Math]::Min($pick.Channels, 6)))" "encoded from $srcLabel at $Ac3Bitrate kbps"))
+    if ($pick.Codec -like 'pcm_*') {
+        $outputs.Add((New-OutputTrack $pick.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $pick.Channels)" 'PCM converted to FLAC (lossless)'))
+    } else {
+        $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied'))
     }
 }
 
@@ -301,7 +247,7 @@ $ffArgs.AddRange([string[]]@('-map_chapters', '1', '-c:v', 'copy', '-tag:v', 'hv
 for ($i = 0; $i -lt $outputs.Count; $i++) {
     $o = $outputs[$i]
     $ffArgs.AddRange([string[]]@("-c:a:$i", $o.Codec))
-    if ($o.Codec -eq 'ac3') { $ffArgs.AddRange([string[]]@("-b:a:$i", "$($Ac3Bitrate)k")) }
+    if ($o.Kbps -gt 0) { $ffArgs.AddRange([string[]]@("-b:a:$i", "$($o.Kbps)k")) }
     if ($o.Ac -gt 0) { $ffArgs.AddRange([string[]]@("-ac:a:$i", "$($o.Ac)")) }
     $disp = '0'
     if ($i -eq 0) { $disp = 'default' }
@@ -315,15 +261,15 @@ $ffArgs.Add($OutputFile)
 
 # ---------------------------------------------------------------- report and run
 
-Write-Host "Planned output audio (Ac3Mode: $Ac3Mode):"
+Write-Host "Source track: audio $($pick.Pos) - $srcLabel ($why)"
+Write-Host 'Planned output audio:'
 for ($i = 0; $i -lt $outputs.Count; $i++) {
     $o = $outputs[$i]
     $flag = ''
     if ($i -eq 0) { $flag = '  [default]' }
-    Write-Host ("  a:{0}  {1,-45} {2}{3}" -f $i, $o.Title, $o.Note, $flag)
+    Write-Host ("  a:{0}  {1,-40} {2}{3}" -f $i, $o.Title, $o.Note, $flag)
 }
-$usedPos = @($outputs | ForEach-Object SrcPos)
-foreach ($d in @($audio | Where-Object { $_.Pos -notin $usedPos })) {
+foreach ($d in @($audio | Where-Object { $_.Pos -ne $pick.Pos })) {
     Write-Host "  dropped: audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
 }
 Write-Host "Output: $OutputFile`n"
@@ -345,9 +291,8 @@ $outAudio = @($outStreams | Where-Object { $_.codec_type -eq 'audio' })
 
 Write-Host "`nResult:"
 foreach ($s in $outAudio) {
-    $disp = Get-Field $s 'disposition'
     Write-Host ("  audio: {0,-7} {1,-4} default={2}  {3}" -f $s.codec_name,
-        (Get-ChannelLabel ([int]$s.channels)), (Get-Field $disp 'default'),
+        (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'disposition') 'default'),
         (Get-Field (Get-Field $s 'tags') 'title'))
 }
 if ($outAudio.Count -ne $outputs.Count) {
