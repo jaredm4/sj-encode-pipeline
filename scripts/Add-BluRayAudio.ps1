@@ -45,7 +45,12 @@
            up as an extra audio track. PCM is converted to FLAC (still lossless). With
            -EmbedMaster the master goes into the MP4 as a second track instead.
     6. All other source audio tracks are dropped. Chapters come from the MKV; the video
-       is copied from the MP4 untouched.
+       is copied from the MP4 untouched, except that its track title is set from the
+       file name: bracketed parts like " [tmdbid-1234]" are removed and trailing ".tag"
+       parts become " [tag]", e.g.
+         "Name, Inc. (2001) [tmdbid-12345] - 2160p.imax" -> "Name, Inc. (2001) - 2160p [imax]"
+       Show episode names are used as-is. The planned title is shown in the log, also
+       with -WhatIf.
     7. Verifies the result: track counts, the .mka, Dolby Vision (if the MP4 had it) and
        that audio and video lengths match. With -Replace, the original MP4 is only
        replaced after these checks pass.
@@ -53,7 +58,11 @@
     Remux output without -Replace: "<name>.remux.mp4" (and "<name>.remux.mka") next to
                                    the MP4.
     Remux output with -Replace:    the MP4 is replaced in place and the master saved as
-                                   "<name>.mka" next to it.
+                                   "<name>.mka" next to it. If .remux files from an
+                                   earlier run without -Replace exist, they are verified
+                                   and used as-is instead of remuxing again. So you can:
+                                   run once, check the .remux files, then run again with
+                                   -Replace to swap them in.
     An extracted-only .mka is always written straight to "<name>.mka" (via a temporary
     "<name>.mka.partial" that is renamed once verified). If you rename an MP4 later,
     rename its .mka to match, or Jellyfin won't find it.
@@ -93,13 +102,15 @@
     Default: off (master goes to an external .mka).
 .PARAMETER Replace
     For MP4s without audio: replace each original MP4 with the remuxed file once it
-    passes verification, and save the master as "<name>.mka".
+    passes verification, and save the master as "<name>.mka". If "<name>.remux.mp4"
+    (and "<name>.remux.mka") already exist from an earlier run, they are verified and
+    used instead of remuxing again; otherwise the remux is created first.
     Has no effect on MP4s that already have audio (their .mka is always written
     straight to "<name>.mka").
     Default: off (writes "<name>.remux.mp4" and "<name>.remux.mka" next to the original).
 .PARAMETER Force
-    Overwrite leftover outputs from earlier runs (.remux.mp4 / .remux.mka), and
-    re-extract .mka files that already exist.
+    Redo remuxes even if .remux.mp4 / .remux.mka files exist (overwriting them, also
+    with -Replace), and re-extract .mka files that already exist.
     Default: off (existing outputs are skipped and listed).
 .PARAMETER WhatIf
     Built-in PowerShell switch. Show the matching and every plan, including the exact
@@ -217,6 +228,27 @@ function New-Result([string]$Status, [string]$Message) {
     return [pscustomobject]@{ Status = $Status; Message = $Message }
 }
 
+# Video track title from the MP4's file name (without extension):
+#   "Movie (2001) [tmdbid-1234]"                     -> "Movie (2001)"
+#   "Movie (2001) [tmdbid-1234] - 2160p"             -> "Movie (2001) - 2160p"
+#   "Name, Inc. (2001) [tmdbid-1] - 2160p.tag"   -> "Name, Inc. (2001) - 2160p [tag]"
+#   "Show (2024) S01E01 Episode Name"                -> unchanged
+# A trailing ".tag" counts as a tag only if it has no spaces, isn't all digits, and
+# the dot isn't followed by a space (so "Name, Inc. (2001)" and "Dr. Name" are safe).
+function Get-VideoTitle([string]$BaseName) {
+    $name = $BaseName.Trim()
+    $tags = [Collections.Generic.List[string]]::new()
+    while ($name -match '^(.*\S)\.([^\s.\[\]()]+)$' -and $Matches[2] -notmatch '^\d+$') {
+        $tags.Insert(0, $Matches[2])
+        $name = $Matches[1]
+    }
+    $name = $name -replace '\s*\[[^\]]*\]', ''        # drop [tmdbid-...] and other bracketed bits
+    $name = $name -replace '\s+-\s*$', ''               # no dangling " -" at the end
+    $name = ($name -replace '\s{2,}', ' ').Trim()
+    foreach ($t in $tags) { $name += " [$t]" }
+    return $name
+}
+
 # ================================================================ one pair
 
 function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
@@ -224,6 +256,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     $dir = [IO.Path]::GetDirectoryName($VideoFile)
     $base = [IO.Path]::GetFileNameWithoutExtension($VideoFile)
     $masterMka = Join-Path $dir ($base + '.mka')   # where Jellyfin looks for the external master
+    $videoTitle = Get-VideoTitle $base
+    $reuse = $false
 
     # ------------------------------------------------ inspect the MP4
     $videoFormat = Get-Format $VideoFile
@@ -257,12 +291,16 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         $finalMka = $null
         if ($Replace) { $finalMka = $masterMka }
 
-        if (-not $Force) {
-            foreach ($f in @($OutFile, $extFile)) {
-                if (Test-Path -LiteralPath $f) {
-                    return New-Result 'Skipped' "output already exists: $([IO.Path]::GetFileName($f)) (use -Force to overwrite)"
-                }
+        $haveRemux = Test-Path -LiteralPath $OutFile
+        $haveRemuxMka = Test-Path -LiteralPath $extFile
+        if (-not $Force -and ($haveRemux -or $haveRemuxMka)) {
+            if (-not $haveRemux) {
+                return New-Result 'Skipped' "leftover $([IO.Path]::GetFileName($extFile)) without a .remux.mp4 (delete it, or use -Force)"
             }
+            if (-not $Replace) {
+                return New-Result 'Skipped' 'remux files from an earlier run exist; review them, then run with -Replace to use them (or -Force to redo)'
+            }
+            $reuse = $true   # -Replace with an existing remux: verify it and use it instead of redoing it
         }
     }
 
@@ -368,7 +406,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         Write-Host ''
 
         if (-not $script:Cmdlet.ShouldProcess($masterMka, 'Extract master audio with ffmpeg')) {
-            return New-Result 'Planned' "extract .mka: $($master.Title)"
+            return New-Result 'Planned' "extract .mka: $($master.Title); MP4 untouched, video title unchanged"
         }
 
         & $script:ffmpeg @argArray
@@ -391,7 +429,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
         Move-Item -LiteralPath $partial -Destination $masterMka -Force
         Write-Host '  .mka created.' -ForegroundColor Green
-        return New-Result 'Done' "extracted .mka: $($master.Title)"
+        return New-Result 'Done' "extracted .mka: $($master.Title); MP4 untouched, video title unchanged"
     }
 
     # ================================================ path 2: full remux (MP4 has no audio)
@@ -426,6 +464,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     foreach ($o in $outputs) { $ffArgs.AddRange([string[]]@('-map', "1:a:$($o.SrcPos)")) }
     $ffArgs.AddRange([string[]]@('-map_chapters', '1', '-c:v', 'copy'))
     if ($videoCodec -eq 'hevc') { $ffArgs.AddRange([string[]]@('-tag:v', 'hvc1')) }
+    $ffArgs.AddRange([string[]]@('-metadata:s:v:0', "title=$videoTitle"))
 
     for ($i = 0; $i -lt $outputs.Count; $i++) {
         $o = $outputs[$i]
@@ -451,6 +490,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
             $extFile))
     }
 
+    Write-Host "Video title: $videoTitle"
     Write-Host 'Planned output audio (full remux; the MP4 has no audio):'
     for ($i = 0; $i -lt $outputs.Count; $i++) {
         $o = $outputs[$i]
@@ -471,24 +511,45 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
     Write-Host ''
 
-    $argArray = $ffArgs.ToArray()
-    Write-Host ((Format-Arg $script:ffmpeg) + ' ' + (($argArray | ForEach-Object { Format-Arg $_ }) -join ' ')) -ForegroundColor Cyan
-    Write-Host ''
-
-    if (-not $script:Cmdlet.ShouldProcess($VideoFile, 'Rebuild audio with ffmpeg')) {
-        return New-Result 'Planned' "remux: $srcLabel"
+    if ($reuse) {
+        Write-Host "Using the existing remux from an earlier run (it will be verified first):" -ForegroundColor Yellow
+        Write-Host "  $OutFile"
+        if ($external) { Write-Host "  $extFile" }
+        Write-Host ''
+        $action = 'Replace with the existing remux files'
+        $what = 'replace with existing remux'
+    } else {
+        $argArray = $ffArgs.ToArray()
+        Write-Host ((Format-Arg $script:ffmpeg) + ' ' + (($argArray | ForEach-Object { Format-Arg $_ }) -join ' ')) -ForegroundColor Cyan
+        Write-Host ''
+        $action = 'Rebuild audio with ffmpeg'
+        $what = 'remux'
     }
 
-    & $script:ffmpeg @argArray
-    if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed with exit code $LASTEXITCODE" }
+    if (-not $script:Cmdlet.ShouldProcess($VideoFile, $action)) {
+        return New-Result 'Planned' "${what}: $srcLabel; video title '$videoTitle'"
+    }
+
+    if (-not $reuse) {
+        & $script:ffmpeg @argArray
+        if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed with exit code $LASTEXITCODE" }
+    }
 
     # ------------------------------------------------ verify
     $problems = [Collections.Generic.List[string]]::new()
+    $notes = [Collections.Generic.List[string]]::new()
     $outStreams = Get-Streams $OutFile
     $outVideo = @($outStreams | Where-Object { $_.codec_type -eq 'video' })
     $outAudio = @($outStreams | Where-Object { $_.codec_type -eq 'audio' })
 
     Write-Host "`nResult:"
+    if ($outVideo.Count -gt 0) {
+        $gotTitle = [string](Get-Field (Get-Field $outVideo[0] 'tags') 'title')
+        Write-Host "  video title: $gotTitle"
+        if ($gotTitle -ne $videoTitle) {
+            $notes.Add("video title is '$gotTitle', expected '$videoTitle' (use -Force to redo the remux)")
+        }
+    }
     foreach ($s in $outAudio) {
         Write-Host ("  audio: {0,-7} {1,-4} default={2}  {3}" -f $s.codec_name,
             (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'disposition') 'default'),
@@ -496,6 +557,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
     if ($outAudio.Count -ne $outputs.Count) {
         $problems.Add("expected $($outputs.Count) audio track(s) in the MP4, found $($outAudio.Count)")
+    }
+
+    # Full length compared with the original MP4: catches a remux that was cut short.
+    $oLen = ConvertTo-Number (Get-Field (Get-Format $OutFile) 'duration')
+    if ($vLen -gt 0 -and [Math]::Abs($vLen - $oLen) -gt 2) {
+        $problems.Add(("the remux is {0:N0}s but the original MP4 is {1:N0}s" -f $oLen, $vLen))
     }
 
     if ($outVideo.Count -gt 0 -and $outAudio.Count -gt 0) {
@@ -514,8 +581,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
                     (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'tags') 'title'))
             }
             if ($extAudio.Count -ne 1) { $problems.Add("expected 1 audio track in the .mka, found $($extAudio.Count)") }
+            $mLen = ConvertTo-Number (Get-Field (Get-Format $extFile) 'duration')
+            if ($vLen -gt 0 -and $mLen -gt 0 -and [Math]::Abs($vLen - $mLen) -gt 2) {
+                $problems.Add(("the .mka is {0:N0}s but the MP4 is {1:N0}s" -f $mLen, $vLen))
+            }
         } else {
-            $problems.Add('the external .mka was not created')
+            $problems.Add("the external .mka is missing: $([IO.Path]::GetFileName($extFile))")
         }
     }
 
@@ -528,6 +599,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         Write-Host '  Dolby Vision: none (not in the encoded video)'
     }
 
+    foreach ($n in $notes) { Write-Warning $n }
     if ($problems.Count -gt 0) {
         throw "Verification failed ($($problems -join '; ')). Output left for inspection: $OutFile"
     }
@@ -538,7 +610,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         Write-Host '  Original MP4 replaced.' -ForegroundColor Green
     }
 
-    return New-Result 'Done' "remuxed: $srcLabel"
+    $msg = "${what}: $srcLabel; video title '$videoTitle'"
+    if ($reuse -and $notes.Count -gt 0) { $msg += "; NOTE: $($notes -join '; ')" }
+    return New-Result 'Done' $msg
 }
 
 # ================================================================ main
