@@ -11,14 +11,18 @@
     3. Surround source:
          - Already AC-3: copied as the only audio track.
          - Anything else: a new AC-3 5.1 track (-Ac3Bitrate) is encoded from it and
-           becomes the default, and the source itself is kept as the second track
-           (copied; PCM is converted to FLAC, which is still lossless).
+           becomes the MP4's audio. The source itself (the master) is written to an
+           external .mka next to the MP4, with the same base name, which Jellyfin
+           (10.8+) picks up as an extra audio track. PCM is converted to FLAC, which is
+           still lossless. With -EmbedMaster the master goes into the MP4 as a second
+           track instead.
     4. All other source audio tracks are dropped.
     5. Prints the plan and the ffmpeg command, runs it, then checks the result
-       (audio tracks and the Dolby Vision configuration record).
+       (audio tracks, the external .mka, and the Dolby Vision configuration record).
 
     Only the first video stream of -VideoFile is used; any audio in it is ignored.
-    Chapters are taken from -SourceFile.
+    Chapters are taken from -SourceFile. If you rename the MP4 later, rename the .mka
+    to match, or Jellyfin won't find it.
 
 .PARAMETER VideoFile
     The FastFlix output (HEVC with Dolby Vision).
@@ -34,8 +38,11 @@
     AC-3 bitrate in kbps for surround sources.
 .PARAMETER AudioLanguage
     ISO 639-2 language tag written on every audio track. Default 'eng'.
+.PARAMETER EmbedMaster
+    Put the lossless master inside the MP4 as a second audio track instead of an
+    external .mka. (TrueHD in MP4 isn't readable by some players, e.g. VLC.)
 .PARAMETER Force
-    Overwrite OutputFile if it exists.
+    Overwrite OutputFile (and the external .mka) if they exist.
 
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -VideoFile '.\S01E01.mp4' -SourceFile 'S:\Sources\S01E01.mkv' -WhatIf
@@ -50,6 +57,7 @@ param(
     [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
+    [switch]$EmbedMaster,
     [switch]$Force
 )
 
@@ -144,6 +152,9 @@ if (-not $OutputFile) {
 }
 $OutputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFile)
 
+if ([IO.Path]::GetExtension($OutputFile) -ne '.mp4') { throw 'OutputFile must end in .mp4' }
+$ExternalFile = [IO.Path]::ChangeExtension($OutputFile, '.mka')
+
 if ($OutputFile -in @($VideoFile, $SourceFile)) { throw 'OutputFile must be different from the input files.' }
 if ((Test-Path -LiteralPath $OutputFile) -and -not $Force) {
     throw "Output already exists: $OutputFile (use -Force to overwrite)"
@@ -153,13 +164,19 @@ if ((Test-Path -LiteralPath $OutputFile) -and -not $Force) {
 
 $videoStreams = @(Get-Streams $VideoFile | Where-Object { $_.codec_type -eq 'video' })
 if ($videoStreams.Count -eq 0) { throw "No video stream found in $VideoFile" }
-if (-not (Test-DolbyVision $videoStreams[0])) {
-    Write-Warning 'The input video has no Dolby Vision configuration record. The output will be HDR10/SDR only.'
+$videoCodec = [string]$videoStreams[0].codec_name
+$videoHasDv = Test-DolbyVision $videoStreams[0]
+
+$srcStreams = Get-Streams $SourceFile
+$srcVideo = @($srcStreams | Where-Object { $_.codec_type -eq 'video' })
+$sourceHasDv = ($srcVideo.Count -gt 0) -and (Test-DolbyVision $srcVideo[0])
+if ($sourceHasDv -and -not $videoHasDv) {
+    Write-Warning 'The source has Dolby Vision but the encoded video does not. The output will be HDR10 only.'
 }
 
 # ---------------------------------------------------------------- inspect audio
 
-$srcAudio = @(Get-Streams $SourceFile | Where-Object { $_.codec_type -eq 'audio' })
+$srcAudio = @($srcStreams | Where-Object { $_.codec_type -eq 'audio' })
 if ($srcAudio.Count -eq 0) { throw "No audio tracks found in $SourceFile" }
 
 $audio = @(for ($i = 0; $i -lt $srcAudio.Count; $i++) {
@@ -214,6 +231,7 @@ if ($SourceTrack -ge 0) {
 # ---------------------------------------------------------------- plan output tracks
 
 $outputs = [Collections.Generic.List[object]]::new()
+$external = $null
 $srcLabel = "$($pick.Name) $(Get-ChannelLabel $pick.Channels)"
 
 if ($pick.Channels -le 2) {
@@ -231,10 +249,19 @@ if ($pick.Channels -le 2) {
     if ($pick.Channels -gt 6) { $ac = 6 }
     $outputs.Add((New-OutputTrack $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel ([Math]::Min($pick.Channels, 6)))" "encoded from $srcLabel at $Ac3Bitrate kbps"))
     if ($pick.Codec -like 'pcm_*') {
-        $outputs.Add((New-OutputTrack $pick.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $pick.Channels)" 'PCM converted to FLAC (lossless)'))
+        $master = New-OutputTrack $pick.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $pick.Channels)" 'PCM converted to FLAC (lossless)'
     } else {
-        $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied'))
+        $master = New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied'
     }
+    if ($EmbedMaster) { $outputs.Add($master) } else { $external = $master }
+}
+
+if ($external) {
+    if ((Test-Path -LiteralPath $ExternalFile) -and -not $Force) {
+        throw "External audio file already exists: $ExternalFile (use -Force to overwrite)"
+    }
+} elseif (Test-Path -LiteralPath $ExternalFile) {
+    Write-Warning "A stale $([IO.Path]::GetFileName($ExternalFile)) exists and would still be picked up by Jellyfin as an extra audio track."
 }
 
 # ---------------------------------------------------------------- build ffmpeg command
@@ -242,7 +269,8 @@ if ($pick.Channels -le 2) {
 $ffArgs = [Collections.Generic.List[string]]::new()
 $ffArgs.AddRange([string[]]@('-hide_banner', '-i', $VideoFile, '-i', $SourceFile, '-map', '0:v:0'))
 foreach ($o in $outputs) { $ffArgs.AddRange([string[]]@('-map', "1:a:$($o.SrcPos)")) }
-$ffArgs.AddRange([string[]]@('-map_chapters', '1', '-c:v', 'copy', '-tag:v', 'hvc1'))
+$ffArgs.AddRange([string[]]@('-map_chapters', '1', '-c:v', 'copy'))
+if ($videoCodec -eq 'hevc') { $ffArgs.AddRange([string[]]@('-tag:v', 'hvc1')) }
 
 for ($i = 0; $i -lt $outputs.Count; $i++) {
     $o = $outputs[$i]
@@ -259,6 +287,15 @@ $ffArgs.AddRange([string[]]@('-strict', 'experimental', '-movflags', '+faststart
 if ($Force) { $ffArgs.Add('-y') } else { $ffArgs.Add('-n') }
 $ffArgs.Add($OutputFile)
 
+if ($external) {
+    # Second output in the same pass: the master alone in a Matroska audio file.
+    $ffArgs.AddRange([string[]]@(
+        '-map', "1:a:$($external.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
+        '-c:a', $external.Codec, '-disposition:a:0', '0',
+        '-metadata:s:a:0', "language=$AudioLanguage", '-metadata:s:a:0', "title=$($external.Title)",
+        $ExternalFile))
+}
+
 # ---------------------------------------------------------------- report and run
 
 Write-Host "Source track: audio $($pick.Pos) - $srcLabel ($why)"
@@ -269,10 +306,15 @@ for ($i = 0; $i -lt $outputs.Count; $i++) {
     if ($i -eq 0) { $flag = '  [default]' }
     Write-Host ("  a:{0}  {1,-40} {2}{3}" -f $i, $o.Title, $o.Note, $flag)
 }
+if ($external) {
+    Write-Host ("  .mka {0,-40} {1}" -f $external.Title, $external.Note)
+}
 foreach ($d in @($audio | Where-Object { $_.Pos -ne $pick.Pos })) {
     Write-Host "  dropped: audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
 }
-Write-Host "Output: $OutputFile`n"
+Write-Host "Output: $OutputFile"
+if ($external) { Write-Host "        $ExternalFile" }
+Write-Host ''
 
 $argArray = $ffArgs.ToArray()
 Write-Host ((Format-Arg $script:ffmpeg) + ' ' + (($argArray | ForEach-Object { Format-Arg $_ }) -join ' ')) -ForegroundColor Cyan
@@ -299,8 +341,24 @@ if ($outAudio.Count -ne $outputs.Count) {
     Write-Warning "Expected $($outputs.Count) audio tracks, found $($outAudio.Count)."
 }
 
-if ($outVideo.Count -gt 0 -and (Test-DolbyVision $outVideo[0])) {
+if ($external) {
+    if (Test-Path -LiteralPath $ExternalFile) {
+        $extAudio = @(Get-Streams $ExternalFile | Where-Object { $_.codec_type -eq 'audio' })
+        foreach ($s in $extAudio) {
+            Write-Host ("  .mka:  {0,-7} {1,-4} {2}" -f $s.codec_name,
+                (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'tags') 'title'))
+        }
+        if ($extAudio.Count -ne 1) { Write-Warning "Expected 1 audio track in the .mka, found $($extAudio.Count)." }
+    } else {
+        Write-Warning "External audio file was not created: $ExternalFile"
+    }
+}
+
+$outHasDv = ($outVideo.Count -gt 0) -and (Test-DolbyVision $outVideo[0])
+if ($outHasDv) {
     Write-Host '  Dolby Vision configuration record: present' -ForegroundColor Green
+} elseif ($videoHasDv) {
+    Write-Warning 'The encoded video had Dolby Vision, but the output does NOT.'
 } else {
-    Write-Warning 'Dolby Vision configuration record NOT found in the output video.'
+    Write-Host '  Dolby Vision: none (not in the encoded video)'
 }
