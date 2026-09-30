@@ -16,8 +16,12 @@
                  - A folder whose MKVs have no mirrored MP4 at all is skipped.
                  - In a partly matched folder, the matched pairs are processed and each
                    MKV without a mirrored MP4 is listed with the path that was expected.
-                 Everything skipped or failed is listed in the summary at the end, and in
-                 -LogFile if given. One failed pair doesn't stop the batch.
+                 Everything skipped or failed is listed in the summary at the end.
+                 One failed pair doesn't stop the batch.
+
+    Every run (including -WhatIf previews) also saves the summary to a log file on
+    your Desktop, named after the start time, e.g.
+    "Add-BluRayAudio 2026-10-01 193512.log"
 
     For each pair:
     1. Checks that the MP4 and MKV are the same length (within 2 s), to catch mismatched
@@ -93,10 +97,6 @@
     Has no effect on MP4s that already have audio (their .mka is always written
     straight to "<name>.mka").
     Default: off (writes "<name>.remux.mp4" and "<name>.remux.mka" next to the original).
-.PARAMETER LogFile
-    Also write the end-of-run summary to this file. Written even with -WhatIf, so a
-    preview run leaves a log to review.
-    Default: none (summary is only printed to the console).
 .PARAMETER Force
     Overwrite leftover outputs from earlier runs (.remux.mp4 / .remux.mka), and
     re-extract .mka files that already exist.
@@ -106,10 +106,10 @@
     ffmpeg commands, without writing anything.
 
 .EXAMPLE
-    .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Shows' -Dest 'L:\Library\Shows' -WhatIf -LogFile .\plan.log
+    .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Shows' -Dest 'L:\Library\Shows' -WhatIf
     Shows the matching and every plan without writing anything.
 .EXAMPLE
-    .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Shows' -Dest 'L:\Library\Shows' -Replace -LogFile .\audio.log
+    .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Shows' -Dest 'L:\Library\Shows' -Replace
     Processes the whole tree, replacing MP4s in place.
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -Source '.\S01E01.mkv' -Dest '.\S01E01.mp4'
@@ -125,7 +125,6 @@ param(
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
     [switch]$EmbedMaster,
     [switch]$Replace,
-    [string]$LogFile,
     [switch]$Force
 )
 
@@ -544,6 +543,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
 # ================================================================ main
 
+$startTime = Get-Date
+$logPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
+    ('Add-BluRayAudio {0:yyyy-MM-dd HHmmss}.log' -f $startTime)
+
 $script:ffmpeg = Get-Tool 'ffmpeg'
 $script:ffprobe = Get-Tool 'ffprobe'
 
@@ -623,7 +626,10 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
 # ================================================================ summary
 
 $lines = [Collections.Generic.List[string]]::new()
-$lines.Add("Add-BluRayAudio summary  $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
+$lines.Add("Add-BluRayAudio summary")
+$lines.Add("Started:  $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))")
+$lines.Add("Finished: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))")
+if ($WhatIfPreference) { $lines.Add('Mode:     -WhatIf preview (nothing was written)') }
 $lines.Add("Source: $Source")
 $lines.Add("Dest:   $Dest")
 $lines.Add(("Done: {0}   Planned (dry run): {1}   Skipped: {2}   Failed: {3}" -f
@@ -646,9 +652,11 @@ Write-Host ''
 Write-Host ('=' * 70)
 foreach ($l in $lines) { Write-Host $l }
 
-if ($LogFile) {
-    Set-Content -LiteralPath $LogFile -Value $lines -Encoding UTF8 -WhatIf:$false
-    Write-Host "`nSummary written to $LogFile"
+try {
+    Set-Content -LiteralPath $logPath -Value $lines -Encoding UTF8 -WhatIf:$false
+    Write-Host "`nLog saved to $logPath"
+} catch {
+    Write-Warning "Could not write the log to ${logPath}: $($_.Exception.Message)"
 }
 
 if ($failed.Count -gt 0) { exit 1 }
