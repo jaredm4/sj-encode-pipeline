@@ -45,12 +45,17 @@
            up as an extra audio track. PCM is converted to FLAC (still lossless). With
            -EmbedMaster the master goes into the MP4 as a second track instead.
     6. All other source audio tracks are dropped. Chapters come from the MKV; the video
-       is copied from the MP4 untouched, except that its track title is set from the
-       file name: bracketed parts like " [tmdbid-1234]" are removed and trailing ".tag"
-       parts become " [tag]", e.g.
-         "Name, Inc. (2001) [tmdbid-12345] - 2160p.imax" -> "Name, Inc. (2001) - 2160p [imax]"
-       Show episode names are used as-is. The planned title is shown in the log, also
-       with -WhatIf.
+       is copied from the MP4 untouched. Title metadata is set from the file name,
+       following the Apple/iTunes MP4 tag convention (read by Apple TV, Infuse, Plex,
+       Kodi, VLC). Bracketed parts like " [tmdbid-1234]" are removed and trailing ".tag"
+       parts become " [tag]" at the end of the title.
+         Episodes: "Show Name (2024) S01E04 Episode Title" -> title "Episode Title", show
+                   "Show Name", season 1, episode 4, episode ID "S01E04", year 2024,
+                   media kind TV Show.
+         Movies:   "Name, Inc. (2001) [tmdbid-12345] - 2160p.imax" -> title
+                   "Name, Inc. (2001) - 2160p [imax]", year 2001, media kind Movie.
+       The video track gets the same title. The planned metadata is shown in the log,
+       also with -WhatIf.
     7. Verifies the result: track counts, the .mka, Dolby Vision (if the MP4 had it) and
        that audio and video lengths match. With -Replace, the original MP4 is only
        replaced after these checks pass.
@@ -228,13 +233,6 @@ function New-Result([string]$Status, [string]$Message) {
     return [pscustomobject]@{ Status = $Status; Message = $Message }
 }
 
-# Video track title from the MP4's file name (without extension):
-#   "Movie (2001) [tmdbid-1234]"                     -> "Movie (2001)"
-#   "Movie (2001) [tmdbid-1234] - 2160p"             -> "Movie (2001) - 2160p"
-#   "Name, Inc. (2001) [tmdbid-1] - 2160p.tag"   -> "Name, Inc. (2001) - 2160p [tag]"
-#   "Show (2024) S01E01 Episode Name"                -> unchanged
-# A trailing ".tag" counts as a tag only if it has no spaces, isn't all digits, and
-# the dot isn't followed by a space (so "Name, Inc. (2001)" and "Dr. Name" are safe).
 # ffprobe doesn't read track titles back from MP4 files (ffmpeg writes them where
 # MediaInfo, Jellyfin and players read them), so MP4 titles are checked with the
 # MediaInfo CLI when it's installed. Returns $null if MediaInfo isn't available.
@@ -248,18 +246,68 @@ function Get-Mp4Titles([string]$File) {
     }
 }
 
-function Get-VideoTitle([string]$BaseName) {
+# Title metadata from the MP4's file name (without extension), following the Apple/iTunes
+# MP4 tag convention read by Apple TV, Infuse, Plex, Kodi and VLC.
+# - Bracketed parts like " [tmdbid-1234]" are removed.
+# - Trailing ".tag" parts become " [tag]" at the end of the title. A ".tag" counts only
+#   if it has no spaces, isn't all digits, and the dot isn't followed by a space
+#   (so "Name, Inc. (2001)" and "Dr. Name" are safe).
+# Episodes (the name contains SxxEyy):
+#   "Show Name (2024) S01E04 Episode Title"
+#     -> Title "Episode Title", Show "Show Name", Season 1, Episode 4, EpisodeId "S01E04", Year 2024
+# Movies:
+#   "Name, Inc. (2001) [tmdbid-12345] - 2160p.imax"
+#     -> Title "Name, Inc. (2001) - 2160p [imax]", Year 2001
+function Get-TitleInfo([string]$BaseName) {
     $name = $BaseName.Trim()
     $tags = [Collections.Generic.List[string]]::new()
     while ($name -match '^(.*\S)\.([^\s.\[\]()]+)$' -and $Matches[2] -notmatch '^\d+$') {
         $tags.Insert(0, $Matches[2])
         $name = $Matches[1]
     }
-    $name = $name -replace '\s*\[[^\]]*\]', ''        # drop [tmdbid-...] and other bracketed bits
-    $name = $name -replace '\s+-\s*$', ''               # no dangling " -" at the end
+    $name = $name -replace '\s*\[[^\]]*\]', ''     # drop [tmdbid-...] and other bracketed bits
+    $name = $name -replace '\s+-\s*$', ''            # no dangling " -" at the end
     $name = ($name -replace '\s{2,}', ' ').Trim()
-    foreach ($t in $tags) { $name += " [$t]" }
-    return $name
+    $tagSuffix = ($tags | ForEach-Object { " [$_]" }) -join ''
+
+    $info = [pscustomobject]@{
+        Kind = 'Movie'; Title = ''; Show = ''; Season = 0; Episode = 0; EpisodeId = ''; Year = ''
+    }
+
+    if ($name -match '^(?<show>.+?)\s+(?<id>S(?<s>\d{1,3})E(?<e>\d{1,4})(?:-?E\d{1,4})*)(?:\s+(?:-\s+)?(?<ep>.*))?$') {
+        $show = $Matches['show'].Trim()
+        $id = $Matches['id'].ToUpper()
+        $season = [int]$Matches['s']
+        $episode = [int]$Matches['e']
+        $epName = ([string]$Matches['ep']).Trim()
+
+        $show = ($show -replace '\s*-$', '').Trim()
+        if ($show -match '^(.*?)\s*\((\d{4})\)$') {
+            $info.Year = $Matches[2]
+            $show = $Matches[1].Trim()
+        }
+        if (-not $epName) { $epName = $id }
+
+        $info.Kind = 'Episode'
+        $info.Title = $epName + $tagSuffix
+        $info.Show = $show
+        $info.Season = $season
+        $info.Episode = $episode
+        $info.EpisodeId = $id
+    } else {
+        if ($name -match '\((\d{4})\)') { $info.Year = $Matches[1] }
+        $info.Title = $name + $tagSuffix
+    }
+    return $info
+}
+
+function Get-TitleSummary($Info) {
+    $year = ''
+    if ($Info.Year) { $year = ", $($Info.Year)" }
+    if ($Info.Kind -eq 'Episode') {
+        return "title '$($Info.Title)' (TV: $($Info.Show), season $($Info.Season), episode $($Info.Episode) [$($Info.EpisodeId)]$year)"
+    }
+    return "title '$($Info.Title)' (movie$year)"
 }
 
 # ================================================================ one pair
@@ -269,7 +317,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     $dir = [IO.Path]::GetDirectoryName($VideoFile)
     $base = [IO.Path]::GetFileNameWithoutExtension($VideoFile)
     $masterMka = Join-Path $dir ($base + '.mka')   # where Jellyfin looks for the external master
-    $videoTitle = Get-VideoTitle $base
+    $titleInfo = Get-TitleInfo $base
+    $videoTitle = $titleInfo.Title
+    $titleDesc = Get-TitleSummary $titleInfo
     $reuse = $false
 
     # ------------------------------------------------ inspect the MP4
@@ -478,7 +528,19 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     foreach ($o in $outputs) { $ffArgs.AddRange([string[]]@('-map', "1:a:$($o.SrcPos)")) }
     $ffArgs.AddRange([string[]]@('-map_chapters', '1', '-c:v', 'copy'))
     if ($videoCodec -eq 'hevc') { $ffArgs.AddRange([string[]]@('-tag:v', 'hvc1')) }
-    $ffArgs.AddRange([string[]]@('-metadata:s:v:0', "title=$videoTitle"))
+    # Video track title, plus Apple/iTunes-style file-level tags.
+    $ffArgs.AddRange([string[]]@('-metadata:s:v:0', "title=$videoTitle", '-metadata', "title=$videoTitle"))
+    if ($titleInfo.Year) { $ffArgs.AddRange([string[]]@('-metadata', "date=$($titleInfo.Year)")) }
+    if ($titleInfo.Kind -eq 'Episode') {
+        $ffArgs.AddRange([string[]]@(
+            '-metadata', "show=$($titleInfo.Show)",
+            '-metadata', "season_number=$($titleInfo.Season)",
+            '-metadata', "episode_sort=$($titleInfo.Episode)",
+            '-metadata', "episode_id=$($titleInfo.EpisodeId)",
+            '-metadata', 'media_type=10'))   # 10 = TV Show
+    } else {
+        $ffArgs.AddRange([string[]]@('-metadata', 'media_type=9'))   # 9 = Movie
+    }
 
     for ($i = 0; $i -lt $outputs.Count; $i++) {
         $o = $outputs[$i]
@@ -505,7 +567,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
             $extFile))
     }
 
-    Write-Host "Video title: $videoTitle"
+    Write-Host "Metadata: $titleDesc"
     Write-Host 'Planned output audio (full remux; the MP4 has no audio):'
     for ($i = 0; $i -lt $outputs.Count; $i++) {
         $o = $outputs[$i]
@@ -542,7 +604,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
 
     if (-not $script:Cmdlet.ShouldProcess($VideoFile, $action)) {
-        return New-Result 'Planned' "${what}: $srcLabel; video title '$videoTitle'"
+        return New-Result 'Planned' "${what}: $srcLabel; $titleDesc"
     }
 
     if (-not $reuse) {
@@ -579,7 +641,26 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
 
     # Full length compared with the original MP4: catches a remux that was cut short.
-    $oLen = ConvertTo-Number (Get-Field (Get-Format $OutFile) 'duration')
+    $outFormat = Get-Format $OutFile
+    $oLen = ConvertTo-Number (Get-Field $outFormat 'duration')
+
+    $fTags = Get-Field $outFormat 'tags'
+    $want = [ordered]@{ title = $videoTitle }
+    if ($titleInfo.Kind -eq 'Episode') {
+        $want['show'] = $titleInfo.Show
+        $want['episode_id'] = $titleInfo.EpisodeId
+    }
+    foreach ($k in $want.Keys) {
+        $got = [string](Get-Field $fTags $k)
+        if ($got -ne $want[$k]) {
+            $notes.Add("file-level $k is '$got', expected '$($want[$k])' (use -Force to redo the remux)")
+        }
+    }
+    $line = "  metadata: title '$(Get-Field $fTags 'title')'"
+    if ($titleInfo.Kind -eq 'Episode') {
+        $line += ", show '$(Get-Field $fTags 'show')', $(Get-Field $fTags 'episode_id')"
+    }
+    Write-Host $line
     if ($vLen -gt 0 -and [Math]::Abs($vLen - $oLen) -gt 2) {
         $problems.Add(("the remux is {0:N0}s but the original MP4 is {1:N0}s" -f $oLen, $vLen))
     }
@@ -629,7 +710,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         Write-Host '  Original MP4 replaced.' -ForegroundColor Green
     }
 
-    $msg = "${what}: $srcLabel; video title '$videoTitle'"
+    $msg = "${what}: $srcLabel; $titleDesc"
     if ($reuse -and $notes.Count -gt 0) { $msg += "; NOTE: $($notes -join '; ')" }
     return New-Result 'Done' $msg
 }
