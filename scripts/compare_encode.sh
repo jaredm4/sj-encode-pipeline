@@ -16,7 +16,17 @@
 #
 # Env overrides: FFMPEG (ffmpeg binary with libvmaf built in; default: "ffmpeg" via $PATH),
 #                FPS (default 24000/1001), CLIP (seconds, 60), SUB (n_subsample, 5),
-#                THREADS (4), WORK (scratch dir)
+#                THREADS (4), WORK (scratch dir), MODEL (force a specific libvmaf model
+#                name, e.g. "vmaf_4k_v0.6.1" -- overrides auto-detection below),
+#                MODEL_4K_MIN_WIDTH (auto-detection threshold, default 3800)
+#
+# VMAF model selection: different models predict different assumed viewing conditions (the
+# default model predicts a 1080p TV at ~3x screen-height distance; vmaf_4k_v0.6.1 predicts a
+# 4K TV at ~1.5x screen-height) and their scores are NOT comparable to each other. Unless
+# MODEL is set explicitly, this script picks vmaf_4k_v0.6.1 automatically when the ORIGINAL
+# file's native width is >= MODEL_4K_MIN_WIDTH, else the standard vmaf_v0.6.1. The choice is
+# based on the original's raw resolution (before any CROP), since that's what determines the
+# real viewing condition being modeled, not the encode's resolution or crop.
 #
 # Uses frame-order timestamps (setpts=N/fps/TB) and checks alignment INDEPENDENTLY at each
 # clip (not just once globally), since drift can start partway through a file even when the
@@ -36,6 +46,8 @@ CLIP=${CLIP:-60}
 SUB=${SUB:-5}
 THREADS=${THREADS:-4}
 WORK=${WORK:-/tmp/vmaf_compare}
+MODEL_OVERRIDE=${MODEL:-}
+MODEL_4K_MIN_WIDTH=${MODEL_4K_MIN_WIDTH:-3800}
 
 FULL=0
 if [ "${1:-}" = "--full" ]; then FULL=1; shift; fi
@@ -94,6 +106,22 @@ elif [ "$SO" != "$SE" ]; then
   fi
 fi
 
+# ---- VMAF model selection ----
+if [ -n "$MODEL_OVERRIDE" ]; then
+  MODEL="$MODEL_OVERRIDE"
+  echo "VMAF model: ${MODEL} (explicitly set via MODEL)"
+elif [ -n "$OW" ] && [ "$OW" -ge "$MODEL_4K_MIN_WIDTH" ]; then
+  MODEL="vmaf_4k_v0.6.1"
+  echo "VMAF model: ${MODEL} (original is ${OW} wide, >= ${MODEL_4K_MIN_WIDTH})"
+else
+  MODEL="vmaf_v0.6.1"
+  if [ -z "$OW" ]; then
+    echo "VMAF model: ${MODEL} (default; could not read the original's width)"
+  else
+    echo "VMAF model: ${MODEL} (original is ${OW} wide, < ${MODEL_4K_MIN_WIDTH})"
+  fi
+fi
+
 # Optional: force both files to the same center-cropped picture area
 if [ -n "${CROP:-}" ]; then
   DSCALE=""; RCROP=""
@@ -120,7 +148,7 @@ fi
 # Trim prefixes are filter fragments like "trim=start_frame=1," (or empty).
 run_score() {
   local dt="$1" rt="$2" off="$3" len="$4" sub="$5" json="${6:-}"
-  local opts="n_subsample=${sub}:n_threads=${THREADS}"
+  local opts="n_subsample=${sub}:n_threads=${THREADS}:model=version=${MODEL}"
   [ -n "$json" ] && opts="${opts}:log_fmt=json:log_path=${json}"
   "$FFMPEG" -hide_banner -nostats \
     -ss "$off" -t "$len" -i "$ENC" \
@@ -239,8 +267,8 @@ for off, m, p1, mn in sorted(rows):
     print(f"{off:>8} {m:>8.2f} {p1:>8.2f} {mn:>8.2f}")
 m, p1, mn = stats(pooled)
 print(f"{'pooled':>8} {m:>8.2f} {p1:>8.2f} {mn:>8.2f}")
-print("\nStreaming-quality guideline used in the Tdarr gate (unvalidated): pooled mean >= 90, p1 >= 75.")
 EOF
+echo "(model: ${MODEL} -- scores from different models are not directly comparable to each other)"
 
 so=$(stat -c %s "$ORIG"); se=$(stat -c %s "$ENC")
 echo
