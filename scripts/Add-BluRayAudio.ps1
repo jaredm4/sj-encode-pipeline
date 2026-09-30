@@ -235,6 +235,19 @@ function New-Result([string]$Status, [string]$Message) {
 #   "Show (2024) S01E01 Episode Name"                -> unchanged
 # A trailing ".tag" counts as a tag only if it has no spaces, isn't all digits, and
 # the dot isn't followed by a space (so "Name, Inc. (2001)" and "Dr. Name" are safe).
+# ffprobe doesn't read track titles back from MP4 files (ffmpeg writes them where
+# MediaInfo, Jellyfin and players read them), so MP4 titles are checked with the
+# MediaInfo CLI when it's installed. Returns $null if MediaInfo isn't available.
+function Get-Mp4Titles([string]$File) {
+    if (-not $script:mediainfo) { return $null }
+    $v = (& $script:mediainfo '--Inform=Video;%Title%|' $File | Out-String).Trim()
+    $a = (& $script:mediainfo '--Inform=Audio;%Title%|' $File | Out-String).Trim()
+    return [pscustomobject]@{
+        Video = ($v -split '\|')[0]
+        Audio = @($a -split '\|')
+    }
+}
+
 function Get-VideoTitle([string]$BaseName) {
     $name = $BaseName.Trim()
     $tags = [Collections.Generic.List[string]]::new()
@@ -397,6 +410,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
             '-hide_banner', '-i', $SourceFile,
             '-map', "0:a:$($master.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
             '-c:a', $master.Codec, '-disposition:a:0', '0',
+            '-metadata', "title=$($master.Title)",
             '-metadata:s:a:0', "language=$AudioLanguage", '-metadata:s:a:0', "title=$($master.Title)",
             '-f', 'matroska', '-y', $partial)
 
@@ -486,6 +500,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         $ffArgs.AddRange([string[]]@(
             '-map', "1:a:$($external.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
             '-c:a', $external.Codec, '-disposition:a:0', '0',
+            '-metadata', "title=$($external.Title)",
             '-metadata:s:a:0', "language=$AudioLanguage", '-metadata:s:a:0', "title=$($external.Title)",
             $extFile))
     }
@@ -543,17 +558,21 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     $outAudio = @($outStreams | Where-Object { $_.codec_type -eq 'audio' })
 
     Write-Host "`nResult:"
-    if ($outVideo.Count -gt 0) {
-        $gotTitle = [string](Get-Field (Get-Field $outVideo[0] 'tags') 'title')
-        Write-Host "  video title: $gotTitle"
-        if ($gotTitle -ne $videoTitle) {
-            $notes.Add("video title is '$gotTitle', expected '$videoTitle' (use -Force to redo the remux)")
+    $mi = Get-Mp4Titles $OutFile
+    if (-not $mi) {
+        Write-Host '  video title: (not checked; install the MediaInfo CLI to check titles)'
+    } elseif ($outVideo.Count -gt 0) {
+        Write-Host "  video title: $($mi.Video)"
+        if ($mi.Video -ne $videoTitle) {
+            $notes.Add("video title is '$($mi.Video)', expected '$videoTitle' (use -Force to redo the remux)")
         }
     }
-    foreach ($s in $outAudio) {
+    for ($i = 0; $i -lt $outAudio.Count; $i++) {
+        $s = $outAudio[$i]
+        $t = ''
+        if ($mi -and $i -lt $mi.Audio.Count) { $t = $mi.Audio[$i] }
         Write-Host ("  audio: {0,-7} {1,-4} default={2}  {3}" -f $s.codec_name,
-            (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'disposition') 'default'),
-            (Get-Field (Get-Field $s 'tags') 'title'))
+            (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'disposition') 'default'), $t)
     }
     if ($outAudio.Count -ne $outputs.Count) {
         $problems.Add("expected $($outputs.Count) audio track(s) in the MP4, found $($outAudio.Count)")
@@ -623,6 +642,8 @@ $logPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
 
 $script:ffmpeg = Get-Tool 'ffmpeg'
 $script:ffprobe = Get-Tool 'ffprobe'
+$script:mediainfo = Get-Command 'mediainfo' -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty Source   # optional: only used to check MP4 titles
 
 if (-not (Test-Path -LiteralPath $Source)) { throw "Source not found: $Source" }
 if (-not (Test-Path -LiteralPath $Dest)) { throw "Dest not found: $Dest" }
