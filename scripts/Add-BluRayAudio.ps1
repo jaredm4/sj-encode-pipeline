@@ -46,7 +46,7 @@
        that audio and video lengths match. With -Replace, the original MP4 is only
        replaced after these checks pass.
 
-    Remux output without -Replace: "<name>.muxed.mp4" (and "<name>.muxed.mka") next to
+    Remux output without -Replace: "<name>.remux.mp4" (and "<name>.remux.mka") next to
                                    the MP4.
     Remux output with -Replace:    the MP4 is replaced in place and the master saved as
                                    "<name>.mka" next to it.
@@ -57,30 +57,53 @@
     Re-running is safe: MP4s that now have audio and a .mka are skipped.
 
 .PARAMETER Source
-    The source MKV, or a folder to search recursively for MKVs. (Alias: -SourceFile)
+    Required. The source MKV (single mode), or the root folder of the MKV tree to search
+    recursively (batch mode). Must be the same kind as -Dest: both files or both folders.
+    Alias: -SourceFile.
 .PARAMETER Dest
-    The encoded MP4, or a folder to search recursively for MP4s. (Alias: -VideoFile)
-.PARAMETER OutputFile
-    Single mode only, without -Replace: a custom output path (must end in .mp4).
+    Required. The encoded MP4 (single mode), or the root folder of the mirrored MP4 tree
+    (batch mode). Can be the same folder as -Source.
+    Alias: -VideoFile.
 .PARAMETER SourceTrack
-    Single mode only: use this source audio track (0-based, as in ffmpeg's 1:a:N).
+    Single mode only. Use this source audio track instead of auto-detecting it. 0-based,
+    counting audio tracks only (the same numbering as ffmpeg's 1:a:N and the "Pos"
+    column the script prints).
+    Default: -1 (auto-detect: the Default-flagged track, else the first lossless track,
+    else the first track).
 .PARAMETER AacBitrate
-    AAC bitrate in kbps for stereo sources (mono sources are capped at 256).
+    AAC bitrate in kbps for stereo sources, which become a single AAC 2.0 track.
+    Mono sources are capped at 256 (AAC's per-channel limit).
+    Allowed: 96-576. Default: 512.
 .PARAMETER Ac3Bitrate
-    AC-3 bitrate in kbps for surround sources.
+    AC-3 (Dolby Digital) bitrate in kbps for the 5.1 compatibility track made from
+    surround sources.
+    Allowed: 384, 448, 512, 576, 640 (640 is AC-3's maximum). Default: 640.
 .PARAMETER AudioLanguage
-    ISO 639-2 language tag written on every audio track. Default 'eng'.
+    ISO 639-2 three-letter language tag written on every audio track the script
+    creates (MP4 tracks and the .mka).
+    Default: eng.
 .PARAMETER EmbedMaster
-    Put the lossless master inside the MP4 as a second audio track instead of an
-    external .mka. (TrueHD in MP4 isn't readable by some players, e.g. VLC.)
+    For MP4s without audio: put the lossless master inside the MP4 as a second audio
+    track instead of an external .mka. TrueHD inside MP4 isn't readable by some players
+    (e.g. VLC). MP4s that already have audio are skipped when this is set.
+    Default: off (master goes to an external .mka).
 .PARAMETER Replace
-    For MP4s without audio: replace each original MP4 with the result once it passes
-    verification. Has no effect on MP4s that already have audio.
+    For MP4s without audio: replace each original MP4 with the remuxed file once it
+    passes verification, and save the master as "<name>.mka".
+    Has no effect on MP4s that already have audio (their .mka is always written
+    straight to "<name>.mka").
+    Default: off (writes "<name>.remux.mp4" and "<name>.remux.mka" next to the original).
 .PARAMETER LogFile
-    Also write the end-of-run summary to this file (written even with -WhatIf).
+    Also write the end-of-run summary to this file. Written even with -WhatIf, so a
+    preview run leaves a log to review.
+    Default: none (summary is only printed to the console).
 .PARAMETER Force
-    Overwrite leftover outputs from earlier runs, and re-extract .mka files that
-    already exist.
+    Overwrite leftover outputs from earlier runs (.remux.mp4 / .remux.mka), and
+    re-extract .mka files that already exist.
+    Default: off (existing outputs are skipped and listed).
+.PARAMETER WhatIf
+    Built-in PowerShell switch. Show the matching and every plan, including the exact
+    ffmpeg commands, without writing anything.
 
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Shows' -Dest 'L:\Library\Shows' -WhatIf -LogFile .\plan.log
@@ -90,13 +113,12 @@
     Processes the whole tree, replacing MP4s in place.
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -Source '.\S01E01.mkv' -Dest '.\S01E01.mp4'
-    Single pair, writing S01E01.muxed.mp4 (and .mka) next to the MP4.
+    Single pair, writing S01E01.remux.mp4 (and S01E01.remux.mka) next to the MP4.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)][Alias('SourceFile')][string]$Source,
     [Parameter(Mandatory)][Alias('VideoFile')][string]$Dest,
-    [string]$OutputFile,
     [int]$SourceTrack = -1,
     [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
@@ -198,7 +220,7 @@ function New-Result([string]$Status, [string]$Message) {
 
 # ================================================================ one pair
 
-function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile, [string]$OutFile) {
+function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
     $dir = [IO.Path]::GetDirectoryName($VideoFile)
     $base = [IO.Path]::GetFileNameWithoutExtension($VideoFile)
@@ -230,14 +252,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile, [string]$O
         Write-Host ("MP4 already has {0} audio track(s) ({1}); leaving it as-is, extracting the master only." -f
             $mp4Audio.Count, (($mp4Audio | ForEach-Object { "$($_.codec_name) $(Get-ChannelLabel ([int]$_.channels))" }) -join ', '))
     } else {
+        # With -Replace these are work files that get renamed over the originals at the end.
+        $OutFile = Join-Path $dir ($base + '.remux.mp4')
+        $extFile = Join-Path $dir ($base + '.remux.mka')
         $finalMka = $null
-        if ($Replace -or -not $OutFile) { $OutFile = Join-Path $dir ($base + '.muxed.mp4') }
         if ($Replace) { $finalMka = $masterMka }
-        $OutFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
-        if ([IO.Path]::GetExtension($OutFile) -ne '.mp4') { throw 'The output file must end in .mp4' }
-        $extFile = [IO.Path]::ChangeExtension($OutFile, '.mka')
 
-        if ($OutFile -in @($VideoFile, $SourceFile)) { throw 'The output file must be different from the input files.' }
         if (-not $Force) {
             foreach ($f in @($OutFile, $extFile)) {
                 if (Test-Path -LiteralPath $f) {
@@ -535,7 +555,6 @@ $batch = Test-Path -LiteralPath $Source -PathType Container
 if ($batch -ne (Test-Path -LiteralPath $Dest -PathType Container)) {
     throw '-Source and -Dest must both be files, or both be folders.'
 }
-if ($Replace -and $OutputFile) { throw '-OutputFile cannot be combined with -Replace.' }
 
 $pairs       = [Collections.Generic.List[object]]::new()
 $done        = [Collections.Generic.List[string]]::new()
@@ -548,7 +567,6 @@ $unmatched   = [Collections.Generic.List[string]]::new()
 if (-not $batch) {
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
 } else {
-    if ($OutputFile) { throw '-OutputFile only works with single files.' }
     if ($SourceTrack -ge 0) { throw '-SourceTrack only works with single files.' }
 
     $srcRoot = $Source.TrimEnd('\', '/')
@@ -590,9 +608,7 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
     Write-Host ("`n==== [{0}/{1}] {2}" -f ($n + 1), $pairs.Count, $p.Video) -ForegroundColor Yellow
     Write-Host "     from $($p.Source)"
     try {
-        $out = ''
-        if (-not $batch) { $out = $OutputFile }
-        $r = Invoke-AudioRebuild $p.Source $p.Video $out
+        $r = Invoke-AudioRebuild $p.Source $p.Video
         switch ($r.Status) {
             'Done'    { $done.Add("$($p.Video)  ($($r.Message))") }
             'Planned' { $planned.Add("$($p.Video)  ($($r.Message))") }
