@@ -188,9 +188,9 @@ function Get-ChannelLabel([int]$Channels) {
     return "$Channels ch"
 }
 
-function Get-FriendlyName([string]$Codec, [string]$Profile) {
-    if ($Codec -in @('dts', 'truehd') -and $Profile -and $Profile -ne 'unknown' -and $Profile -notmatch '^-?\d+$') {
-        return $Profile   # e.g. "DTS-HD MA", "DTS-HD MA + DTS:X", "Dolby TrueHD + Dolby Atmos"
+function Get-FriendlyName([string]$Codec, [string]$codecProfile) {
+    if ($Codec -in @('dts', 'truehd') -and $codecProfile -and $codecProfile -ne 'unknown' -and $codecProfile -notmatch '^-?\d+$') {
+        return $codecProfile   # e.g. "DTS-HD MA", "DTS-HD MA + DTS:X", "Dolby TrueHD + Dolby Atmos"
     }
     switch -Regex ($Codec) {
         '^truehd$' { return 'Dolby TrueHD' }
@@ -204,9 +204,9 @@ function Get-FriendlyName([string]$Codec, [string]$Profile) {
     return $Codec.ToUpper()
 }
 
-function Test-Lossless([string]$Codec, [string]$Profile) {
+function Test-Lossless([string]$Codec, [string]$codecProfile) {
     if ($Codec -match '^(truehd|mlp|flac|alac|pcm_.*)$') { return $true }
-    if ($Codec -eq 'dts' -and $Profile -like 'DTS-HD MA*') { return $true }
+    if ($Codec -eq 'dts' -and $codecProfile -like 'DTS-HD MA*') { return $true }
     return $false
 }
 
@@ -414,7 +414,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     $audio = @(for ($i = 0; $i -lt $srcAudio.Count; $i++) {
         $s = $srcAudio[$i]
         $codec = [string]$s.codec_name
-        $profile = [string](Get-Field $s 'profile')
+        $codecProfile = [string](Get-Field $s 'profile')
         $tags = Get-Field $s 'tags'
         $bitrate = ConvertTo-Number (Get-Field $s 'bit_rate')
         if ($bitrate -le 0) { $bitrate = ConvertTo-Number (Get-Field $tags 'BPS') }
@@ -423,10 +423,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         [pscustomobject]@{
             Pos      = $i
             Codec    = $codec
-            Name     = Get-FriendlyName $codec $profile
+            Name     = Get-FriendlyName $codec $codecProfile
             Channels = [int](ConvertTo-Number (Get-Field $s 'channels'))
             BitRate  = $bitrate
-            Lossless = Test-Lossless $codec $profile
+            Lossless = Test-Lossless $codec $codecProfile
             Title    = [string](Get-Field $tags 'title')
         }
     })
@@ -454,7 +454,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
 
     # Main track = what the MP4's compatibility track is made from.
-    $script:NoLossless = ($masters.Count -eq 0)
+    $script:FlagNoLossless = ($masters.Count -eq 0)
     if ($SourceTrack -ge 0) {
         if ($SourceTrack -ge $audio.Count) { throw "There is no audio track $SourceTrack (0-$($audio.Count - 1))." }
         $pick = $audio[$SourceTrack]
@@ -780,7 +780,7 @@ $skipped     = [Collections.Generic.List[string]]::new()
 $failed      = [Collections.Generic.List[string]]::new()
 $skippedDirs = [Collections.Generic.List[string]]::new()
 $unmatched   = [Collections.Generic.List[string]]::new()
-$noLossless  = [Collections.Generic.List[string]]::new()
+$noLosslessTitles  = [Collections.Generic.List[string]]::new()
 
 if (-not $batch) {
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
@@ -826,9 +826,9 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
     Write-Host ("`n==== [{0}/{1}] {2}" -f ($n + 1), $pairs.Count, $p.Video) -ForegroundColor Yellow
     Write-Host "     from $($p.Source)"
     try {
-        $script:NoLossless = $false
+        $script:FlagNoLossless = $false
         $r = Invoke-AudioRebuild $p.Source $p.Video
-        if ($script:NoLossless) { $noLossless.Add("$($p.Video)  ($($r.Status): $($r.Message))") }
+        if ($script:FlagNoLossless) { $noLosslessTitles.Add("$($p.Video)  ($($r.Status): $($r.Message))") }
         switch ($r.Status) {
             'Done'    { $done.Add("$($p.Video)  ($($r.Message))") }
             'Planned' { $planned.Add("$($p.Video)  ($($r.Message))") }
@@ -861,7 +861,7 @@ function Add-Section([string]$Title, $Items) {
 Add-Section 'FAILED' $failed
 Add-Section 'Folders skipped: no mirrored MP4s' $skippedDirs
 Add-Section 'MKVs without a mirrored MP4 (in otherwise matched folders)' $unmatched
-Add-Section 'No lossless audio in the source (best lossy track used)' $noLossless
+Add-Section 'No lossless audio in the source (best lossy track used)' $noLosslessTitles
 Add-Section 'Skipped' $skipped
 Add-Section 'Planned (dry run)' $planned
 Add-Section 'Done' $done
