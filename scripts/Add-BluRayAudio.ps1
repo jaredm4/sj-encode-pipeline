@@ -26,25 +26,31 @@
     For each pair:
     1. Checks that the MP4 and MKV are the same length (within 2 s), to catch mismatched
        pairs before doing any work.
-    2. Picks the source audio track: the one flagged Default (first one if several),
-       else the first lossless track, else the first track. -SourceTrack overrides this
-       (single mode only).
-    3. If the MP4 already has audio, it is left untouched. Only the master is extracted
-       from the MKV into "<name>.mka" next to it, and only when the source's main track
-       is a surround track that isn't AC-3 (stereo and AC-3 sources have no separate
-       master). Skipped if the .mka already exists, or if the MP4 already contains
-       lossless audio (listed for review instead).
-       Otherwise (the MP4 has no audio), the audio is rebuilt with a full remux:
-    4. Stereo or mono source: encoded to AAC (-AacBitrate). Nothing else is kept.
-       (An AAC source is copied instead of re-encoded.)
-    5. Surround source:
-         - Already AC-3: copied as the only audio track.
-         - Anything else: a new AC-3 5.1 track (-Ac3Bitrate) is encoded from it and
-           becomes the MP4's audio. The source itself (the master) is written to an
-           external .mka with the same base name as the MP4, which Jellyfin (10.8+) picks
-           up as an extra audio track. PCM is converted to FLAC (still lossless). With
-           -EmbedMaster the master goes into the MP4 as a second track instead.
-    6. All other source audio tracks are dropped. Chapters come from the MKV; the video
+    2. Masters: every lossless track in the MKV (TrueHD incl. Atmos, DTS-HD MA incl.
+       DTS:X and its built-in DTS core, PCM, FLAC, ALAC, MLP). Separate lossy tracks
+       (AC-3, E-AC-3, DTS, AAC, Opus...) are not masters. The source's Default flag is
+       ignored. All masters are kept together in one external "<name>.mka" next to the
+       MP4, which Jellyfin (10.8+) shows as extra audio tracks. PCM becomes FLAC (still
+       lossless).
+    3. Main track (what the MP4's compatibility track is made from): the master with
+       the most channels (then highest bitrate, then first in the list); it goes first
+       in the .mka. If the source has no lossless track, the best lossy track is used
+       the same way and the title is listed in its own section of the log. If that
+       track is AC-3, E-AC-3 or AAC it goes into the MP4 as-is and no .mka is made;
+       anything else (e.g. lossy DTS) is converted for the MP4 and the original is
+       kept in the .mka, so nothing from the disc is lost.
+       -SourceTrack overrides the choice (single mode only).
+    4. If the MP4 already has audio, it is left untouched and only the .mka is made.
+       Skipped if the .mka already exists, if there is nothing to keep in a .mka, or if
+       the MP4 already contains lossless audio (listed for review instead).
+       Otherwise (the MP4 has no audio), the audio is rebuilt with a full remux, and the
+       MP4 gets one compatibility track made from the main track:
+         - AC-3, E-AC-3 or AAC: copied as-is.
+         - Other stereo or mono: AAC (-AacBitrate).
+         - Other surround: a new AC-3 5.1 track (-Ac3Bitrate).
+       The .mka is written in the same pass. With -EmbedMaster its tracks go into the
+       MP4 as extra tracks instead.
+    5. All other source audio tracks are dropped. Chapters come from the MKV; the video
        is copied from the MP4 untouched. Title metadata is set from the file name,
        following the Apple/iTunes MP4 tag convention (read by Apple TV, Infuse, Plex,
        Kodi, VLC). Bracketed parts like " [tmdbid-1234]" are removed and trailing ".tag"
@@ -56,7 +62,7 @@
                    "Name, Inc. (2001) - 2160p [imax]", year 2001, media kind Movie.
        The video track gets the same title. The planned metadata is shown in the log,
        also with -WhatIf.
-    7. Verifies the result: track counts, the .mka, Dolby Vision (if the MP4 had it) and
+    6. Verifies the result: track counts, the .mka, Dolby Vision (if the MP4 had it) and
        that audio and video lengths match. With -Replace, the original MP4 is only
        replaced after these checks pass.
 
@@ -83,11 +89,12 @@
     (batch mode). Can be the same folder as -Source.
     Alias: -VideoFile.
 .PARAMETER SourceTrack
-    Single mode only. Use this source audio track instead of auto-detecting it. 0-based,
-    counting audio tracks only (the same numbering as ffmpeg's 1:a:N and the "Pos"
-    column the script prints).
-    Default: -1 (auto-detect: the Default-flagged track, else the first lossless track,
-    else the first track).
+    Single mode only. Use this source audio track as the main track (the one the MP4's
+    compatibility track is made from) instead of auto-detecting it. 0-based, counting
+    audio tracks only (the same numbering as ffmpeg's 1:a:N and the "Pos" column the
+    script prints). Doesn't change which tracks are masters.
+    Default: -1 (auto-detect: the master with the most channels, or the best lossy
+    track if there is no lossless one).
 .PARAMETER AacBitrate
     AAC bitrate in kbps for stereo sources, which become a single AAC 2.0 track.
     Mono sources are capped at 256 (AAC's per-channel limit).
@@ -301,6 +308,22 @@ function Get-TitleInfo([string]$BaseName) {
     return $info
 }
 
+# ffmpeg arguments for one Matroska audio output holding every master track.
+# $InputIndex is the ffmpeg input number of the source MKV.
+function Get-MkaArgs($Tracks, [int]$InputIndex, [string]$OutPath) {
+    $a = [Collections.Generic.List[string]]::new()
+    foreach ($t in $Tracks) { $a.AddRange([string[]]@('-map', "$($InputIndex):a:$($t.SrcPos)")) }
+    $a.AddRange([string[]]@('-map_metadata', '-1', '-map_chapters', '-1',
+        '-metadata', "title=$(($Tracks | ForEach-Object Title) -join ' / ')"))
+    for ($i = 0; $i -lt $Tracks.Count; $i++) {
+        $t = $Tracks[$i]
+        $a.AddRange([string[]]@("-c:a:$i", $t.Codec, "-disposition:a:$i", '0',
+            "-metadata:s:a:$i", "language=$AudioLanguage", "-metadata:s:a:$i", "title=$($t.Title)"))
+    }
+    $a.AddRange([string[]]@('-f', 'matroska', $OutPath))
+    return ,$a.ToArray()
+}
+
 function Get-TitleSummary($Info) {
     $year = ''
     if ($Info.Year) { $year = ", $($Info.Year)" }
@@ -403,7 +426,6 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
             Name     = Get-FriendlyName $codec $profile
             Channels = [int](ConvertTo-Number (Get-Field $s 'channels'))
             BitRate  = $bitrate
-            Default  = ((ConvertTo-Number (Get-Field (Get-Field $s 'disposition') 'default')) -eq 1)
             Lossless = Test-Lossless $codec $profile
             Title    = [string](Get-Field $tags 'title')
         }
@@ -413,64 +435,83 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     $audio | Format-Table -AutoSize Pos, Name,
         @{ n = 'Ch';   e = { Get-ChannelLabel $_.Channels } },
         @{ n = 'kbps'; e = { if ($_.BitRate -gt 0) { [math]::Round($_.BitRate / 1000) } else { '?' } } },
-        Default, Lossless, Title | Out-Host
+        Lossless, Title | Out-Host
 
-    # ------------------------------------------------ choose source track
-    $defaults = @($audio | Where-Object Default)
+    # ------------------------------------------------ masters and the main track
+    # The Default flag is ignored: it doesn't reflect the disc.
+    # Masters = every lossless track (a DTS-HD MA track keeps its DTS core inside it;
+    # separate lossy DTS tracks are not masters).
+    $masters = @($audio | Where-Object Lossless)
+
+    # Best track = most channels, then highest bitrate, then first in the list.
+    function Select-BestTrack($Tracks) {
+        $best = $null
+        foreach ($t in $Tracks) {
+            if (-not $best -or $t.Channels -gt $best.Channels -or
+                ($t.Channels -eq $best.Channels -and $t.BitRate -gt $best.BitRate)) { $best = $t }
+        }
+        return $best
+    }
+
+    # Main track = what the MP4's compatibility track is made from.
+    $script:NoLossless = ($masters.Count -eq 0)
     if ($SourceTrack -ge 0) {
         if ($SourceTrack -ge $audio.Count) { throw "There is no audio track $SourceTrack (0-$($audio.Count - 1))." }
         $pick = $audio[$SourceTrack]
         $why = 'chosen with -SourceTrack'
-    } elseif ($defaults.Count -gt 0) {
-        $pick = $defaults[0]
-        $why = 'flagged Default'
-        if ($defaults.Count -gt 1) {
-            Write-Warning "Several audio tracks are flagged Default ($(($defaults | ForEach-Object Pos) -join ', ')); using the first."
-        }
+    } elseif ($masters.Count -gt 0) {
+        $pick = Select-BestTrack $masters
+        $why = 'lossless track with the most channels'
     } else {
-        $pick = @($audio | Where-Object Lossless) | Select-Object -First 1
-        $why = 'first lossless track (none flagged Default)'
-        if (-not $pick) {
-            $pick = $audio[0]
-            $why = 'first track (none flagged Default, none lossless)'
-        }
+        $pick = Select-BestTrack $audio
+        $why = 'NO LOSSLESS TRACK in the source; best lossy track'
+        Write-Warning 'The source has no lossless audio track.'
     }
 
     $srcLabel = "$($pick.Name) $(Get-ChannelLabel $pick.Channels)"
-    Write-Host "Source track: audio $($pick.Pos) - $srcLabel ($why)"
+    Write-Host "Main track: audio $($pick.Pos) - $srcLabel ($why)"
 
-    # The master is kept only for surround sources that aren't already AC-3.
-    $master = $null
-    if ($pick.Channels -gt 2 -and $pick.Codec -ne 'ac3') {
-        if ($pick.Codec -like 'pcm_*') {
-            $master = New-OutputTrack $pick.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $pick.Channels)" 'PCM converted to FLAC (lossless)'
+    # Lossy formats that go into the MP4 as-is (every target player handles them).
+    $copyable = $pick.Codec -in @('ac3', 'eac3', 'aac')
+
+    # Kept in the .mka: every master, main one first. With no lossless tracks, a main
+    # track that has to be converted for the MP4 (e.g. lossy DTS) is kept there instead,
+    # so the original is never lost.
+    $keep = @($masters | Where-Object { $_.Pos -eq $pick.Pos }) + @($masters | Where-Object { $_.Pos -ne $pick.Pos })
+    if ($masters.Count -eq 0 -and -not $copyable) { $keep = @($pick) }
+
+    $masterTracks = [Collections.Generic.List[object]]::new()
+    foreach ($m in $keep) {
+        if ($m.Codec -like 'pcm_*') {
+            $masterTracks.Add((New-OutputTrack $m.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $m.Channels)" "audio $($m.Pos): PCM converted to FLAC (lossless)"))
         } else {
-            $master = New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied'
+            $note = "audio $($m.Pos): copied"
+            if (-not $m.Lossless) { $note = "audio $($m.Pos): copied (original lossy track, kept because the MP4 gets a converted copy)" }
+            $masterTracks.Add((New-OutputTrack $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note))
         }
     }
+    $mastersLabel = ($masterTracks | ForEach-Object Title) -join ' + '
 
-    # ================================================ path 1: extract the master only
+    # ================================================ path 1: extract the masters only
     if ($extractOnly) {
-        if (-not $master) {
-            return New-Result 'Skipped' "MP4 has audio; the source's main track ($srcLabel) has no separate master to extract"
+        if ($masterTracks.Count -eq 0) {
+            return New-Result 'Skipped' "MP4 has audio; the source has no lossless track, and its best track ($srcLabel) needs no .mka"
         }
 
         $partial = Join-Path $dir ($base + '.mka.partial')   # not a media extension, so Jellyfin ignores it
-        $argArray = [string[]]@(
-            '-hide_banner', '-i', $SourceFile,
-            '-map', "0:a:$($master.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
-            '-c:a', $master.Codec, '-disposition:a:0', '0',
-            '-metadata', "title=$($master.Title)",
-            '-metadata:s:a:0', "language=$AudioLanguage", '-metadata:s:a:0', "title=$($master.Title)",
-            '-f', 'matroska', '-y', $partial)
+        $argArray = [string[]](@('-hide_banner', '-y', '-i', $SourceFile) + (Get-MkaArgs $masterTracks 0 $partial))
 
-        Write-Host "Master:   $masterMka  ($($master.Title), $($master.Note))"
+        Write-Host "Master(s) -> $masterMka"
+        foreach ($m in $masterTracks) { Write-Host ("  {0,-40} {1}" -f $m.Title, $m.Note) }
+        foreach ($d in @($audio | Where-Object { $_.Pos -notin @($keep | ForEach-Object Pos) })) {
+            Write-Host "  not a master (lossy): audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
+        }
         Write-Host ''
         Write-Host ((Format-Arg $script:ffmpeg) + ' ' + (($argArray | ForEach-Object { Format-Arg $_ }) -join ' ')) -ForegroundColor Cyan
         Write-Host ''
 
         if (-not $script:Cmdlet.ShouldProcess($masterMka, 'Extract master audio with ffmpeg')) {
-            return New-Result 'Planned' "extract .mka: $($master.Title); MP4 untouched, video title unchanged"
+            return New-Result 'Planned' "extract .mka: $mastersLabel; MP4 untouched, video title unchanged"
         }
 
         & $script:ffmpeg @argArray
@@ -482,7 +523,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
             Write-Host ("  .mka:  {0,-7} {1,-4} {2}" -f $s.codec_name,
                 (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'tags') 'title'))
         }
-        if ($extAudio.Count -ne 1) { $problems.Add("expected 1 audio track in the .mka, found $($extAudio.Count)") }
+        if ($extAudio.Count -ne $masterTracks.Count) {
+            $problems.Add("expected $($masterTracks.Count) audio track(s) in the .mka, found $($extAudio.Count)")
+        }
         $mLen = ConvertTo-Number (Get-Field (Get-Format $partial) 'duration')
         if ($vLen -gt 0 -and $mLen -gt 0 -and [Math]::Abs($vLen - $mLen) -gt 2) {
             $problems.Add(("the .mka is {0:N0}s but the MP4 is {1:N0}s" -f $mLen, $vLen))
@@ -493,33 +536,31 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
         Move-Item -LiteralPath $partial -Destination $masterMka -Force
         Write-Host '  .mka created.' -ForegroundColor Green
-        return New-Result 'Done' "extracted .mka: $($master.Title); MP4 untouched, video title unchanged"
+        return New-Result 'Done' "extracted .mka: $mastersLabel; MP4 untouched, video title unchanged"
     }
 
     # ================================================ path 2: full remux (MP4 has no audio)
     $outputs = [Collections.Generic.List[object]]::new()
-    $external = $null
+    $externals = [Collections.Generic.List[object]]::new()
 
-    if ($pick.Channels -le 2) {
-        if ($pick.Codec -eq 'aac') {
-            $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 "AAC $(Get-ChannelLabel $pick.Channels)" 'copied (already AAC)'))
-        } else {
-            $kbps = $AacBitrate
-            if ($pick.Channels -eq 1) { $kbps = [Math]::Min($AacBitrate, 256) }
-            $outputs.Add((New-OutputTrack $pick.Pos 'aac' $kbps 0 "AAC $(Get-ChannelLabel $pick.Channels)" "encoded from $srcLabel at $kbps kbps"))
-        }
-    } elseif ($pick.Codec -eq 'ac3') {
-        $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied (already AC-3)'))
+    if ($copyable) {
+        $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied as-is'))
+    } elseif ($pick.Channels -le 2) {
+        $kbps = $AacBitrate
+        if ($pick.Channels -eq 1) { $kbps = [Math]::Min($AacBitrate, 256) }
+        $outputs.Add((New-OutputTrack $pick.Pos 'aac' $kbps 0 "AAC $(Get-ChannelLabel $pick.Channels)" "encoded from $srcLabel at $kbps kbps"))
     } else {
         $ac = 0
         if ($pick.Channels -gt 6) { $ac = 6 }
         $outputs.Add((New-OutputTrack $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel ([Math]::Min($pick.Channels, 6)))" "encoded from $srcLabel at $Ac3Bitrate kbps"))
-        if ($EmbedMaster) { $outputs.Add($master) } else { $external = $master }
+    }
+    foreach ($m in $masterTracks) {
+        if ($EmbedMaster) { $outputs.Add($m) } else { $externals.Add($m) }
     }
 
     $mkaAfter = $extFile
     if ($Replace) { $mkaAfter = $finalMka }
-    if (-not $external -and (Test-Path -LiteralPath $mkaAfter)) {
+    if ($externals.Count -eq 0 -and (Test-Path -LiteralPath $mkaAfter)) {
         Write-Warning "$([IO.Path]::GetFileName($mkaAfter)) exists but this title has no external master; Jellyfin would still show it as an audio track."
     }
 
@@ -557,14 +598,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     if ($Force) { $ffArgs.Add('-y') } else { $ffArgs.Add('-n') }
     $ffArgs.Add($OutFile)
 
-    if ($external) {
-        # Second output in the same pass: the master alone in a Matroska audio file.
-        $ffArgs.AddRange([string[]]@(
-            '-map', "1:a:$($external.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
-            '-c:a', $external.Codec, '-disposition:a:0', '0',
-            '-metadata', "title=$($external.Title)",
-            '-metadata:s:a:0', "language=$AudioLanguage", '-metadata:s:a:0', "title=$($external.Title)",
-            $extFile))
+    if ($externals.Count -gt 0) {
+        # Second output in the same pass: every master in one Matroska audio file.
+        $ffArgs.AddRange([string[]](Get-MkaArgs $externals 1 $extFile))
     }
 
     Write-Host "Metadata: $titleDesc"
@@ -575,23 +611,23 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         if ($i -eq 0) { $flag = '  [default]' }
         Write-Host ("  a:{0}  {1,-40} {2}{3}" -f $i, $o.Title, $o.Note, $flag)
     }
-    if ($external) { Write-Host ("  .mka {0,-40} {1}" -f $external.Title, $external.Note) }
-    foreach ($d in @($audio | Where-Object { $_.Pos -ne $pick.Pos })) {
+    foreach ($m in $externals) { Write-Host ("  .mka {0,-40} {1}" -f $m.Title, $m.Note) }
+    foreach ($d in @($audio | Where-Object { $_.Pos -ne $pick.Pos -and $_.Pos -notin @($keep | ForEach-Object Pos) })) {
         Write-Host "  dropped: audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
     }
     if ($Replace) {
         Write-Host "Replaces: $VideoFile"
-        if ($external) { Write-Host "Master:   $finalMka" }
+        if ($externals.Count -gt 0) { Write-Host "Master:   $finalMka" }
     } else {
         Write-Host "Output:   $OutFile"
-        if ($external) { Write-Host "          $extFile" }
+        if ($externals.Count -gt 0) { Write-Host "          $extFile" }
     }
     Write-Host ''
 
     if ($reuse) {
         Write-Host "Using the existing remux from an earlier run (it will be verified first):" -ForegroundColor Yellow
         Write-Host "  $OutFile"
-        if ($external) { Write-Host "  $extFile" }
+        if ($externals.Count -gt 0) { Write-Host "  $extFile" }
         Write-Host ''
         $action = 'Replace with the existing remux files'
         $what = 'replace with existing remux'
@@ -673,14 +709,16 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         }
     }
 
-    if ($external) {
+    if ($externals.Count -gt 0) {
         if (Test-Path -LiteralPath $extFile) {
             $extAudio = @(Get-Streams $extFile | Where-Object { $_.codec_type -eq 'audio' })
             foreach ($s in $extAudio) {
                 Write-Host ("  .mka:  {0,-7} {1,-4} {2}" -f $s.codec_name,
                     (Get-ChannelLabel ([int]$s.channels)), (Get-Field (Get-Field $s 'tags') 'title'))
             }
-            if ($extAudio.Count -ne 1) { $problems.Add("expected 1 audio track in the .mka, found $($extAudio.Count)") }
+            if ($extAudio.Count -ne $externals.Count) {
+                $problems.Add("expected $($externals.Count) audio track(s) in the .mka, found $($extAudio.Count)")
+            }
             $mLen = ConvertTo-Number (Get-Field (Get-Format $extFile) 'duration')
             if ($vLen -gt 0 -and $mLen -gt 0 -and [Math]::Abs($vLen - $mLen) -gt 2) {
                 $problems.Add(("the .mka is {0:N0}s but the MP4 is {1:N0}s" -f $mLen, $vLen))
@@ -706,7 +744,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
     if ($Replace) {
         Move-Item -LiteralPath $OutFile -Destination $VideoFile -Force
-        if ($external) { Move-Item -LiteralPath $extFile -Destination $finalMka -Force }
+        if ($externals.Count -gt 0) { Move-Item -LiteralPath $extFile -Destination $finalMka -Force }
         Write-Host '  Original MP4 replaced.' -ForegroundColor Green
     }
 
@@ -742,6 +780,7 @@ $skipped     = [Collections.Generic.List[string]]::new()
 $failed      = [Collections.Generic.List[string]]::new()
 $skippedDirs = [Collections.Generic.List[string]]::new()
 $unmatched   = [Collections.Generic.List[string]]::new()
+$noLossless  = [Collections.Generic.List[string]]::new()
 
 if (-not $batch) {
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
@@ -787,7 +826,9 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
     Write-Host ("`n==== [{0}/{1}] {2}" -f ($n + 1), $pairs.Count, $p.Video) -ForegroundColor Yellow
     Write-Host "     from $($p.Source)"
     try {
+        $script:NoLossless = $false
         $r = Invoke-AudioRebuild $p.Source $p.Video
+        if ($script:NoLossless) { $noLossless.Add("$($p.Video)  ($($r.Status): $($r.Message))") }
         switch ($r.Status) {
             'Done'    { $done.Add("$($p.Video)  ($($r.Message))") }
             'Planned' { $planned.Add("$($p.Video)  ($($r.Message))") }
@@ -820,6 +861,7 @@ function Add-Section([string]$Title, $Items) {
 Add-Section 'FAILED' $failed
 Add-Section 'Folders skipped: no mirrored MP4s' $skippedDirs
 Add-Section 'MKVs without a mirrored MP4 (in otherwise matched folders)' $unmatched
+Add-Section 'No lossless audio in the source (best lossy track used)' $noLossless
 Add-Section 'Skipped' $skipped
 Add-Section 'Planned (dry run)' $planned
 Add-Section 'Done' $done
