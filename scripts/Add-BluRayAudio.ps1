@@ -314,7 +314,7 @@ function Get-MkaArgs($Tracks, [int]$InputIndex, [string]$OutPath) {
     $a = [Collections.Generic.List[string]]::new()
     foreach ($t in $Tracks) { $a.AddRange([string[]]@('-map', "$($InputIndex):a:$($t.SrcPos)")) }
     $a.AddRange([string[]]@('-map_metadata', '-1', '-map_chapters', '-1',
-        '-metadata', "title=$(($Tracks | ForEach-Object Title) -join ' / ')"))
+        '-metadata', "title=$(($Tracks | ForEach-Object { $_.Title }) -join ' / ')"))
     for ($i = 0; $i -lt $Tracks.Count; $i++) {
         $t = $Tracks[$i]
         $a.AddRange([string[]]@("-c:a:$i", $t.Codec, "-disposition:a:$i", '0',
@@ -360,7 +360,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     if ($extractOnly) {
         $mp4Lossless = @($mp4Audio | Where-Object { Test-Lossless ([string]$_.codec_name) ([string](Get-Field $_ 'profile')) })
         if ($mp4Lossless.Count -gt 0) {
-            return New-Result 'Skipped' "MP4 already contains lossless audio ($(($mp4Lossless | ForEach-Object codec_name) -join ', ')); review by hand"
+            return New-Result 'Skipped' "MP4 already contains lossless audio ($(($mp4Lossless | ForEach-Object { $_.codec_name }) -join ', ')); review by hand"
         }
         if ($EmbedMaster) {
             return New-Result 'Skipped' 'MP4 already has audio (-EmbedMaster only applies to MP4s without audio)'
@@ -490,7 +490,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
             $masterTracks.Add((New-OutputTrack $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note))
         }
     }
-    $mastersLabel = ($masterTracks | ForEach-Object Title) -join ' + '
+    $mastersLabel = ($masterTracks | ForEach-Object { $_.Title }) -join ', '
+    $keepPos = @($keep | ForEach-Object { $_.Pos })   # source positions kept in the .mka
 
     # ================================================ path 1: extract the masters only
     if ($extractOnly) {
@@ -503,15 +504,15 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
         Write-Host "Master(s) -> $masterMka"
         foreach ($m in $masterTracks) { Write-Host ("  {0,-40} {1}" -f $m.Title, $m.Note) }
-        foreach ($d in @($audio | Where-Object { $_.Pos -notin @($keep | ForEach-Object Pos) })) {
-            Write-Host "  not a master (lossy): audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
+        foreach ($d in @($audio | Where-Object { $_.Pos -notin $keepPos })) {
+            Write-Host "  not kept (lossy): audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
         }
         Write-Host ''
         Write-Host ((Format-Arg $script:ffmpeg) + ' ' + (($argArray | ForEach-Object { Format-Arg $_ }) -join ' ')) -ForegroundColor Cyan
         Write-Host ''
 
         if (-not $script:Cmdlet.ShouldProcess($masterMka, 'Extract master audio with ffmpeg')) {
-            return New-Result 'Planned' "extract .mka: $mastersLabel; MP4 untouched, video title unchanged"
+            return New-Result 'Planned' "extract $mastersLabel to .mka; MP4 untouched, video title unchanged"
         }
 
         & $script:ffmpeg @argArray
@@ -536,7 +537,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
         Move-Item -LiteralPath $partial -Destination $masterMka -Force
         Write-Host '  .mka created.' -ForegroundColor Green
-        return New-Result 'Done' "extracted .mka: $mastersLabel; MP4 untouched, video title unchanged"
+        return New-Result 'Done' "extracted $mastersLabel to .mka; MP4 untouched, video title unchanged"
     }
 
     # ================================================ path 2: full remux (MP4 has no audio)
@@ -556,6 +557,15 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
     foreach ($m in $masterTracks) {
         if ($EmbedMaster) { $outputs.Add($m) } else { $externals.Add($m) }
+    }
+
+    # e.g. "Dolby Digital 5.1 (from Dolby TrueHD + Dolby Atmos 7.1) to MP4, Dolby TrueHD + Dolby Atmos 7.1 to .mka"
+    $mp4Parts = foreach ($o in $outputs) {
+        if ($o.Codec -eq 'copy') { $o.Title } else { "$($o.Title) (from $srcLabel)" }
+    }
+    $remuxLabel = "$($mp4Parts -join ', ') to MP4"
+    if ($externals.Count -gt 0) {
+        $remuxLabel += ", $(($externals | ForEach-Object { $_.Title }) -join ', ') to .mka"
     }
 
     $mkaAfter = $extFile
@@ -612,7 +622,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         Write-Host ("  a:{0}  {1,-40} {2}{3}" -f $i, $o.Title, $o.Note, $flag)
     }
     foreach ($m in $externals) { Write-Host ("  .mka {0,-40} {1}" -f $m.Title, $m.Note) }
-    foreach ($d in @($audio | Where-Object { $_.Pos -ne $pick.Pos -and $_.Pos -notin @($keep | ForEach-Object Pos) })) {
+    foreach ($d in @($audio | Where-Object { $_.Pos -ne $pick.Pos -and $_.Pos -notin $keepPos })) {
         Write-Host "  dropped: audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
     }
     if ($Replace) {
@@ -640,7 +650,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
 
     if (-not $script:Cmdlet.ShouldProcess($VideoFile, $action)) {
-        return New-Result 'Planned' "${what}: $srcLabel; $titleDesc"
+        return New-Result 'Planned' "${what}: $remuxLabel; $titleDesc"
     }
 
     if (-not $reuse) {
@@ -748,7 +758,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         Write-Host '  Original MP4 replaced.' -ForegroundColor Green
     }
 
-    $msg = "${what}: $srcLabel; $titleDesc"
+    $msg = "${what}: $remuxLabel; $titleDesc"
     if ($reuse -and $notes.Count -gt 0) { $msg += "; NOTE: $($notes -join '; ')" }
     return New-Result 'Done' $msg
 }
