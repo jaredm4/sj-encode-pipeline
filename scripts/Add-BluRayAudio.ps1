@@ -6,6 +6,9 @@
 .DESCRIPTION
     Works on one pair of files, or on whole folders.
 
+    Example:
+    powershell -ExecutionPolicy Bypass -File $HOME\Documents\Add-BluRayAudio.ps1 -Source "S:\..." -Dest "L:\..."
+
     Single mode: -Source is the MKV and -Dest is the encoded MP4.
 
     Batch mode:  -Source and -Dest are mirrored folder trees (or the same folder). Every
