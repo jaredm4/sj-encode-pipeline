@@ -823,19 +823,20 @@ if (-not $batch) {
 
 for ($n = 0; $n -lt $pairs.Count; $n++) {
     $p = $pairs[$n]
-    Write-Host ("`n==== [{0}/{1}] {2}" -f ($n + 1), $pairs.Count, $p.Video) -ForegroundColor Yellow
-    Write-Host "     from $($p.Source)"
+    # Folders are mirrored, so the file name alone identifies each title.
+    $name = [IO.Path]::GetFileName($p.Video)
+    Write-Host ("`n==== [{0}/{1}] {2}" -f ($n + 1), $pairs.Count, $name) -ForegroundColor Yellow
     try {
         $script:FlagNoLossless = $false
         $r = Invoke-AudioRebuild $p.Source $p.Video
-        if ($script:FlagNoLossless) { $noLosslessTitles.Add("$($p.Video)  ($($r.Status): $($r.Message))") }
+        if ($script:FlagNoLossless) { $noLosslessTitles.Add("$name  ($($r.Status): $($r.Message))") }
         switch ($r.Status) {
-            'Done'    { $done.Add("$($p.Video)  ($($r.Message))") }
-            'Planned' { $planned.Add("$($p.Video)  ($($r.Message))") }
-            'Skipped' { $skipped.Add("$($p.Video)  ($($r.Message))"); Write-Host "Skipped: $($r.Message)" -ForegroundColor DarkGray }
+            'Done'    { $done.Add("$name  ($($r.Message))") }
+            'Planned' { $planned.Add("$name  ($($r.Message))") }
+            'Skipped' { $skipped.Add("$name  ($($r.Message))"); Write-Host "Skipped: $($r.Message)" -ForegroundColor DarkGray }
         }
     } catch {
-        $failed.Add("$($p.Video)`n      $($_.Exception.Message)")
+        $failed.Add("$name`n      $($_.Exception.Message)")
         Write-Warning $_.Exception.Message
     }
 }
