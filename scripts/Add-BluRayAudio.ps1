@@ -6,9 +6,6 @@
 .DESCRIPTION
     Works on one pair of files, or on whole mirrored folder trees.
 
-    Example:
-    powershell -ExecutionPolicy Bypass -File $HOME\Documents\Add-BluRayAudio.ps1 -Source "S:\..." -Dest "L:\..."
-
     Single mode: -Source is the MKV and -Dest is the encoded MP4.
 
     Batch mode:  -Source and -Dest are mirrored folder trees (or the same folder). Every
@@ -43,12 +40,16 @@
                 - AC-3, E-AC-3 or AAC: copied as-is.
                 - Other stereo or mono: AAC (-AacBitrate).
                 - Other surround: a new AC-3 5.1 track (-Ac3Bitrate).
-         a:1+ every master, main one first. With no lossless track, a main track that
+         then any -Passthru tracks (single mode only), copied as-is, in the order given.
+         then every master, main one first. With no lossless track, a main track that
               had to be converted (e.g. lossy DTS) is kept here as-is instead, so the
               original is never lost.
        Players use a:0 by default; viewers can pick a master if their device supports it.
        If the MP4's audio already matches this plan, the title is skipped.
-    5. All other source audio tracks are dropped. Chapters come from the MKV.
+    5. All other source audio tracks are dropped. If the MP4 has no audio yet (a first
+       remux) and any dropped track is lossy stereo, it is listed in the summary as a
+       possible commentary track, so you can re-run that title with -Passthru to keep it.
+       Chapters come from the MKV.
        Title metadata is set from the file name, following the Apple/iTunes MP4 tag
        convention (read by Apple TV, Infuse, Plex, Kodi, VLC). Bracketed parts like
        " [tmdbid-1234]" are removed and trailing ".tag" parts become " [tag]".
@@ -78,11 +79,21 @@
     Alias: -VideoFile.
 .PARAMETER SourceTrack
     Single mode only. Use this source audio track as the main track (the one the
-    compatibility track is made from) instead of auto-detecting it. 0-based, counting
-    audio tracks only (the same numbering as ffmpeg's 1:a:N and the "Pos" column the
-    script prints). Doesn't change which tracks are masters.
+    compatibility track is made from) instead of auto-detecting it. Doesn't change which
+    tracks are masters. Track numbers work as described under -Passthru.
     Default: -1 (auto-detect: the master with the most channels, or the best lossy
     track if there is no lossless one).
+.PARAMETER Passthru
+    Single mode only. Extra source audio tracks to keep, copied as-is (no re-encoding),
+    e.g. a director's commentary. Placed after the default track and before the masters,
+    in the order given. PCM is the exception: it becomes FLAC (still lossless), since
+    MP4 doesn't handle PCM well.
+    TRACK NUMBERS: 0 = the first AUDIO track in the MKV. Video and subtitle tracks are
+    not counted. Use the "Pos" column the script prints (run with -WhatIf to see it).
+      - MediaInfo's "Audio #1" is Pos 0 (subtract 1).
+      - Don't use MKVToolNix track IDs: those count the video track too.
+    Several tracks: -Passthru 2,3
+    Default: none.
 .PARAMETER AacBitrate
     AAC bitrate in kbps for the compatibility track made from stereo sources.
     Mono sources are capped at 256 (AAC's per-channel limit).
@@ -116,12 +127,16 @@
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -Source '.\S01E01.mkv' -Dest '.\S01E01.mp4'
     Single pair, writing S01E01.remux.mp4 next to the MP4.
+.EXAMPLE
+    .\Add-BluRayAudio.ps1 -Source '.\Movie.mkv' -Dest '.\Movie.mp4' -Passthru 3 -WhatIf
+    Previews keeping the MKV's 4th audio track (Pos 3, e.g. a commentary) as-is.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)][Alias('SourceFile')][string]$Source,
     [Parameter(Mandatory)][Alias('VideoFile')][string]$Dest,
     [int]$SourceTrack = -1,
+    [int[]]$Passthru = @(),
     [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
@@ -228,6 +243,14 @@ function New-OutputTrack([int]$SrcPos, [string]$Codec, [int]$Kbps, [int]$Ac, [st
         SrcPos = $SrcPos; Codec = $Codec; Kbps = $Kbps; Ac = $Ac
         Title = $Title; Note = $Note; Layout = $Layout
     }
+}
+
+# e.g. "audio 3: Dolby Digital 2.0, 192 kbps, 'Stereo'"
+function Get-TrackDesc($Track) {
+    $desc = "audio $($Track.Pos): $($Track.Name) $(Get-ChannelLabel $Track.Channels)"
+    if ($Track.BitRate -gt 0) { $desc += ", $([math]::Round($Track.BitRate / 1000)) kbps" }
+    if ($Track.Title) { $desc += ", '$($Track.Title)'" }
+    return $desc
 }
 
 function New-Result([string]$Status, [string]$Message) {
@@ -427,6 +450,17 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     if ($masters.Count -eq 0 -and -not $copyable) { $keep = @($pick) }
     $keepPos = @($keep | ForEach-Object { $_.Pos })
 
+    # -Passthru: extra tracks copied as-is (single mode only; checked in main).
+    $passTracks = [Collections.Generic.List[object]]::new()
+    foreach ($pp in @($Passthru | Select-Object -Unique)) {
+        if ($pp -lt 0 -or $pp -ge $audio.Count) {
+            throw "-Passthru: there is no audio track $pp. Valid: 0-$($audio.Count - 1) (the 'Pos' column above)."
+        }
+        if ($pp -in $keepPos) { throw "-Passthru: audio track $pp is already kept as a master." }
+        if ($copyable -and $pp -eq $pick.Pos) { throw "-Passthru: audio track $pp is already the default track." }
+        $passTracks.Add($audio[$pp])
+    }
+
     # ------------------------------------------------ plan the MP4's audio
     $outputs = [Collections.Generic.List[object]]::new()
 
@@ -445,6 +479,16 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
             "encoded from $srcLabel at $Ac3Bitrate kbps" "ac3 $outCh"))
     }
 
+    foreach ($pt in $passTracks) {
+        if ($pt.Codec -like 'pcm_*') {
+            $outputs.Add((New-OutputTrack $pt.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $pt.Channels)" `
+                "audio $($pt.Pos): passthrough, PCM converted to FLAC (lossless)" "flac $($pt.Channels)"))
+        } else {
+            $outputs.Add((New-OutputTrack $pt.Pos 'copy' 0 0 "$($pt.Name) $(Get-ChannelLabel $pt.Channels)" `
+                "audio $($pt.Pos): passthrough, copied as-is" "$($pt.Codec) $($pt.Channels)"))
+        }
+    }
+
     foreach ($m in $keep) {
         if ($m.Codec -like 'pcm_*') {
             $track = New-OutputTrack $m.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $m.Channels)" `
@@ -460,8 +504,20 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
     # e.g. "Dolby Digital 5.1 (from Dolby TrueHD + Dolby Atmos 7.1), Dolby TrueHD + Dolby Atmos 7.1"
     $trackLabel = (@($outputs | ForEach-Object {
-        if ($_.Codec -eq 'copy') { $_.Title } else { "$($_.Title) (from $srcLabel)" }
+        if ($_.Codec -ne 'copy' -and $_.SrcPos -eq $pick.Pos) { "$($_.Title) (from $srcLabel)" } else { $_.Title }
     })) -join ', '
+
+    # ------------------------------------------------ possible commentary tracks
+    # Only on a first remux (the MP4 has no audio yet): lossy stereo tracks that will be
+    # dropped may be commentary worth keeping with -Passthru.
+    $usedPos = @($outputs | ForEach-Object { $_.SrcPos })
+    if ($currentLayout.Count -eq 0) {
+        $maybe = @($audio | Where-Object { -not $_.Lossless -and $_.Channels -le 2 -and $_.Pos -notin $usedPos })
+        if ($maybe.Count -gt 0) {
+            $script:FlagCommentary = ($maybe | ForEach-Object { Get-TrackDesc $_ }) -join '; '
+            Write-Warning "Lossy stereo track(s) will be dropped; check whether they're commentary: $($script:FlagCommentary). Keep with -Passthru."
+        }
+    }
 
     # ------------------------------------------------ already done?
     if (-not $Force -and -not $reuse -and (($currentLayout -join '|') -eq ($plannedLayout -join '|'))) {
@@ -519,7 +575,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         if ($i -eq 0) { $flag = '  [default]' }
         Write-Host ("  a:{0}  {1,-40} {2}{3}" -f $i, $o.Title, $o.Note, $flag)
     }
-    foreach ($d in @($audio | Where-Object { $_.Pos -ne $pick.Pos -and $_.Pos -notin $keepPos })) {
+    foreach ($d in @($audio | Where-Object { $_.Pos -notin $usedPos })) {
         Write-Host "  dropped: audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
     }
     if ($Replace) { Write-Host "Replaces: $VideoFile" } else { Write-Host "Output:   $outFile" }
@@ -662,11 +718,13 @@ $failed      = [Collections.Generic.List[string]]::new()
 $skippedDirs = [Collections.Generic.List[string]]::new()
 $unmatched   = [Collections.Generic.List[string]]::new()
 $noLosslessTitles  = [Collections.Generic.List[string]]::new()
+$commentaryTitles  = [Collections.Generic.List[string]]::new()
 
 if (-not $batch) {
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
 } else {
     if ($SourceTrack -ge 0) { throw '-SourceTrack only works with single files.' }
+    if ($Passthru.Count -gt 0) { throw '-Passthru only works with single files (one -Source MKV and one -Dest MP4), not folders.' }
 
     $srcRoot = $Source.TrimEnd('\', '/')
     $dstRoot = $Dest.TrimEnd('\', '/')
@@ -709,8 +767,10 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
     Write-Host ("`n==== [{0}/{1}] {2}" -f ($n + 1), $pairs.Count, $name) -ForegroundColor Yellow
     try {
         $script:FlagNoLossless = $false
+        $script:FlagCommentary = ''
         $r = Invoke-AudioRebuild $p.Source $p.Video
         if ($script:FlagNoLossless) { $noLosslessTitles.Add("$name  ($($r.Status): $($r.Message))") }
+        if ($script:FlagCommentary) { $commentaryTitles.Add("$name`n      dropped: $($script:FlagCommentary)") }
         switch ($r.Status) {
             'Done'    { $done.Add("$name  ($($r.Message))") }
             'Planned' { $planned.Add("$name  ($($r.Message))") }
@@ -744,6 +804,7 @@ Add-Section 'FAILED' $failed
 Add-Section 'Folders skipped: no mirrored MP4s' $skippedDirs
 Add-Section 'MKVs without a mirrored MP4 (in otherwise matched folders)' $unmatched
 Add-Section 'No lossless audio in the source (best lossy track used)' $noLosslessTitles
+Add-Section 'Possible commentary: lossy stereo tracks dropped on a first remux (keep with -Passthru)' $commentaryTitles
 Add-Section 'Skipped' $skipped
 Add-Section 'Planned (dry run)' $planned
 Add-Section 'Done' $done
