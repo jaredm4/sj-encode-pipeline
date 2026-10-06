@@ -45,7 +45,7 @@ FPS=${FPS:-24000/1001}
 CLIP=${CLIP:-60}
 SUB=${SUB:-5}
 THREADS=${THREADS:-4}
-WORK=${WORK:-./vmaf_compare}
+WORK=${WORK:-./vmaf_compare_$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 4)}
 MODEL_OVERRIDE=${MODEL:-}
 MODEL_4K_MIN_WIDTH=${MODEL_4K_MIN_WIDTH:-3800}
 
