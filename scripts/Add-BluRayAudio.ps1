@@ -1,21 +1,24 @@
 <#
 .SYNOPSIS
-    Rebuilds the audio of encoded MP4s from their Blu-ray source MKVs: a compatible
-    default track first, then every lossless master, all inside the MP4.
+    Rebuilds the audio of encoded MKVs from their Blu-ray source MKVs: a compatible
+    default track first, then commentary, then every lossless master. Muxed with
+    mkvmerge; new audio is encoded with ffmpeg.
 
 .DESCRIPTION
     Works on one pair of files, or on whole mirrored folder trees.
 
-    Single mode: -Source is the MKV and -Dest is the encoded MP4.
+    Single mode: -Source is the source MKV and -Dest is the encoded video (.mkv, or an
+                 older .mp4 to migrate).
 
-    Batch mode:  -Source and -Dest are mirrored folder trees (or the same folder). Every
-                 MKV under -Source (recursively) is matched only to the MP4 at the same
-                 relative path under -Dest, with the same file name:
-                   S:\Sources\Shows\Show Name (2024)\Season 01\Show Name (2024) S01E01 Episode Title.mkv
-                   L:\Library\Shows\Show Name (2024)\Season 01\Show Name (2024) S01E01 Episode Title.mp4
-                 - A folder whose MKVs have no mirrored MP4 at all is skipped.
+    Batch mode:  -Source and -Dest are two different, mirrored folder trees. Every MKV
+                 under -Source (recursively) is matched only to the file at the same
+                 relative path under -Dest with the same name: "<name>.mkv", or else
+                 "<name>.mp4" (an older encode, migrated to MKV by this script):
+                   S:\Sources\Shows\Show (2010)\Season 01\Show (2010) S01E05 Episode Title.mkv
+                   L:\Library\Shows\Show (2010)\Season 01\Show (2010) S01E05 Episode Title.mkv
+                 - A folder whose MKVs have no mirrored file at all is skipped.
                  - In a partly matched folder, the matched pairs are processed and each
-                   MKV without a mirrored MP4 is listed with the path that was expected.
+                   MKV without a mirrored file is listed with the path that was expected.
                  Everything skipped or failed is listed in the summary at the end.
                  One failed pair doesn't stop the batch.
 
@@ -24,95 +27,107 @@
     "Add-BluRayAudio 2026-10-01 193512.log"
 
     For each pair:
-    1. Checks that the MP4 and MKV are the same length (within 2 s), to catch mismatched
-       pairs before doing any work.
-    2. Masters: every lossless track in the MKV (TrueHD incl. Atmos, DTS-HD MA incl.
-       DTS:X and its built-in DTS core, PCM, FLAC, ALAC, MLP). Separate lossy tracks
-       (AC-3, E-AC-3, DTS, AAC, Opus...) are not masters. The source's Default flag is
-       ignored. PCM becomes FLAC (still lossless).
-    3. Main track (what the compatibility track is made from): the master with the most
-       channels (then highest bitrate, then first in the list). If the source has no
-       lossless track, the best lossy track is used the same way and the title is
-       listed in its own section of the log. -SourceTrack overrides the choice (single
-       mode only).
-    4. The MP4's video is copied untouched and all of its audio is rebuilt from the MKV:
-         a:0  compatibility track (Default), made from the main track:
-                - AC-3, E-AC-3 or AAC: copied as-is.
-                - Other stereo or mono: AAC (-AacBitrate).
-                - Other surround: a new AC-3 5.1 track (-Ac3Bitrate).
-         then any commentary tracks (detected, or chosen with -PassthruCommentaries),
-              copied as-is.
-         then every master, main one first. With no lossless track, a main track that
-              had to be converted (e.g. lossy DTS) is kept here as-is instead, so the
-              original is never lost.
-       Players use a:0 by default; viewers can pick a master if their device supports it.
-       If the MP4's audio already matches this plan, the title is skipped. An MP4
-       remuxed before commentary detection existed is remuxed again if a commentary
-       track was detected for it, so its commentary gets added.
-    5. Stereo track check (every title, unless -PassthruCommentaries overrides it for
-       a single file): each lossy stereo track that isn't otherwise
-       used is compared with the main track in 5 clips of up to 60 s (at 15/30/45/60/75%
-       of the runtime). Both are mixed to mono and their loudness is measured 10 times a
-       second; the check counts the moments where the stereo track is clearly louder
-       than the main track predicts (more than 6 dB), i.e. someone talking over the
-       film. The highest share across the clips decides:
-         - 15% or more  -> commentary (kept automatically)
-         - 3% or more   -> narration / audio description (reported, not kept)
-         - below that   -> a downmix of the main track (dropped)
-       Every checked track is listed in the summary with its score and whether it is
-       kept. The cutoffs ($CommentaryMinPercent, $NarrationMinPercent) and the clip
-       count and length are set at the top of the script, for tuning.
-       All other source audio tracks are dropped. Chapters come from the MKV.
-       Title metadata is set from the file name, following the Apple/iTunes MP4 tag
-       convention (read by Apple TV, Infuse, Plex, Kodi, VLC). Bracketed parts like
-       " [tmdbid-1234]" are removed and trailing ".tag" parts become " [tag]".
+    1. Checks that the encoded file and the source MKV are the same length (within 2 s).
+    2. Masters: every lossless track in the source (TrueHD incl. Atmos, DTS-HD MA incl.
+       DTS:X and its built-in DTS core, PCM, FLAC, ALAC, MLP). The source's Default flag
+       is ignored. Main track: the master with the most channels (then highest
+       bitrate, then first in the list). -SourceTrack overrides it (single mode only).
+    3. Default (compatibility) track, chosen from the main track:
+         - TrueHD 5.1 or more: its AC-3 core, copied (448 kbps or more). The core is
+           the AC-3 with the same disc stream ID (the SOURCE_ID tag), or else the
+           AC-3 right after the TrueHD. No core, or one under 448 kbps, is an ERROR:
+           the source MKV is probably missing tracks.
+         - Other masters of 5.1 or more (DTS-HD MA, PCM...): an existing 5.1 AC-3 that
+           the comparison (step 4) shows is the same mix, copied. Otherwise a new
+           AC-3 5.1 (-Ac3Bitrate).
+         - Stereo or mono masters: an existing lossy track with the same channel count
+           (not DTS) that is the same mix, copied. Otherwise a new AAC (-AacBitrate).
+         - No lossless track at all: the best lossy track (listed in its own summary
+           section). AC-3, E-AC-3 or AAC is copied as-is; anything else (e.g. lossy
+           DTS) is converted (AC-3 5.1 or AAC) and the original is kept as a master.
+    4. Comparison: each lossy track that could be a copy or a commentary is compared
+       with the main track in 5 clips of up to 60 s (at 15-75% of the runtime). Both
+       are mixed to mono and their loudness is measured 10 times a second. Two shares
+       are counted: moments where the track is clearly LOUDER than the main track
+       predicts (someone talking over the film), and moments where it is clearly
+       QUIETER (something missing, e.g. an isolated score). Then:
+         - louder 15%+ in at least 4 of the 5 clips -> commentary (kept automatically,
+           if stereo or mono). A commentator talks through the whole film; a different
+           mix, like an original theatrical stereo mix, only differs in some scenes.
+         - louder 3%+ in some clip, but quieter under 10% -> narration / audio
+           description (dropped): the film plus a narrator, nothing removed.
+         - louder and quieter both under 3% -> same mix as the main track (usable as
+           the default track).
+         - anything else -> a different mix (dropped).
+       Every compared track is listed in the summary with its result. The cutoffs and
+       clip settings are at the top of the script, for tuning.
+    5. Output track order: default track, then commentary (flagged as commentary),
+       then every master (main one first). Everything else is dropped. PCM masters
+       become FLAC (still lossless). Chapters come from the source MKV.
+       Metadata comes from the file name, using Matroska's tag scheme: bracketed parts
+       like " [tmdbid-1234]" are removed and trailing ".tag" parts become " [tag]".
          Episodes: "Show Name (2024) S01E04 Episode Title" -> title "Episode Title", show
-                   "Show Name", season 1, episode 4, episode ID "S01E04", year 2024,
-                   media kind TV Show.
+                   "Show Name", season 1, episode 4, year 2024.
          Movies:   "Name, Inc. (2001) [tmdbid-12345] - 2160p.imax" -> title
-                   "Name, Inc. (2001) - 2160p [imax]", year 2001, media kind Movie.
-       The video track gets the same title.
-    6. Warns (in the console and its own summary section) when a kept audio track's
-       length in the MKV differs from the video by more than 2 s, e.g. a main track that
-       ends a few seconds early. That's how the disc is, so it isn't an error.
-       Verifies the result: the audio tracks match the plan, lengths match the original,
-       Dolby Vision survived (if the MP4 had it), and the metadata is set. With
-       -Replace, the original MP4 is only replaced after these checks pass.
+                   "Name, Inc. (2001) - 2160p [imax]", year 2001.
+       The file title and the video track name are set to the title.
+       If the encoded MKV's audio already matches this plan, the title is skipped.
+    6. Warns when a kept track's length in the source differs from the video by more
+       than 2 s (e.g. a main track that ends early). That's how the disc is.
+       Verifies the result: the tracks match the plan, each track is as long as its
+       source track, the file is as long as the original, the default track is set and
+       Dolby Vision survived (if the encoded video had it).
 
-    Output without -Replace: "<name>.remux.mp4" next to the original, for review.
-    Output with -Replace:    the original MP4 is replaced in place. If a .remux.mp4 from
-                             an earlier run without -Replace exists, it is verified and
-                             used as-is instead of remuxing again. So you can: run once,
-                             check the .remux.mp4 files, then run again with -Replace.
+    The remux is written as "<name>.remux.mkv.partial" and only renamed once it passes
+    verification; a failed one stays ".partial" for inspection (Jellyfin ignores it).
+    Output without -Replace: "<name>.remux.mkv" next to the original, for review.
+    Output with -Replace:    "<name>.mkv" replaced in place (an .mp4 original is
+                             deleted after its .mkv replacement is verified).
+    Reviewing first: run without -Replace, check the .remux.mkv files, then run again
+    with -Replace. A .remux.mkv has already passed full verification, so -Replace only
+    gives it a quick check (opens, has audio, same length, Dolby Vision kept) and swaps
+    it in, with no source analysis or comparisons. -Force redoes it from scratch.
+
+    Subtitle backup: if the source MKV has subtitle tracks (e.g. PGS), they are all
+    copied, unchanged, into one Matroska subtitle file next to the encoded file, as a
+    backup for when the source MKVs are deleted. The ".originals" extension keeps
+    Jellyfin from showing it as an extra subtitle. It follows the same flow as the
+    remux: "<name>.remux.mks.originals" for review without -Replace, then
+    "<name>.mks.originals" (moved into place by -Replace, or written directly with
+    -Replace). Verified by its track count; existing backups are skipped. This runs
+    for every title, even when the audio needs no changes.
+    New audio is encoded to temporary files in your local temp folder, which are
+    deleted afterwards.
+
+    Requires ffmpeg, ffprobe and mkvmerge (MKVToolNix) on PATH. MKVToolNix installs
+    to "C:\Program Files\MKVToolNix", which is not on PATH by default.
 
 .PARAMETER Source
-    Required. The source MKV (single mode), or the root folder of the MKV tree to search
-    recursively (batch mode). Must be the same kind as -Dest: both files or both folders.
+    Required. The source MKV (single mode), or the root folder of the source MKV tree
+    (batch mode). Must be the same kind as -Dest: both files or both folders.
     Alias: -SourceFile.
 .PARAMETER Dest
-    Required. The encoded MP4 (single mode), or the root folder of the mirrored MP4 tree
-    (batch mode). Can be the same folder as -Source.
+    Required. The encoded .mkv or .mp4 (single mode), or the root folder of the mirrored
+    encoded tree (batch mode). Must be a different folder from -Source.
     Alias: -VideoFile.
 .PARAMETER SourceTrack
     Single mode only. Use this source audio track as the main track (the one the
-    compatibility track is made from) instead of auto-detecting it. Doesn't change which
+    default track is made from) instead of auto-detecting it. Doesn't change which
     tracks are masters. Track numbers work as described under -PassthruCommentaries.
     Default: -1 (auto-detect: the master with the most channels, or the best lossy
     track if there is no lossless one).
 .PARAMETER PassthruCommentaries
-    Single mode only: overrides which commentary tracks are kept for this one file, and
-    skips the stereo track check for it. Without this option (the default, and always
-    in batch mode), every track the check detects as commentary is kept automatically.
+    Single mode only: overrides which commentary tracks are kept for this one file.
+    Without this option (the default, and always in batch mode), every stereo or mono
+    track the comparison detects as commentary is kept.
       -PassthruCommentaries 2,3
-          Keep exactly these source audio tracks as commentary, copied as-is. PCM
-          becomes FLAC (still lossless), since MP4 doesn't handle PCM well.
+          Keep exactly these source audio tracks as commentary, copied as-is.
       -PassthruCommentaries None
-          Keep no commentary for this file (e.g. if the check got it wrong).
-    TRACK NUMBERS: 0 = the first AUDIO track in the MKV. Video and subtitle tracks are
-    not counted. Use the "Pos" column the script prints (run with -WhatIf to see it).
+          Keep no commentary for this file (e.g. if the comparison got it wrong).
+    TRACK NUMBERS: 0 = the first AUDIO track in the source MKV. Video and subtitle
+    tracks are not counted. Use the "Pos" column the script prints (run with -WhatIf).
       - MediaInfo's "Audio #1" is Pos 0 (subtract 1).
       - Don't use MKVToolNix track IDs: those count the video track too.
-    Kept tracks are marked as commentary in the MP4.
     Default: automatic (keep every detected commentary).
 .PARAMETER PassthruTitles
     Titles for the tracks given as numbers in -PassthruCommentaries, one per track, in
@@ -122,44 +137,39 @@
     Only works with track numbers (not with None, and not in batch mode).
     Default: "Commentary" for every kept track.
 .PARAMETER AacBitrate
-    AAC bitrate in kbps for the compatibility track made from stereo sources.
+    AAC bitrate in kbps for a new default track made from a stereo source.
     Mono sources are capped at 256 (AAC's per-channel limit).
     Allowed: 96-576. Default: 512.
 .PARAMETER Ac3Bitrate
-    AC-3 (Dolby Digital) bitrate in kbps for the 5.1 compatibility track made from
-    surround sources.
+    AC-3 (Dolby Digital) bitrate in kbps for a new 5.1 default track.
     Allowed: 384, 448, 512, 576, 640 (640 is AC-3's maximum). Default: 640.
 .PARAMETER AudioLanguage
     ISO 639-2 three-letter language tag written on every audio track.
     Default: eng.
 .PARAMETER Replace
-    Replace each original MP4 with its remux once it passes verification. Uses an
-    existing "<name>.remux.mp4" from an earlier run if there is one (after verifying it);
-    otherwise the remux is created first.
-    Default: off (writes "<name>.remux.mp4" next to the original).
+    Replace each original with its remux once it passes verification ("<name>.mkv";
+    an .mp4 original is deleted). Uses an existing "<name>.remux.mkv" from an earlier
+    run if there is one (after a quick check, without redoing any analysis); otherwise
+    the remux is created first.
+    Default: off (writes "<name>.remux.mkv" next to the original).
 .PARAMETER Force
-    Redo remuxes even if a .remux.mp4 exists (overwriting it, also with -Replace), and
-    even if the MP4's audio already matches the plan.
+    Redo remuxes even if a .remux.mkv exists (overwriting it, also with -Replace), even
+    if the encoded MKV's audio already matches the plan, and redo subtitle backups
+    even if they exist.
     Default: off.
 .PARAMETER WhatIf
-    Built-in PowerShell switch. Show the matching and every plan, including the exact
-    ffmpeg commands, without writing anything.
+    Built-in PowerShell switch. Show the matching, the comparisons and every plan,
+    including the exact ffmpeg and mkvmerge commands, without writing anything.
 
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Shows' -Dest 'L:\Library\Shows' -WhatIf
-    Shows the matching and every plan without writing anything.
+    Previews the whole tree.
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Shows' -Dest 'L:\Library\Shows' -Replace
-    Processes the whole tree, replacing MP4s in place.
+    Processes the whole tree, replacing the encoded files in place.
 .EXAMPLE
-    .\Add-BluRayAudio.ps1 -Source '.\S01E01.mkv' -Dest '.\S01E01.mp4'
-    Single pair, writing S01E01.remux.mp4 next to the MP4.
-.EXAMPLE
-    .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Movies' -Dest 'L:\Library\Movies' -WhatIf
-    Previews the whole library, including which commentary tracks would be added.
-.EXAMPLE
-    .\Add-BluRayAudio.ps1 -Source '.\Movie.mkv' -Dest '.\Movie.mp4' -PassthruCommentaries 3 -PassthruTitles "Director's Commentary"
-    Keeps the MKV's 4th audio track (Pos 3) as-is, titled "Director's Commentary".
+    .\Add-BluRayAudio.ps1 -Source '.\sources\Movie.mkv' -Dest '.\encodes\Movie.mkv' -PassthruCommentaries 3 -PassthruTitles "Director's Commentary"
+    Single pair, keeping the source's 4th audio track (Pos 3) as a titled commentary.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -179,18 +189,19 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $script:Cmdlet = $PSCmdlet
 
-# ---- Stereo track check: cutoffs (tune these after testing on your discs) ----
-# Share of measured moments where a stereo track is clearly louder than the main track
-# predicts. The highest share across the clips is compared with these.
-$CommentaryMinPercent = 15   # at or above: commentary
-$NarrationMinPercent  = 3    # at or above (but below the commentary cutoff): narration
-$CheckClipCount       = 5    # clips per title, spread over 15-75% of the runtime
-$CheckClipSeconds     = 60   # longest clip length
+# ---- Tunables (adjust after testing on your discs) ----
+$CommentaryMinPercent = 15    # louder share a clip needs to count toward commentary...
+$CommentaryMinClips   = 4     # ...in at least this many clips (a commentator talks throughout)
+$NarrationMinPercent  = 3     # louder share at or above (in any clip): narration...
+$NarrationMaxQuieter  = 10    # ...if its quieter share stays below this (nothing removed)
+$SameMixMaxPercent    = 3     # louder and quieter shares both below this: same mix
+$CoreMinKbps          = 448   # minimum bitrate for a TrueHD's AC-3 core
+$CheckClipCount       = 5     # comparison clips per title, spread over 15-75% of the runtime
+$CheckClipSeconds     = 60    # longest clip length
 
-# Note: PowerShell variable names are case-insensitive, so every variable below has a
-# name that differs by more than case from the others in the same scope. Property
-# shorthand like "ForEach-Object Name" is avoided too: it honors -WhatIf and then
-# returns nothing, so "ForEach-Object { $_.Name }" is used instead.
+# Note: PowerShell variable names are case-insensitive, so names in the same scope
+# differ by more than case. Property shorthand like "ForEach-Object Name" is avoided:
+# it honors -WhatIf and then returns nothing ("ForEach-Object { $_.Name }" is used).
 
 # ================================================================ helpers
 
@@ -252,6 +263,10 @@ function Format-Arg([string]$Arg) {
     return $Arg
 }
 
+function Format-Command([string]$Exe, [string[]]$ArgList) {
+    return (Format-Arg $Exe) + ' ' + (($ArgList | ForEach-Object { Format-Arg $_ }) -join ' ')
+}
+
 function Get-Streams([string]$File) {
     $json = & $script:ffprobe -v error -show_streams -of json $File | Out-String
     if ($LASTEXITCODE -ne 0) { throw "ffprobe failed on $File" }
@@ -262,6 +277,13 @@ function Get-Format([string]$File) {
     $json = & $script:ffprobe -v error -show_format -of json $File | Out-String
     if ($LASTEXITCODE -ne 0) { throw "ffprobe failed on $File" }
     return (ConvertFrom-Json $json).format
+}
+
+# mkvmerge's view of a file's tracks (its track IDs are what mkvmerge options use).
+function Get-MkvTracks([string]$File) {
+    $json = & $script:mkvmerge -J $File | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "mkvmerge couldn't read $File" }
+    return @((ConvertFrom-Json $json).tracks)
 }
 
 # Length of one stream in seconds: ffprobe's duration, or the DURATION tag muxers and
@@ -289,19 +311,34 @@ function Test-DolbyVision($VideoStream) {
     return [bool](@($sideData | Where-Object { (Get-Field $_ 'side_data_type') -like 'DOVI*' }).Count)
 }
 
-# "codec channels" for each audio stream, e.g. "ac3 6", "truehd 8"; used to compare an
-# MP4's audio with the plan.
+# "codec channels" for each audio stream, e.g. "ac3 6", "truehd 8"; compared with the plan.
 function Get-AudioLayout($Streams) {
     return @($Streams | Where-Object { $_.codec_type -eq 'audio' } |
         ForEach-Object { "$($_.codec_name) $([int]$_.channels)" })
 }
 
-# One planned MP4 audio track. Layout is what ffprobe should report for it afterwards.
-function New-OutputTrack([int]$SrcPos, [string]$Codec, [int]$Kbps, [int]$Ac, [string]$Title, [string]$Note, [string]$Layout) {
+# One planned output audio track.
+#   From:   'source' (copied from the source MKV) or 'encode' (made with ffmpeg)
+#   Layout: what ffprobe should report for it afterwards
+function New-OutputTrack([string]$From, [int]$SrcPos, [string]$Codec, [int]$Kbps, [int]$Ac,
+                         [string]$Title, [string]$Note, [string]$Layout) {
     return [pscustomobject]@{
-        SrcPos = $SrcPos; Codec = $Codec; Kbps = $Kbps; Ac = $Ac
+        From = $From; SrcPos = $SrcPos; Codec = $Codec; Kbps = $Kbps; Ac = $Ac
         Title = $Title; Note = $Note; Layout = $Layout
+        IsDefault = $false; IsCommentary = $false; TempFile = ''
     }
+}
+
+# e.g. "audio 3: Dolby Digital 2.0, 192 kbps, 'Stereo'"
+function Get-TrackDesc($Track) {
+    $desc = "audio $($Track.Pos): $($Track.Name) $(Get-ChannelLabel $Track.Channels)"
+    if ($Track.BitRate -gt 0) { $desc += ", $([math]::Round($Track.BitRate / 1000)) kbps" }
+    if ($Track.Title) { $desc += ", '$($Track.Title)'" }
+    return $desc
+}
+
+function New-Result([string]$Status, [string]$Message) {
+    return [pscustomobject]@{ Status = $Status; Message = $Message }
 }
 
 # Loudness of one audio track over a clip, 10 values per second (dB). The track is mixed
@@ -330,7 +367,8 @@ function Get-LoudnessCurve([string]$File, [int]$AudioPos, [double]$Start, [doubl
 }
 
 # Share (%) of moments where $Other is more than 6 dB louder than predicted from $Main
-# (a straight-line fit of Other's loudness against Main's).
+# (a straight-line fit of Other's loudness against Main's). Swap the arguments to count
+# moments where Other is quieter than predicted.
 function Get-ExtraSoundPercent([double[]]$Main, [double[]]$Other) {
     $count = [Math]::Min($Main.Length, $Other.Length)
     if ($count -lt 10) { return 0.0 }
@@ -353,43 +391,14 @@ function Get-ExtraSoundPercent([double[]]$Main, [double[]]$Other) {
     return 100.0 * $louder / $count
 }
 
-# e.g. "audio 3: Dolby Digital 2.0, 192 kbps, 'Stereo'"
-function Get-TrackDesc($Track) {
-    $desc = "audio $($Track.Pos): $($Track.Name) $(Get-ChannelLabel $Track.Channels)"
-    if ($Track.BitRate -gt 0) { $desc += ", $([math]::Round($Track.BitRate / 1000)) kbps" }
-    if ($Track.Title) { $desc += ", '$($Track.Title)'" }
-    return $desc
-}
-
-function New-Result([string]$Status, [string]$Message) {
-    return [pscustomobject]@{ Status = $Status; Message = $Message }
-}
-
-# ffprobe doesn't read track titles back from MP4 files (ffmpeg writes them where
-# MediaInfo, Jellyfin and players read them), so MP4 track titles are checked with the
-# MediaInfo CLI when it's installed. Returns $null if MediaInfo isn't available.
-function Get-Mp4Titles([string]$File) {
-    if (-not $script:mediainfo) { return $null }
-    $v = (& $script:mediainfo '--Inform=Video;%Title%|' $File | Out-String).Trim()
-    $a = (& $script:mediainfo '--Inform=Audio;%Title%|' $File | Out-String).Trim()
-    return [pscustomobject]@{
-        Video = ($v -split '\|')[0]
-        Audio = @($a -split '\|')
-    }
-}
-
-# Title metadata from the MP4's file name (without extension), following the Apple/iTunes
-# MP4 tag convention read by Apple TV, Infuse, Plex, Kodi and VLC.
-# - Bracketed parts like " [tmdbid-1234]" are removed.
-# - Trailing ".tag" parts become " [tag]" at the end of the title. A ".tag" counts only
-#   if it has no spaces, isn't all digits, and the dot isn't followed by a space
-#   (so "Name, Inc. (2001)" and "Dr. Name" are safe).
-# Episodes (the name contains SxxEyy):
-#   "Show Name (2024) S01E04 Episode Title"
-#     -> Title "Episode Title", Show "Show Name", Season 1, Episode 4, EpisodeId "S01E04", Year 2024
-# Movies:
+# Title info from the file name (without extension):
 #   "Name, Inc. (2001) [tmdbid-12345] - 2160p.imax"
-#     -> Title "Name, Inc. (2001) - 2160p [imax]", Year 2001
+#     -> movie, Title "Name, Inc. (2001) - 2160p [imax]", Year 2001
+#   "Show Name (2024) S01E04 Episode Title"
+#     -> episode, Title "Episode Title", Show "Show Name", Season 1, Episode 4, Year 2024
+# Bracketed parts like " [tmdbid-1234]" are removed; trailing ".tag" parts become " [tag]".
+# A ".tag" counts only if it has no spaces, isn't all digits, and the dot isn't followed
+# by a space (so "Name, Inc. (2001)" and "Dr. Name" are safe).
 function Get-TitleInfo([string]$BaseName) {
     $text = $BaseName.Trim()
     $tags = [Collections.Generic.List[string]]::new()
@@ -405,21 +414,17 @@ function Get-TitleInfo([string]$BaseName) {
     $result = [pscustomobject]@{
         Kind = 'Movie'; Title = ''; Show = ''; Season = 0; Episode = 0; EpisodeId = ''; Year = ''
     }
-
     if ($text -match '^(?<show>.+?)\s+(?<id>S(?<s>\d{1,3})E(?<e>\d{1,4})(?:-?E\d{1,4})*)(?:\s+(?:-\s+)?(?<ep>.*))?$') {
-        $show = $Matches['show'].Trim()
+        $show = ($Matches['show'].Trim() -replace '\s*-$', '').Trim()
         $epId = $Matches['id'].ToUpper()
         $seasonNum = [int]$Matches['s']
         $episodeNum = [int]$Matches['e']
         $epName = ([string]$Matches['ep']).Trim()
-
-        $show = ($show -replace '\s*-$', '').Trim()
         if ($show -match '^(.*?)\s*\((\d{4})\)$') {
             $result.Year = $Matches[2]
             $show = $Matches[1].Trim()
         }
         if (-not $epName) { $epName = $epId }
-
         $result.Kind = 'Episode'
         $result.Title = $epName + $tagSuffix
         $result.Show = $show
@@ -437,58 +442,170 @@ function Get-TitleSummary($TitleInfo) {
     $yearText = ''
     if ($TitleInfo.Year) { $yearText = ", $($TitleInfo.Year)" }
     if ($TitleInfo.Kind -eq 'Episode') {
-        return "title '$($TitleInfo.Title)' (TV: $($TitleInfo.Show), season $($TitleInfo.Season), episode $($TitleInfo.Episode) [$($TitleInfo.EpisodeId)]$yearText)"
+        return "title '$($TitleInfo.Title)' (TV: $($TitleInfo.Show), season $($TitleInfo.Season), episode $($TitleInfo.Episode)$yearText)"
     }
     return "title '$($TitleInfo.Title)' (movie$yearText)"
 }
 
+# Matroska's own tag scheme (the MKV counterpart of the MP4 show/season/episode tags):
+#   level 70 = the show, 60 = the season, 50 = the episode or movie.
+function Get-TagsXml($TitleInfo) {
+    function Simple([string]$TagName, [string]$Value) {
+        return "<Simple><Name>$TagName</Name><String>$([Security.SecurityElement]::Escape($Value))</String></Simple>"
+    }
+    $parts = [Collections.Generic.List[string]]::new()
+    $parts.Add('<?xml version="1.0" encoding="UTF-8"?>')
+    $parts.Add('<Tags>')
+    if ($TitleInfo.Kind -eq 'Episode') {
+        $showTags = Simple 'TITLE' $TitleInfo.Show
+        if ($TitleInfo.Year) { $showTags += Simple 'DATE_RELEASED' $TitleInfo.Year }
+        $parts.Add("<Tag><Targets><TargetTypeValue>70</TargetTypeValue></Targets>$showTags</Tag>")
+        $parts.Add("<Tag><Targets><TargetTypeValue>60</TargetTypeValue></Targets>$(Simple 'PART_NUMBER' "$($TitleInfo.Season)")</Tag>")
+        $parts.Add("<Tag><Targets><TargetTypeValue>50</TargetTypeValue></Targets>$(Simple 'TITLE' $TitleInfo.Title)$(Simple 'PART_NUMBER' "$($TitleInfo.Episode)")</Tag>")
+    } else {
+        $movieTags = Simple 'TITLE' $TitleInfo.Title
+        if ($TitleInfo.Year) { $movieTags += Simple 'DATE_RELEASED' $TitleInfo.Year }
+        $parts.Add("<Tag><Targets><TargetTypeValue>50</TargetTypeValue></Targets>$movieTags</Tag>")
+    }
+    $parts.Add('</Tags>')
+    return $parts -join "`n"
+}
+
+# Backup of all of a source MKV's subtitle tracks (e.g. PGS), unchanged, in one Matroska
+# subtitle file next to the encoded file. The ".originals" extension keeps Jellyfin from
+# treating it as an extra subtitle. Same flow as the audio remux:
+#   "<name>.remux.mks.originals.partial" while writing,
+#   "<name>.remux.mks.originals" once verified (for review, without -Replace),
+#   "<name>.mks.originals" final (with -Replace).
+function Export-SubtitleBackup([string]$SourceFile, [string]$DestFile) {
+    $dir = [IO.Path]::GetDirectoryName($DestFile)
+    $base = [IO.Path]::GetFileNameWithoutExtension($DestFile)
+    $finalSubs = Join-Path $dir ($base + '.mks.originals')
+    $reviewSubs = Join-Path $dir ($base + '.remux.mks.originals')
+    $partialSubs = $reviewSubs + '.partial'
+
+    if ((Test-Path -LiteralPath $finalSubs) -and -not $Force) { return '' }
+    $srcSubCount = @(Get-MkvTracks $SourceFile | Where-Object { $_.type -eq 'subtitles' }).Count
+    if ($srcSubCount -eq 0) { return '' }
+
+    # A verified review copy from an earlier run: leave it, or move it into place.
+    if ((Test-Path -LiteralPath $reviewSubs) -and -not $Force) {
+        if (-not $Replace) { return '' }
+        $gotCount = @(Get-MkvTracks $reviewSubs | Where-Object { $_.type -eq 'subtitles' }).Count
+        if ($gotCount -ne $srcSubCount) {
+            throw "$([IO.Path]::GetFileName($reviewSubs)) has $gotCount subtitle track(s), the source has $srcSubCount. Use -Force to redo it."
+        }
+        if (-not $script:Cmdlet.ShouldProcess($finalSubs, 'Move the reviewed subtitle backup into place')) {
+            return "reviewed backup would be moved to $([IO.Path]::GetFileName($finalSubs))"
+        }
+        Move-Item -LiteralPath $reviewSubs -Destination $finalSubs -Force
+        return "reviewed backup moved to $([IO.Path]::GetFileName($finalSubs))"
+    }
+
+    $target = $reviewSubs
+    if ($Replace) { $target = $finalSubs }
+    if (-not $script:Cmdlet.ShouldProcess($target, "Back up $srcSubCount subtitle track(s)")) {
+        return "would back up $srcSubCount subtitle track(s) to $([IO.Path]::GetFileName($target))"
+    }
+    & $script:mkvmerge --quiet --output $partialSubs --no-video --no-audio --no-chapters --no-attachments --no-global-tags $SourceFile
+    if ($LASTEXITCODE -ge 2) {
+        Remove-Item -LiteralPath $partialSubs -Force -ErrorAction SilentlyContinue
+        throw "mkvmerge failed backing up subtitles (exit code $LASTEXITCODE)"
+    }
+    $gotCount = @(Get-MkvTracks $partialSubs | Where-Object { $_.type -eq 'subtitles' }).Count
+    if ($gotCount -ne $srcSubCount) {
+        throw "Subtitle backup has $gotCount track(s), the source has $srcSubCount. Left for inspection: $partialSubs"
+    }
+    Move-Item -LiteralPath $partialSubs -Destination $target -Force
+    return "backed up $srcSubCount subtitle track(s) to $([IO.Path]::GetFileName($target))"
+}
+
 # ================================================================ one pair
 
-function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
+function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 
-    $dir = [IO.Path]::GetDirectoryName($VideoFile)
-    $base = [IO.Path]::GetFileNameWithoutExtension($VideoFile)
-    $outFile = Join-Path $dir ($base + '.remux.mp4')
-
+    $dir = [IO.Path]::GetDirectoryName($DestFile)
+    $base = [IO.Path]::GetFileNameWithoutExtension($DestFile)
+    $destIsMp4 = ([IO.Path]::GetExtension($DestFile) -eq '.mp4')
+    $finalFile = Join-Path $dir ($base + '.mkv')
+    $outFile = Join-Path $dir ($base + '.remux.mkv')
+    $partialFile = $outFile + '.partial'   # written first; renamed to .remux.mkv once verified
     $titleInfo = Get-TitleInfo $base
     $videoTitle = $titleInfo.Title
     $titleDesc = Get-TitleSummary $titleInfo
 
-    # ------------------------------------------------ inspect the MP4
-    $videoFormat = Get-Format $VideoFile
-    $videoAll = Get-Streams $VideoFile
-    $videoStreams = @($videoAll | Where-Object { $_.codec_type -eq 'video' })
-    if ($videoStreams.Count -eq 0) { throw "No video stream found in $VideoFile" }
-    $videoCodec = [string]$videoStreams[0].codec_name
-    $videoHasDv = Test-DolbyVision $videoStreams[0]
-    $currentLayout = Get-AudioLayout $videoAll
+    if ($destIsMp4 -and (Test-Path -LiteralPath $finalFile)) {
+        throw "Both $base.mp4 and $base.mkv exist; remove one of them first."
+    }
 
-    # A .remux.mp4 from an earlier run: review it first, then -Replace uses it.
-    $reuse = $false
+    # ------------------------------------------------ inspect the encoded file
+    $destFormat = Get-Format $DestFile
+    $destAll = Get-Streams $DestFile
+    $destVideo = @($destAll | Where-Object { $_.codec_type -eq 'video' })
+    if ($destVideo.Count -eq 0) { throw "No video stream found in $DestFile" }
+    $destHasDv = Test-DolbyVision $destVideo[0]
+    $currentLayout = Get-AudioLayout $destAll
+
+    # A .remux.mkv from an earlier run has already passed full verification (it only gets
+    # that name afterwards). Without -Replace it's left for review. With -Replace it gets a
+    # quick sanity check and is swapped in: no source analysis, no comparisons.
+    # -Force skips this and redoes everything.
     if ((Test-Path -LiteralPath $outFile) -and -not $Force) {
         if (-not $Replace) {
-            return New-Result 'Skipped' 'a .remux.mp4 from an earlier run exists; review it, then run with -Replace to use it (or -Force to redo)'
+            return New-Result 'Skipped' 'a .remux.mkv from an earlier run exists; review it, then run with -Replace to use it (or -Force to redo)'
         }
-        $reuse = $true
+        $origLen = ConvertTo-Number (Get-Field $destFormat 'duration')
+        $rLen = ConvertTo-Number (Get-Field (Get-Format $outFile) 'duration')
+        $rStreams = Get-Streams $outFile
+        $rVideo = @($rStreams | Where-Object { $_.codec_type -eq 'video' })
+        $rLayout = Get-AudioLayout $rStreams
+        $quick = [Collections.Generic.List[string]]::new()
+        if ($rVideo.Count -eq 0) { $quick.Add('no video') }
+        if ($rLayout.Count -eq 0) { $quick.Add('no audio') }
+        if ($origLen -gt 0 -and [Math]::Abs($origLen - $rLen) -gt 2) {
+            $quick.Add(("it is {0} but the original is {1}" -f (Format-Duration $rLen), (Format-Duration $origLen)))
+        }
+        if ($destHasDv -and -not ($rVideo.Count -gt 0 -and (Test-DolbyVision $rVideo[0]))) { $quick.Add('Dolby Vision missing') }
+        if ($quick.Count -gt 0) {
+            throw "The existing .remux.mkv failed its quick check ($($quick -join '; ')). Use -Force to redo it."
+        }
+        $rWhat = 'replaced with the reviewed .remux.mkv'
+        if ($destIsMp4) { $rWhat += ' (MP4 migrated to MKV)' }
+        Write-Host "Reviewed remux found: $outFile (audio: $($rLayout -join ', '))"
+        if (-not $script:Cmdlet.ShouldProcess($DestFile, 'Replace with the reviewed .remux.mkv')) {
+            return New-Result 'Planned' "$rWhat; audio: $($rLayout -join ', ')"
+        }
+        Move-Item -LiteralPath $outFile -Destination $finalFile -Force
+        if ($destIsMp4) { Remove-Item -LiteralPath $DestFile -Force }
+        Write-Host '  Original replaced.' -ForegroundColor Green
+        return New-Result 'Done' "$rWhat; audio: $($rLayout -join ', ')"
     }
 
     # ------------------------------------------------ check the pair
     $srcFormat = Get-Format $SourceFile
-    $vLen = ConvertTo-Number (Get-Field $videoFormat 'duration')
+    $vLen = ConvertTo-Number (Get-Field $destFormat 'duration')
     $sLen = ConvertTo-Number (Get-Field $srcFormat 'duration')
     if ($vLen -gt 0 -and $sLen -gt 0 -and [Math]::Abs($vLen - $sLen) -gt 2) {
-        throw ("Length mismatch: MP4 is {0}, MKV is {1}. Is this the right pair?" -f (Format-Duration $vLen), (Format-Duration $sLen))
+        throw ("Length mismatch: encoded file is {0}, source MKV is {1}. Is this the right pair?" -f (Format-Duration $vLen), (Format-Duration $sLen))
     }
 
     $srcStreams = Get-Streams $SourceFile
     $srcVideo = @($srcStreams | Where-Object { $_.codec_type -eq 'video' })
-    if ($srcVideo.Count -gt 0 -and (Test-DolbyVision $srcVideo[0]) -and -not $videoHasDv) {
-        Write-Warning 'The source has Dolby Vision but the encoded video does not. The output will be HDR10 only.'
+    if ($srcVideo.Count -gt 0 -and (Test-DolbyVision $srcVideo[0]) -and -not $destHasDv) {
+        Write-Warning 'The source has Dolby Vision but the encoded video does not. The output will be HDR10/SDR only.'
     }
+
+    # mkvmerge track IDs (its options refer to tracks by these).
+    $destMkvVideo = @(Get-MkvTracks $DestFile | Where-Object { $_.type -eq 'video' })
+    if ($destMkvVideo.Count -eq 0) { throw "mkvmerge sees no video track in $DestFile" }
+    $srcMkvAudioIds = @(Get-MkvTracks $SourceFile | Where-Object { $_.type -eq 'audio' } | ForEach-Object { $_.id })
 
     # ------------------------------------------------ inspect source audio
     $srcAudio = @($srcStreams | Where-Object { $_.codec_type -eq 'audio' })
     if ($srcAudio.Count -eq 0) { throw "No audio tracks found in $SourceFile" }
+    if ($srcMkvAudioIds.Count -ne $srcAudio.Count) {
+        throw "ffprobe sees $($srcAudio.Count) audio tracks but mkvmerge sees $($srcMkvAudioIds.Count); refusing to guess the mapping."
+    }
 
     $audio = @(for ($i = 0; $i -lt $srcAudio.Count; $i++) {
         $st = $srcAudio[$i]
@@ -498,16 +615,20 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         $bitrate = ConvertTo-Number (Get-Field $st 'bit_rate')
         if ($bitrate -le 0) { $bitrate = ConvertTo-Number (Get-Field $tags 'BPS') }
         if ($bitrate -le 0) { $bitrate = ConvertTo-Number (Get-Field $tags 'BPS-eng') }
+        $sourceId = [string](Get-Field $tags 'SOURCE_ID')
+        if (-not $sourceId) { $sourceId = [string](Get-Field $tags 'SOURCE_ID-eng') }
 
         [pscustomobject]@{
             Pos      = $i
+            MkvId    = $srcMkvAudioIds[$i]
             Codec    = $codecName
             Name     = Get-FriendlyName $codecName $codecProfile
             Channels = [int](ConvertTo-Number (Get-Field $st 'channels'))
             BitRate  = $bitrate
             Lossless = Test-Lossless $codecName $codecProfile
-            Seconds  = Get-StreamSeconds $st
             Title    = [string](Get-Field $tags 'title')
+            Seconds  = Get-StreamSeconds $st
+            SourceId = $sourceId
         }
     })
 
@@ -518,9 +639,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         Lossless, Title | Out-Host
 
     # ------------------------------------------------ masters and the main track
-    # The Default flag is ignored: it doesn't reflect the disc.
-    # Masters = every lossless track (a DTS-HD MA track keeps its DTS core inside it;
-    # separate lossy DTS tracks are not masters).
+    # Masters = every lossless track (a DTS-HD MA track keeps its DTS core inside it).
     $masters = @($audio | Where-Object { $_.Lossless })
 
     # Best track = most channels, then highest bitrate, then first in the list.
@@ -546,26 +665,19 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         $why = 'NO LOSSLESS TRACK in the source; best lossy track'
         Write-Warning 'The source has no lossless audio track.'
     }
-
     $srcLabel = "$($pick.Name) $(Get-ChannelLabel $pick.Channels)"
     Write-Host "Main track: audio $($pick.Pos) - $srcLabel ($why)"
 
-    # Lossy formats that go into the MP4 as-is (every target player handles them).
-    $copyable = $pick.Codec -in @('ac3', 'eac3', 'aac')
+    # ------------------------------------------------ comparison with the main track
+    $isTrueHdMain = ($pick.Lossless -and $pick.Codec -eq 'truehd' -and $pick.Channels -ge 6)
+    $toCompare = @($audio | Where-Object {
+        -not $_.Lossless -and $_.Pos -ne $pick.Pos -and (
+            $_.Channels -le 2 -or
+            ($_.Codec -eq 'ac3' -and $_.Channels -eq 6 -and $pick.Lossless -and -not $isTrueHdMain -and $pick.Channels -ge 6))
+    })
 
-    # Kept after the compatibility track: every master, main one first. With no lossless
-    # track, a main track that has to be converted (e.g. lossy DTS) is kept as-is instead.
-    $keep = @($masters | Where-Object { $_.Pos -eq $pick.Pos }) + @($masters | Where-Object { $_.Pos -ne $pick.Pos })
-    if ($masters.Count -eq 0 -and -not $copyable) { $keep = @($pick) }
-    $keepPos = @($keep | ForEach-Object { $_.Pos })
-
-    # ------------------------------------------------ stereo track check
-    # Every lossy stereo track that isn't otherwise used, compared with the main track.
-    $candidates = @($audio | Where-Object {
-        -not $_.Lossless -and $_.Channels -le 2 -and $_.Pos -ne $pick.Pos -and $_.Pos -notin $keepPos })
     $verdicts = @{}   # source position -> verdict
-    # Skipped when -PassthruCommentaries overrides the choice for this file.
-    if ($candidates.Count -gt 0 -and $script:PassMode -eq 'Auto') {
+    if ($toCompare.Count -gt 0) {
         $runtime = $sLen
         if ($runtime -le 0) { $runtime = $vLen }
         $clipLen = [Math]::Min($CheckClipSeconds, [Math]::Floor($runtime * 0.1))
@@ -573,32 +685,114 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         $starts = @(for ($c = 0; $c -lt $CheckClipCount; $c++) {
             $runtime * (0.15 + 0.6 * $c / [Math]::Max(1, $CheckClipCount - 1))
         })
-        Write-Host ("Stereo track check: {0} track(s) vs the main track, {1} x {2:N0}s clips..." -f
-            $candidates.Count, $starts.Count, $clipLen)
+        Write-Host ("Comparing {0} track(s) with the main track, {1} x {2:N0}s clips..." -f
+            $toCompare.Count, $starts.Count, $clipLen)
 
         $mainCurves = [Collections.Generic.List[object]]::new()
         foreach ($st0 in $starts) { $mainCurves.Add((Get-LoudnessCurve $SourceFile $pick.Pos $st0 $clipLen)) }
 
-        foreach ($cand in $candidates) {
-            $scores = [Collections.Generic.List[double]]::new()
+        foreach ($cand in $toCompare) {
+            $louder = [Collections.Generic.List[double]]::new()
+            $quieter = [Collections.Generic.List[double]]::new()
             for ($c = 0; $c -lt $starts.Count; $c++) {
                 $curve = Get-LoudnessCurve $SourceFile $cand.Pos $starts[$c] $clipLen
-                $scores.Add((Get-ExtraSoundPercent $mainCurves[$c] $curve))
+                $louder.Add((Get-ExtraSoundPercent $mainCurves[$c] $curve))
+                $quieter.Add((Get-ExtraSoundPercent $curve $mainCurves[$c]))
             }
-            $top = ($scores | Measure-Object -Maximum).Maximum
-            $kind = 'downmix'
-            if ($top -ge $CommentaryMinPercent) { $kind = 'commentary' }
-            elseif ($top -ge $NarrationMinPercent) { $kind = 'narration' }
+            $topLouder = ($louder | Measure-Object -Maximum).Maximum
+            $topQuieter = ($quieter | Measure-Object -Maximum).Maximum
+            # Commentary talks through the whole film: high in (nearly) every clip. A different
+            # mix (e.g. an original theatrical stereo mix) only differs in some scenes.
+            $clipsOver = @($louder | Where-Object { $_ -ge $CommentaryMinPercent }).Count
+            $needClips = [Math]::Min($CommentaryMinClips, $starts.Count)
+            $kind = 'different mix'
+            if ($clipsOver -ge $needClips) { $kind = 'commentary' }
+            elseif ($topLouder -ge $NarrationMinPercent -and $topQuieter -lt $NarrationMaxQuieter) { $kind = 'narration' }
+            elseif ($topLouder -lt $SameMixMaxPercent -and $topQuieter -lt $SameMixMaxPercent) { $kind = 'same mix' }
             $verdicts[$cand.Pos] = [pscustomobject]@{
-                Kind = $kind; Top = $top
-                Clips = (($scores | ForEach-Object { '{0:N1}' -f $_ }) -join ' / ')
+                Kind = $kind; Louder = $topLouder; Quieter = $topQuieter
+                ClipsOver = "$clipsOver/$($starts.Count)"
+                Clips = (($louder | ForEach-Object { '{0:N1}' -f $_ }) -join ' / ')
             }
-            Write-Host ("  {0} -> {1} ({2:N1}% extra sound; clips {3})" -f (Get-TrackDesc $cand), $kind, $top, $verdicts[$cand.Pos].Clips)
+            Write-Host ("  {0} -> {1} (louder {2:N1}%, quieter {3:N1}%; louder per clip {4}; {5} clips at {6}%+)" -f
+                (Get-TrackDesc $cand), $kind, $topLouder, $topQuieter, $verdicts[$cand.Pos].Clips,
+                $verdicts[$cand.Pos].ClipsOver, $CommentaryMinPercent)
         }
     }
 
+    # Highest-bitrate track among $Tracks that the comparison found to be the same mix.
+    function Select-SameMix($Tracks) {
+        $best = $null
+        foreach ($t in $Tracks) {
+            if (-not $verdicts.ContainsKey($t.Pos) -or $verdicts[$t.Pos].Kind -ne 'same mix') { continue }
+            if (-not $best -or $t.BitRate -gt $best.BitRate) { $best = $t }
+        }
+        return $best
+    }
+
+    # ------------------------------------------------ default (compatibility) track
+    $copyable = $pick.Codec -in @('ac3', 'eac3', 'aac')
+    $compat = $null
+
+    if ($masters.Count -eq 0 -and $copyable) {
+        $compat = New-OutputTrack 'source' $pick.Pos 'copy' 0 0 $srcLabel 'copied as-is (no lossless track)' "$($pick.Codec) $($pick.Channels)"
+    } elseif ($isTrueHdMain) {
+        $core = @($audio | Where-Object {
+            $_.Codec -eq 'ac3' -and $_.Pos -ne $pick.Pos -and $pick.SourceId -and $_.SourceId -eq $pick.SourceId }) |
+            Select-Object -First 1
+        $how = 'same disc stream ID'
+        if (-not $core -and ($pick.Pos + 1) -lt $audio.Count -and $audio[$pick.Pos + 1].Codec -eq 'ac3') {
+            $core = $audio[$pick.Pos + 1]
+            $how = 'the AC-3 right after the TrueHD'
+        }
+        if (-not $core) {
+            throw "The TrueHD master (audio $($pick.Pos)) has no AC-3 core track. The source MKV is probably missing tracks."
+        }
+        if ($core.BitRate -gt 0 -and $core.BitRate -lt $CoreMinKbps * 1000) {
+            throw ("The TrueHD's AC-3 core (audio {0}) is {1} kbps, below {2}. The source MKV is probably missing tracks." -f
+                $core.Pos, [math]::Round($core.BitRate / 1000), $CoreMinKbps)
+        }
+        $compat = New-OutputTrack 'source' $core.Pos 'copy' 0 0 "$($core.Name) $(Get-ChannelLabel $core.Channels)" `
+            "audio $($core.Pos): the TrueHD's AC-3 core ($how), copied" "ac3 $($core.Channels)"
+    } elseif ($pick.Lossless -and $pick.Channels -ge 6) {
+        $same = Select-SameMix @($audio | Where-Object { $_.Codec -eq 'ac3' -and $_.Channels -eq 6 })
+        if ($same) {
+            $compat = New-OutputTrack 'source' $same.Pos 'copy' 0 0 "$($same.Name) $(Get-ChannelLabel $same.Channels)" `
+                "audio $($same.Pos): existing AC-3, same mix as the main track, copied" "ac3 6"
+        }
+    } elseif ($pick.Lossless -and $pick.Channels -le 2) {
+        $same = Select-SameMix @($audio | Where-Object {
+            -not $_.Lossless -and $_.Codec -ne 'dts' -and $_.Channels -eq $pick.Channels })
+        if ($same) {
+            $compat = New-OutputTrack 'source' $same.Pos 'copy' 0 0 "$($same.Name) $(Get-ChannelLabel $same.Channels)" `
+                "audio $($same.Pos): existing $($same.Name), same mix as the main track, copied" "$($same.Codec) $($same.Channels)"
+        }
+    }
+
+    if (-not $compat) {
+        if ($pick.Channels -le 2) {
+            $kbps = $AacBitrate
+            if ($pick.Channels -eq 1) { $kbps = [Math]::Min($AacBitrate, 256) }
+            $compat = New-OutputTrack 'encode' $pick.Pos 'aac' $kbps 0 "AAC $(Get-ChannelLabel $pick.Channels)" `
+                "new, encoded from $srcLabel at $kbps kbps" "aac $($pick.Channels)"
+        } else {
+            $ac = 0
+            if ($pick.Channels -gt 6) { $ac = 6 }
+            $outCh = [Math]::Min($pick.Channels, 6)
+            $compat = New-OutputTrack 'encode' $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel $outCh)" `
+                "new, encoded from $srcLabel at $Ac3Bitrate kbps" "ac3 $outCh"
+        }
+    }
+    $compat.IsDefault = $true
+
+    # Kept as masters: every lossless track, main one first. With no lossless track, a
+    # main track that had to be converted (e.g. lossy DTS) is kept as-is instead.
+    $keep = @($masters | Where-Object { $_.Pos -eq $pick.Pos }) + @($masters | Where-Object { $_.Pos -ne $pick.Pos })
+    if ($masters.Count -eq 0 -and $compat.From -eq 'encode') { $keep = @($pick) }
+    $keepPos = @($keep | ForEach-Object { $_.Pos })
+
     # ------------------------------------------------ commentary tracks to keep
-    # Default: every detected commentary. Overrides (single mode): track numbers, or None.
+    # Default: every detected stereo/mono commentary. Overrides (single mode): numbers, or None.
     $passTracks = [Collections.Generic.List[object]]::new()
     $passTitles = [Collections.Generic.List[string]]::new()
     if ($script:PassMode -eq 'List') {
@@ -608,13 +802,13 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
                 throw "-PassthruCommentaries: there is no audio track $pp. Valid: 0-$($audio.Count - 1) (the 'Pos' column above)."
             }
             if ($pp -in $keepPos) { throw "-PassthruCommentaries: audio track $pp is already kept as a master." }
-            if ($pp -eq $pick.Pos) { throw "-PassthruCommentaries: audio track $pp is the main track." }
+            if ($pp -eq $compat.SrcPos -or $pp -eq $pick.Pos) { throw "-PassthruCommentaries: audio track $pp is the main or default track." }
             $passTracks.Add($audio[$pp])
             if ($PassthruTitles.Count -gt 0) { $passTitles.Add($PassthruTitles[$k]) } else { $passTitles.Add('Commentary') }
         }
     } elseif ($script:PassMode -eq 'Auto') {
-        foreach ($cand in $candidates) {
-            if ($verdicts[$cand.Pos].Kind -eq 'commentary') {
+        foreach ($cand in $toCompare) {
+            if ($cand.Channels -le 2 -and $verdicts[$cand.Pos].Kind -eq 'commentary' -and $cand.Pos -ne $compat.SrcPos) {
                 $passTracks.Add($cand)
                 $passTitles.Add('Commentary')
             }
@@ -622,82 +816,56 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
     $passPos = @($passTracks | ForEach-Object { $_.Pos })
 
-    # Report line per checked track (and per track kept by number).
-    $keptWord = 'kept'
-    if ($WhatIfPreference) { $keptWord = 'would be kept' }
-    $reportLines = [Collections.Generic.List[string]]::new()
-    foreach ($cand in $candidates) {
-        if (-not $verdicts.ContainsKey($cand.Pos)) { continue }
-        $v = $verdicts[$cand.Pos]
-        $fate = 'dropped'
-        if ($cand.Pos -in $passPos) { $fate = $keptWord }
-        $reportLines.Add(("{0} -> {1}, {2:N1}% extra sound (clips {3}) -> {4}" -f
-            (Get-TrackDesc $cand), $v.Kind, $v.Top, $v.Clips, $fate))
-    }
-    if ($script:PassMode -eq 'List') {
-        foreach ($pt in $passTracks) {
-            $reportLines.Add("$(Get-TrackDesc $pt) -> not checked (-PassthruCommentaries) -> $keptWord")
-        }
-    } elseif ($script:PassMode -eq 'None' -and $candidates.Count -gt 0) {
-        $reportLines.Add("not checked (-PassthruCommentaries None): $(($candidates | ForEach-Object { Get-TrackDesc $_ }) -join '; ') -> dropped")
-    }
-    $script:StereoReport = $reportLines -join "`n      "
-
-    # ------------------------------------------------ plan the MP4's audio
+    # ------------------------------------------------ plan the output audio
     $outputs = [Collections.Generic.List[object]]::new()
-
-    if ($copyable) {
-        $outputs.Add((New-OutputTrack $pick.Pos 'copy' 0 0 $srcLabel 'copied as-is' "$($pick.Codec) $($pick.Channels)"))
-    } elseif ($pick.Channels -le 2) {
-        $kbps = $AacBitrate
-        if ($pick.Channels -eq 1) { $kbps = [Math]::Min($AacBitrate, 256) }
-        $outputs.Add((New-OutputTrack $pick.Pos 'aac' $kbps 0 "AAC $(Get-ChannelLabel $pick.Channels)" `
-            "encoded from $srcLabel at $kbps kbps" "aac $($pick.Channels)"))
-    } else {
-        $ac = 0
-        if ($pick.Channels -gt 6) { $ac = 6 }
-        $outCh = [Math]::Min($pick.Channels, 6)
-        $outputs.Add((New-OutputTrack $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel $outCh)" `
-            "encoded from $srcLabel at $Ac3Bitrate kbps" "ac3 $outCh"))
-    }
-
+    $outputs.Add($compat)
     for ($k = 0; $k -lt $passTracks.Count; $k++) {
         $pt = $passTracks[$k]
-        if ($pt.Codec -like 'pcm_*') {
-            $track = New-OutputTrack $pt.Pos 'flac' 0 0 $passTitles[$k] `
-                "audio $($pt.Pos): commentary, PCM converted to FLAC (lossless)" "flac $($pt.Channels)"
-        } else {
-            $track = New-OutputTrack $pt.Pos 'copy' 0 0 $passTitles[$k] `
-                "audio $($pt.Pos): commentary, copied as-is ($($pt.Name) $(Get-ChannelLabel $pt.Channels))" "$($pt.Codec) $($pt.Channels)"
-        }
-        $track | Add-Member -NotePropertyName Disp -NotePropertyValue 'comment'
+        $track = New-OutputTrack 'source' $pt.Pos 'copy' 0 0 $passTitles[$k] `
+            "audio $($pt.Pos): commentary, copied ($($pt.Name) $(Get-ChannelLabel $pt.Channels))" "$($pt.Codec) $($pt.Channels)"
+        $track.IsCommentary = $true
         $outputs.Add($track)
     }
-
     foreach ($m in $keep) {
         if ($m.Codec -like 'pcm_*') {
-            $track = New-OutputTrack $m.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $m.Channels)" `
-                "audio $($m.Pos): PCM converted to FLAC (lossless)" "flac $($m.Channels)"
+            $outputs.Add((New-OutputTrack 'encode' $m.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $m.Channels)" `
+                "audio $($m.Pos): PCM converted to FLAC (lossless)" "flac $($m.Channels)"))
         } else {
             $note = "audio $($m.Pos): copied"
             if (-not $m.Lossless) { $note = "audio $($m.Pos): copied (original lossy track; the default track is a converted copy)" }
-            $track = New-OutputTrack $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note "$($m.Codec) $($m.Channels)"
+            $outputs.Add((New-OutputTrack 'source' $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note "$($m.Codec) $($m.Channels)"))
         }
-        $outputs.Add($track)
     }
     $plannedLayout = @($outputs | ForEach-Object { $_.Layout })
-
-    # e.g. "Dolby Digital 5.1 (from Dolby TrueHD + Dolby Atmos 7.1), Dolby TrueHD + Dolby Atmos 7.1"
-    $trackLabel = (@($outputs | ForEach-Object {
-        if ($_.Codec -ne 'copy' -and $_.SrcPos -eq $pick.Pos) { "$($_.Title) (from $srcLabel)" } else { $_.Title }
-    })) -join ', '
-
     $usedPos = @($outputs | ForEach-Object { $_.SrcPos })
 
+    # e.g. "Dolby Digital 5.1 (from DTS-HD MA 5.1), Commentary, DTS-HD MA 5.1"
+    $trackLabel = (@($outputs | ForEach-Object {
+        if ($_.From -eq 'encode' -and $_.SrcPos -eq $pick.Pos) { "$($_.Title) (from $srcLabel)" } else { $_.Title }
+    })) -join ', '
+
+    # Comparison report: one line per compared track, with what happens to it.
+    $keptWord = 'kept'
+    if ($WhatIfPreference) { $keptWord = 'would be kept' }
+    $reportLines = [Collections.Generic.List[string]]::new()
+    foreach ($cand in $toCompare) {
+        $v = $verdicts[$cand.Pos]
+        $fate = 'dropped'
+        if ($cand.Pos -eq $compat.SrcPos -and $compat.From -eq 'source') { $fate = "used as the default track" }
+        elseif ($cand.Pos -in $passPos) { $fate = "$keptWord as commentary" }
+        $reportLines.Add(("{0} -> {1} (louder {2:N1}%, quieter {3:N1}%, louder per clip {4}) -> {5}" -f
+            (Get-TrackDesc $cand), $v.Kind, $v.Louder, $v.Quieter, $v.Clips, $fate))
+    }
+    if ($script:PassMode -eq 'List') {
+        foreach ($pt in $passTracks) {
+            if (-not $verdicts.ContainsKey($pt.Pos)) {
+                $reportLines.Add("$(Get-TrackDesc $pt) -> chosen with -PassthruCommentaries -> $keptWord as commentary")
+            }
+        }
+    }
+    $script:StereoReport = $reportLines -join "`n      "
+
     # ------------------------------------------------ source length check (warning only)
-    # Kept tracks whose length in the MKV differs from the picture by more than 2 s, e.g. a
-    # main track that ends early while a commentary runs to the end. Not an error (the
-    # remux copies what the disc has), but worth checking during playback.
     $srcVideoLen = 0.0
     if ($srcVideo.Count -gt 0) { $srcVideoLen = Get-StreamSeconds $srcVideo[0] }
     $lengthLines = [Collections.Generic.List[string]]::new()
@@ -720,131 +888,159 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
     }
 
     # ------------------------------------------------ already done?
-    if (-not $Force -and -not $reuse -and (($currentLayout -join '|') -eq ($plannedLayout -join '|'))) {
-        return New-Result 'Skipped' "MP4 already has the planned audio ($trackLabel)"
+    if (-not $Force -and -not $destIsMp4 -and (($currentLayout -join '|') -eq ($plannedLayout -join '|'))) {
+        return New-Result 'Skipped' "already has the planned audio ($trackLabel)"
     }
 
-    # ------------------------------------------------ build the ffmpeg command
-    $ffArgs = [Collections.Generic.List[string]]::new()
-    # -v warning: only warnings and errors; -stats: keep the live progress line anyway.
-    $ffArgs.AddRange([string[]]@('-hide_banner', '-v', 'warning', '-stats',
-        '-i', $VideoFile, '-i', $SourceFile, '-map', '0:v:0'))
-    foreach ($o in $outputs) { $ffArgs.AddRange([string[]]@('-map', "1:a:$($o.SrcPos)")) }
-    $ffArgs.AddRange([string[]]@('-map_chapters', '1', '-c:v', 'copy'))
-    if ($videoCodec -eq 'hevc') { $ffArgs.AddRange([string[]]@('-tag:v', 'hvc1')) }
-
-    # Video track title, plus Apple/iTunes-style file-level tags.
-    # (name= clears a leftover track name from the encoder, e.g. NVEncC's disc title.)
-    $ffArgs.AddRange([string[]]@('-metadata:s:v:0', "title=$videoTitle", '-metadata:s:v:0', 'name=',
-        '-metadata', "title=$videoTitle"))
-    if ($titleInfo.Year) { $ffArgs.AddRange([string[]]@('-metadata', "date=$($titleInfo.Year)")) }
-    if ($titleInfo.Kind -eq 'Episode') {
-        $ffArgs.AddRange([string[]]@(
-            '-metadata', "show=$($titleInfo.Show)",
-            '-metadata', "season_number=$($titleInfo.Season)",
-            '-metadata', "episode_sort=$($titleInfo.Episode)",
-            '-metadata', "episode_id=$($titleInfo.EpisodeId)",
-            '-metadata', 'media_type=10'))   # 10 = TV Show
-    } else {
-        $ffArgs.AddRange([string[]]@('-metadata', 'media_type=9'))   # 9 = Movie
+    # ------------------------------------------------ build the commands
+    $tempDir = [IO.Path]::GetTempPath()
+    $encodeCmds = [Collections.Generic.List[object]]::new()
+    foreach ($o in $outputs) {
+        if ($o.From -ne 'encode') { continue }
+        $o.TempFile = Join-Path $tempDir ('abr-' + [guid]::NewGuid().ToString('N') + '.mka')
+        # -copyts keeps the source track's start time, so a track that starts late stays in sync.
+        $enc = [Collections.Generic.List[string]]::new()
+        $enc.AddRange([string[]]@('-hide_banner', '-v', 'warning', '-stats', '-nostdin', '-copyts',
+            '-i', $SourceFile, '-map', "0:a:$($o.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
+            '-c:a', $o.Codec))
+        if ($o.Kbps -gt 0) { $enc.AddRange([string[]]@('-b:a', "$($o.Kbps)k")) }
+        if ($o.Ac -gt 0) { $enc.AddRange([string[]]@('-ac', "$($o.Ac)")) }
+        $enc.AddRange([string[]]@('-f', 'matroska', '-y', $o.TempFile))
+        $encodeCmds.Add($enc.ToArray())
     }
 
+    # mkvmerge inputs: file 0 = encoded video, file 1 = source MKV (copied audio + chapters),
+    # files 2+ = the temp encodes. --track-order puts everything in the planned order.
+    $vid = $destMkvVideo[0].id
+    $mk = [Collections.Generic.List[string]]::new()
+    $tagsFile = Join-Path $tempDir ('abr-' + [guid]::NewGuid().ToString('N') + '.xml')
+    $mk.AddRange([string[]]@('--output', $partialFile, '--title', $videoTitle, '--global-tags', $tagsFile))
+    $mk.AddRange([string[]]@('--video-tracks', "$vid", '--no-audio', '--no-subtitles', '--no-chapters',
+        '--no-global-tags', '--no-attachments', '--track-name', "${vid}:$videoTitle", $DestFile))
+
+    $srcIds = @($outputs | Where-Object { $_.From -eq 'source' } | ForEach-Object { $audio[$_.SrcPos].MkvId })
+    $mk.AddRange([string[]]@('--no-video', '--no-subtitles', '--no-global-tags', '--no-attachments'))
+    if ($srcIds.Count -gt 0) { $mk.AddRange([string[]]@('--audio-tracks', ($srcIds -join ','))) } else { $mk.Add('--no-audio') }
+    $order = [Collections.Generic.List[string]]::new()
+    $order.Add("0:$vid")
+    $fileNo = 2
+    $trackOpts = @{}   # output index -> "file:track" for --track-order
     for ($i = 0; $i -lt $outputs.Count; $i++) {
         $o = $outputs[$i]
-        $ffArgs.AddRange([string[]]@("-c:a:$i", $o.Codec))
-        if ($o.Kbps -gt 0) { $ffArgs.AddRange([string[]]@("-b:a:$i", "$($o.Kbps)k")) }
-        if ($o.Ac -gt 0) { $ffArgs.AddRange([string[]]@("-ac:a:$i", "$($o.Ac)")) }
-        $disp = '0'
-        if ($i -eq 0) { $disp = 'default' }
-        elseif (Get-Field $o 'Disp') { $disp = $o.Disp }   # 'comment' for commentary tracks
-        $ffArgs.AddRange([string[]]@("-disposition:a:$i", $disp,
-            "-metadata:s:a:$i", "language=$AudioLanguage", "-metadata:s:a:$i", "title=$($o.Title)"))
+        if ($o.From -ne 'source') { continue }
+        $tid = $audio[$o.SrcPos].MkvId
+        $mk.AddRange([string[]]@('--language', "${tid}:$AudioLanguage", '--track-name', "${tid}:$($o.Title)",
+            '--default-track-flag', "${tid}:$(if ($o.IsDefault) { 'yes' } else { 'no' })"))
+        if ($o.IsCommentary) { $mk.AddRange([string[]]@('--commentary-flag', "${tid}:yes")) }
+        $trackOpts[$i] = "1:$tid"
     }
-
-    # -strict experimental: needed for TrueHD in MP4 and for the Dolby Vision config box.
-    $ffArgs.AddRange([string[]]@('-strict', 'experimental', '-movflags', '+faststart'))
-    if ($Force) { $ffArgs.Add('-y') } else { $ffArgs.Add('-n') }
-    $ffArgs.Add($outFile)
+    $mk.Add($SourceFile)
+    for ($i = 0; $i -lt $outputs.Count; $i++) {
+        $o = $outputs[$i]
+        if ($o.From -ne 'encode') { continue }
+        $mk.AddRange([string[]]@('--no-chapters', '--no-global-tags', '--language', "0:$AudioLanguage",
+            '--track-name', "0:$($o.Title)", '--default-track-flag', "0:$(if ($o.IsDefault) { 'yes' } else { 'no' })",
+            $o.TempFile))
+        $trackOpts[$i] = "${fileNo}:0"
+        $fileNo++
+    }
+    for ($i = 0; $i -lt $outputs.Count; $i++) { $order.Add($trackOpts[$i]) }
+    $mk.AddRange([string[]]@('--track-order', ($order -join ',')))
 
     # ------------------------------------------------ report
     Write-Host "Metadata: $titleDesc"
     if ($currentLayout.Count -gt 0) {
-        Write-Host "MP4 audio now: $($currentLayout -join ', ')  (will be replaced)"
+        Write-Host "Encoded file's audio now: $($currentLayout -join ', ')  (will be replaced)"
     } else {
-        Write-Host 'MP4 audio now: none'
+        Write-Host "Encoded file's audio now: none"
     }
-    Write-Host 'Planned MP4 audio:'
+    Write-Host 'Planned audio:'
     for ($i = 0; $i -lt $outputs.Count; $i++) {
         $o = $outputs[$i]
         $flag = ''
-        if ($i -eq 0) { $flag = '  [default]' }
+        if ($o.IsDefault) { $flag = '  [default]' }
+        if ($o.IsCommentary) { $flag = '  [commentary]' }
         Write-Host ("  a:{0}  {1,-40} {2}{3}" -f $i, $o.Title, $o.Note, $flag)
     }
     foreach ($d in @($audio | Where-Object { $_.Pos -notin $usedPos })) {
-        Write-Host "  dropped: audio $($d.Pos) - $($d.Name) $(Get-ChannelLabel $d.Channels)" -ForegroundColor DarkGray
+        Write-Host "  dropped: $(Get-TrackDesc $d)" -ForegroundColor DarkGray
     }
-    if ($Replace) { Write-Host "Replaces: $VideoFile" } else { Write-Host "Output:   $outFile" }
+    if ($Replace) {
+        if ($destIsMp4) { Write-Host "Replaces: $DestFile  (with $finalFile)" } else { Write-Host "Replaces: $DestFile" }
+    } else {
+        Write-Host "Output:   $outFile"
+    }
     Write-Host ''
 
-    if ($reuse) {
-        Write-Host 'Using the existing .remux.mp4 from an earlier run (it will be verified first).' -ForegroundColor Yellow
-        Write-Host ''
-        $action = 'Replace with the existing .remux.mp4'
-        $what = 'replace with existing remux'
-    } else {
-        $argArray = $ffArgs.ToArray()
-        Write-Host ((Format-Arg $script:ffmpeg) + ' ' + (($argArray | ForEach-Object { Format-Arg $_ }) -join ' ')) -ForegroundColor Cyan
-        Write-Host ''
-        $action = 'Rebuild audio with ffmpeg'
-        $what = 'remux'
-    }
+    foreach ($enc in $encodeCmds) { Write-Host (Format-Command $script:ffmpeg $enc) -ForegroundColor Cyan }
+    Write-Host (Format-Command $script:mkvmerge $mk.ToArray()) -ForegroundColor Cyan
+    Write-Host ''
+    $action = 'Rebuild audio with ffmpeg and mkvmerge'
+    $what = 'remux'
+    if ($destIsMp4) { $what += ' (MP4 migrated to MKV)' }
 
-    if (-not $script:Cmdlet.ShouldProcess($VideoFile, $action)) {
+    if (-not $script:Cmdlet.ShouldProcess($DestFile, $action)) {
         return New-Result 'Planned' "${what}: $trackLabel; $titleDesc"
     }
 
-    if (-not $reuse) {
-        & $script:ffmpeg @argArray
-        if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed with exit code $LASTEXITCODE" }
+    # ------------------------------------------------ run
+    $mkWarnings = $false
+    try {
+        [IO.File]::WriteAllText($tagsFile, (Get-TagsXml $titleInfo), [Text.UTF8Encoding]::new($false))
+        foreach ($enc in $encodeCmds) {
+            & $script:ffmpeg @enc
+            if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed with exit code $LASTEXITCODE" }
+        }
+        $mkArgs = $mk.ToArray()
+        & $script:mkvmerge @mkArgs
+        if ($LASTEXITCODE -ge 2) { throw "mkvmerge failed with exit code $LASTEXITCODE" }
+        if ($LASTEXITCODE -eq 1) { $mkWarnings = $true }
+    } finally {
+        Remove-Item -LiteralPath $tagsFile -Force -ErrorAction SilentlyContinue
+        foreach ($o in $outputs) {
+            if ($o.TempFile) { Remove-Item -LiteralPath $o.TempFile -Force -ErrorAction SilentlyContinue }
+        }
     }
 
     # ------------------------------------------------ verify
     $problems = [Collections.Generic.List[string]]::new()
     $notes = [Collections.Generic.List[string]]::new()
-    $outStreams = Get-Streams $outFile
+    if ($mkWarnings) { $notes.Add('mkvmerge reported warnings (see above)') }
+    $outStreams = Get-Streams $partialFile
     $outVideo = @($outStreams | Where-Object { $_.codec_type -eq 'video' })
     $outAudio = @($outStreams | Where-Object { $_.codec_type -eq 'audio' })
     $outLayout = Get-AudioLayout $outStreams
 
     Write-Host "`nResult:"
-    $mi = Get-Mp4Titles $outFile
-    if (-not $mi) {
-        Write-Host '  video title: (not checked; install the MediaInfo CLI to check titles)'
-    } elseif ($outVideo.Count -gt 0) {
-        Write-Host "  video title: $($mi.Video)"
-        if ($mi.Video -ne $videoTitle) {
-            $notes.Add("video title is '$($mi.Video)', expected '$videoTitle' (use -Force to redo the remux)")
-        }
+    if ($outVideo.Count -gt 0) {
+        $gotTitle = [string](Get-Field (Get-Field $outVideo[0] 'tags') 'title')
+        Write-Host "  video track name: $gotTitle"
+        if ($gotTitle -ne $videoTitle) { $notes.Add("video track name is '$gotTitle', expected '$videoTitle'") }
     }
     for ($i = 0; $i -lt $outAudio.Count; $i++) {
         $st = $outAudio[$i]
-        $t = ''
-        if ($mi -and $i -lt $mi.Audio.Count) { $t = $mi.Audio[$i] }
-        Write-Host ("  audio: {0,-7} {1,-4} default={2}  {3}" -f $st.codec_name,
-            (Get-ChannelLabel ([int]$st.channels)), (Get-Field (Get-Field $st 'disposition') 'default'), $t)
+        $disp = Get-Field $st 'disposition'
+        $gotName = [string](Get-Field (Get-Field $st 'tags') 'title')
+        Write-Host ("  audio: {0,-7} {1,-4} default={2} commentary={3}  {4}" -f $st.codec_name,
+            (Get-ChannelLabel ([int]$st.channels)), (Get-Field $disp 'default'), (Get-Field $disp 'comment'), $gotName)
+        if ($i -lt $outputs.Count -and $gotName -ne $outputs[$i].Title) {
+            $notes.Add("a:$i is named '$gotName', expected '$($outputs[$i].Title)'")
+        }
     }
     if (($outLayout -join '|') -ne ($plannedLayout -join '|')) {
         $problems.Add("audio tracks are [$($outLayout -join ', ')], expected [$($plannedLayout -join ', ')]")
     }
-
-    # Full length compared with the original MP4: catches a remux that was cut short.
-    $outFormat = Get-Format $outFile
-    $oLen = ConvertTo-Number (Get-Field $outFormat 'duration')
-    if ($vLen -gt 0 -and [Math]::Abs($vLen - $oLen) -gt 2) {
-        $problems.Add(("the remux is {0} but the original MP4 is {1}" -f (Format-Duration $oLen), (Format-Duration $vLen)))
+    if ($outAudio.Count -gt 0 -and (ConvertTo-Number (Get-Field (Get-Field $outAudio[0] 'disposition') 'default')) -ne 1) {
+        $problems.Add('a:0 is not flagged as the default track')
     }
-    # Each audio track compared with its OWN source track in the MKV, not with the video:
-    # some discs have audio that legitimately ends a few seconds before the picture.
+
+    # Whole file compared with the original: catches a remux that was cut short.
+    $oLen = ConvertTo-Number (Get-Field (Get-Format $partialFile) 'duration')
+    if ($vLen -gt 0 -and [Math]::Abs($vLen - $oLen) -gt 2) {
+        $problems.Add(("the remux is {0} but the original is {1}" -f (Format-Duration $oLen), (Format-Duration $vLen)))
+    }
+    # Each audio track compared with its OWN source track (some discs have audio that
+    # legitimately ends a few seconds before the picture).
     for ($i = 0; $i -lt [Math]::Min($outAudio.Count, $outputs.Count); $i++) {
         $gotLen = Get-StreamSeconds $outAudio[$i]
         $srcTrack = $audio[$outputs[$i].SrcPos]
@@ -854,28 +1050,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
         }
     }
 
-    $fTags = Get-Field $outFormat 'tags'
-    $want = [ordered]@{ title = $videoTitle }
-    if ($titleInfo.Kind -eq 'Episode') {
-        $want['show'] = $titleInfo.Show
-        $want['episode_id'] = $titleInfo.EpisodeId
-    }
-    foreach ($k in $want.Keys) {
-        $got = [string](Get-Field $fTags $k)
-        if ($got -ne $want[$k]) {
-            $notes.Add("file-level $k is '$got', expected '$($want[$k])' (use -Force to redo the remux)")
-        }
-    }
-    $line = "  metadata: title '$(Get-Field $fTags 'title')'"
-    if ($titleInfo.Kind -eq 'Episode') {
-        $line += ", show '$(Get-Field $fTags 'show')', $(Get-Field $fTags 'episode_id')"
-    }
-    Write-Host $line
-
     $outHasDv = ($outVideo.Count -gt 0) -and (Test-DolbyVision $outVideo[0])
     if ($outHasDv) {
         Write-Host '  Dolby Vision configuration record: present' -ForegroundColor Green
-    } elseif ($videoHasDv) {
+    } elseif ($destHasDv) {
         $problems.Add('the encoded video had Dolby Vision, but the output does not')
     } else {
         Write-Host '  Dolby Vision: none (not in the encoded video)'
@@ -883,16 +1061,25 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$VideoFile) {
 
     foreach ($noteText in $notes) { Write-Warning $noteText }
     if ($problems.Count -gt 0) {
-        throw "Verification failed ($($problems -join '; ')). Output left for inspection: $outFile"
+        throw "Verification failed ($($problems -join '; ')). Output left for inspection: $partialFile"
     }
 
     # ------------------------------------------------ replace the original
-    if ($Replace) {
-        Move-Item -LiteralPath $outFile -Destination $VideoFile -Force
-        Write-Host '  Original MP4 replaced.' -ForegroundColor Green
+    if (-not $Replace) {
+        Move-Item -LiteralPath $partialFile -Destination $outFile -Force
+        Write-Host "  Verified; saved as $([IO.Path]::GetFileName($outFile)) for review." -ForegroundColor Green
+    } else {
+        Move-Item -LiteralPath $partialFile -Destination $finalFile -Force
+        if ($destIsMp4) {
+            Remove-Item -LiteralPath $DestFile -Force
+            Write-Host "  Replaced: $([IO.Path]::GetFileName($finalFile)) written, old MP4 deleted." -ForegroundColor Green
+        } else {
+            Write-Host '  Original replaced.' -ForegroundColor Green
+        }
     }
+
     $msg = "${what}: $trackLabel; $titleDesc"
-    if ($reuse -and $notes.Count -gt 0) { $msg += "; NOTE: $($notes -join '; ')" }
+    if ($notes.Count -gt 0) { $msg += "; NOTE: $($notes -join '; ')" }
     return New-Result 'Done' $msg
 }
 
@@ -904,8 +1091,7 @@ $logPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
 
 $script:ffmpeg = Get-Tool 'ffmpeg'
 $script:ffprobe = Get-Tool 'ffprobe'
-$script:mediainfo = Get-Command 'mediainfo' -CommandType Application -ErrorAction SilentlyContinue |
-    Select-Object -First 1 -ExpandProperty Source   # optional: only used to check MP4 titles
+$script:mkvmerge = Get-Tool 'mkvmerge'
 
 if (-not (Test-Path -LiteralPath $Source)) { throw "Source not found: $Source" }
 if (-not (Test-Path -LiteralPath $Dest)) { throw "Dest not found: $Dest" }
@@ -915,17 +1101,22 @@ $batch = Test-Path -LiteralPath $Source -PathType Container
 if ($batch -ne (Test-Path -LiteralPath $Dest -PathType Container)) {
     throw '-Source and -Dest must both be files, or both be folders.'
 }
+if ($Source.TrimEnd('\', '/') -eq $Dest.TrimEnd('\', '/')) {
+    throw '-Source and -Dest must be different (both hold .mkv files with the same names).'
+}
 
-$pairs       = [Collections.Generic.List[object]]::new()
-$done        = [Collections.Generic.List[string]]::new()
-$planned     = [Collections.Generic.List[string]]::new()
-$skipped     = [Collections.Generic.List[string]]::new()
-$failed      = [Collections.Generic.List[string]]::new()
-$skippedDirs = [Collections.Generic.List[string]]::new()
-$unmatched   = [Collections.Generic.List[string]]::new()
-$noLosslessTitles  = [Collections.Generic.List[string]]::new()
-$stereoChecks      = [Collections.Generic.List[string]]::new()
-$lengthChecks      = [Collections.Generic.List[string]]::new()
+$pairs            = [Collections.Generic.List[object]]::new()
+$done             = [Collections.Generic.List[string]]::new()
+$planned          = [Collections.Generic.List[string]]::new()
+$skipped          = [Collections.Generic.List[string]]::new()
+$failed           = [Collections.Generic.List[string]]::new()
+$skippedDirs      = [Collections.Generic.List[string]]::new()
+$unmatched        = [Collections.Generic.List[string]]::new()
+$noLosslessTitles = [Collections.Generic.List[string]]::new()
+$stereoChecks     = [Collections.Generic.List[string]]::new()
+$lengthChecks     = [Collections.Generic.List[string]]::new()
+$subBackups       = [Collections.Generic.List[string]]::new()
+
 
 # -PassthruCommentaries: not given = Auto (keep detected commentary); "None"; or track
 # numbers ("2,3" may also arrive as one string). The overrides are single mode only.
@@ -959,6 +1150,7 @@ if ($PassthruTitles.Count -gt 0) {
 }
 
 if (-not $batch) {
+    if ([IO.Path]::GetExtension($Dest) -notin @('.mkv', '.mp4')) { throw '-Dest must be an .mkv or .mp4 file.' }
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
 } else {
     if ($SourceTrack -ge 0) { throw '-SourceTrack only works with single files.' }
@@ -969,8 +1161,10 @@ if (-not $batch) {
     $srcRoot = $Source.TrimEnd('\', '/')
     $dstRoot = $Dest.TrimEnd('\', '/')
 
-    # Each MKV maps to exactly one MP4: same relative folder under Dest, same base name.
-    $mkvs = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File | Where-Object { $_.Extension -eq '.mkv' })
+    # Each source MKV maps to one encoded file: same relative folder under Dest, same base
+    # name, as .mkv (or else .mp4, an older encode to migrate).
+    $mkvs = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File |
+        Where-Object { $_.Extension -eq '.mkv' -and $_.Name -notlike '*.remux.mkv' })
     foreach ($group in ($mkvs | Group-Object DirectoryName | Sort-Object Name)) {
         $relDir = $group.Name.Substring($srcRoot.Length).TrimStart('\', '/')
         $mirrorDir = $dstRoot
@@ -979,16 +1173,20 @@ if (-not $batch) {
         $matched = [Collections.Generic.List[object]]::new()
         $missing = [Collections.Generic.List[string]]::new()
         foreach ($mkv in ($group.Group | Sort-Object Name)) {
-            $mp4 = Join-Path $mirrorDir ($mkv.BaseName + '.mp4')
-            if (Test-Path -LiteralPath $mp4 -PathType Leaf) {
-                $matched.Add([pscustomobject]@{ Source = $mkv.FullName; Video = $mp4 })
+            $target = $null
+            foreach ($ext in @('.mkv', '.mp4')) {
+                $candidate = Join-Path $mirrorDir ($mkv.BaseName + $ext)
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { $target = $candidate; break }
+            }
+            if ($target) {
+                $matched.Add([pscustomobject]@{ Source = $mkv.FullName; Video = $target })
             } else {
-                $missing.Add("$($mkv.FullName)`n      expected: $mp4")
+                $missing.Add("$($mkv.FullName)`n      expected: $(Join-Path $mirrorDir ($mkv.BaseName + '.mkv'))")
             }
         }
 
         if ($matched.Count -eq 0) {
-            $why = 'mirrored folder exists, but none of the MP4 names match'
+            $why = 'mirrored folder exists, but none of the file names match'
             if (-not (Test-Path -LiteralPath $mirrorDir -PathType Container)) { $why = 'mirrored folder does not exist' }
             $skippedDirs.Add("$($group.Name)  ($($group.Count) MKV(s))`n      expected: $mirrorDir`n      $why")
         } else {
@@ -1022,6 +1220,13 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
         $failed.Add("$name`n      $($_.Exception.Message)")
         Write-Warning $_.Exception.Message
     }
+    try {
+        $subMsg = Export-SubtitleBackup $p.Source $p.Video
+        if ($subMsg) { $subBackups.Add("$name  ($subMsg)"); Write-Host "Subtitles: $subMsg" }
+    } catch {
+        $failed.Add("$name (subtitle backup)`n      $($_.Exception.Message)")
+        Write-Warning $_.Exception.Message
+    }
 }
 
 # ================================================================ summary
@@ -1043,11 +1248,12 @@ function Add-Section([string]$Title, $Items) {
     foreach ($item in $Items) { $lines.Add("  $item") }
 }
 Add-Section 'FAILED' $failed
-Add-Section 'Folders skipped: no mirrored MP4s' $skippedDirs
-Add-Section 'MKVs without a mirrored MP4 (in otherwise matched folders)' $unmatched
+Add-Section 'Folders skipped: no mirrored encoded files' $skippedDirs
+Add-Section 'MKVs without a mirrored encoded file (in otherwise matched folders)' $unmatched
 Add-Section 'No lossless audio in the source (best lossy track used)' $noLosslessTitles
-Add-Section 'Stereo track check (lossy stereo tracks vs the main track)' $stereoChecks
+Add-Section 'Track comparison (lossy tracks vs the main track)' $stereoChecks
 Add-Section 'Audio and video lengths differ in the source by more than 2 s (check playback)' $lengthChecks
+Add-Section 'Subtitle backups' $subBackups
 Add-Section 'Skipped' $skipped
 Add-Section 'Planned (dry run)' $planned
 Add-Section 'Done' $done
