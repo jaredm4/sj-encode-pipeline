@@ -266,13 +266,20 @@ score_pair() {
   if [ -z "$SO" ] || [ -z "$SE" ]; then
     echo "WARNING: could not read frame sizes; assuming they match."
   elif [ "$SO" != "$SE" ]; then
-    if [ "$EW" -eq "$OW" ] && [ "$EH" -lt "$OH" ]; then
+    if [ "$EW" -le "$OW" ] && [ "$EH" -le "$OH" ]; then
+      # The encode fits entirely within the original's frame on both axes -- this covers
+      # letterboxing (EH<OH, EW=OW), pillarboxing (EW<OW, EH=OH), and a crop reduced on
+      # both axes at once, all via the same centered crop. Previously this branch only
+      # matched the letterbox case specifically, so a pillarboxed encode (bars on the
+      # sides, e.g. 4:3 content auto-cropped from a 16:9 disc frame) fell through to the
+      # scale-up branch below instead -- which is wrong for a real crop, and can silently
+      # produce catastrophically low scores that look like a content/quality problem but
+      # are actually just this comparison being set up incorrectly.
       RCROP="crop=${EW}:${EH},"
       echo "Encode is ${SE}, original ${SO}: center-cropping the original to match."
     else
       DSCALE="scale=${OW}:${OH}:flags=bicubic,"
       echo "Encode is ${SE}, original ${SO}: scaling the encode up to the original size."
-      echo "  (If the encode was cropped on more than one axis, scores will be unreliable.)"
     fi
   fi
 

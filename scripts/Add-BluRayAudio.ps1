@@ -72,6 +72,14 @@
                    "Name, Inc. (2001) - 2160p [imax]", year 2001.
        The file title and the video track name are set to the title.
        If the encoded MKV's audio already matches this plan, the title is skipped.
+    Sync: if the encoder moved the video's start time (e.g. the source video starts at
+       0.5 s and the encode at 0), or dropped the source's first frames (sources that start
+       mid-sequence, found by comparing frame counts), every audio track is shifted by the
+       same amount with mkvmerge --sync, so it stays in sync with the picture. After muxing, each audio
+       track's start relative to the video must match the source's within 50 ms.
+    Duplicate commentary: a lossless track (not the main track) that is the same audio
+       as a kept commentary (compared directly, both directions under 10%) is dropped;
+       the lossy commentary is kept.
     6. Warns when a kept track's length in the source differs from the video by more
        than 2 s (e.g. a main track that ends early). That's how the disc is.
        Verifies the result: the tracks match the plan, each track is as long as its
@@ -195,6 +203,7 @@ $CommentaryMinClips   = 4     # ...in at least this many clips (a commentator ta
 $NarrationMinPercent  = 3     # louder share at or above (in any clip): narration...
 $NarrationMaxQuieter  = 10    # ...if its quieter share stays below this (nothing removed)
 $SameMixMaxPercent    = 3     # louder and quieter shares both below this: same mix
+$CommentaryCopyMaxPercent = 10  # lossless track vs a kept commentary, both below this: a copy of it
 $CoreMinKbps          = 448   # minimum bitrate for a TrueHD's AC-3 core
 $CheckClipCount       = 5     # comparison clips per title, spread over 15-75% of the runtime
 $CheckClipSeconds     = 60    # longest clip length
@@ -304,6 +313,30 @@ function Get-StreamSeconds($Stream) {
 # e.g. 2580.5867 -> "0:43:00.587"
 function Format-Duration([double]$Seconds) {
     return [TimeSpan]::FromSeconds($Seconds).ToString('h\:mm\:ss\.fff')
+}
+
+# Number of frames in a video stream: the NUMBER_OF_FRAMES tag mkvmerge (and others) write
+# (instant), else ffprobe counts the packets (reads the whole file, so a few seconds on a
+# local disk, longer over the network).
+function Get-FrameCount([string]$File, $VideoStream) {
+    $tags = Get-Field $VideoStream 'tags'
+    foreach ($key in @('NUMBER_OF_FRAMES', 'NUMBER_OF_FRAMES-eng')) {
+        $n = ConvertTo-Number (Get-Field $tags $key)
+        if ($n -gt 0) { return [long]$n }
+    }
+    $out = (& $script:ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 $File | Out-String).Trim()
+    return [long](ConvertTo-Number $out)
+}
+
+# Seconds per frame from "24000/1001"-style rates (0 if unknown).
+function Get-FrameSeconds($VideoStream) {
+    foreach ($key in @('r_frame_rate', 'avg_frame_rate')) {
+        $rate = [string](Get-Field $VideoStream $key)
+        if ($rate -match '^(\d+)/(\d+)$' -and [double]$Matches[1] -gt 0) {
+            return [double]$Matches[2] / [double]$Matches[1]
+        }
+    }
+    return 0.0
 }
 
 function Test-DolbyVision($VideoStream) {
@@ -591,6 +624,43 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 
     $srcStreams = Get-Streams $SourceFile
     $srcVideo = @($srcStreams | Where-Object { $_.codec_type -eq 'video' })
+
+    # ---- sync: where the video starts in the source vs in the encoded file
+    # Source audio is in sync with the SOURCE video. If the encoder moved the video's start
+    # (e.g. the source video starts at 0.5 s and the encode restarts it at 0), every audio
+    # track has to move by the same amount: shift = encoded video start - source video start.
+    # Some sources start mid-sequence (leading frames that can't be decoded); an encoder may
+    # drop those, so the encode's first frame is a LATER source frame. That time is added:
+    # source time of the encode's first frame = source video start + dropped x frame length.
+    $srcVideoStart = 0.0
+    if ($srcVideo.Count -gt 0) { $srcVideoStart = ConvertTo-Number (Get-Field $srcVideo[0] 'start_time') }
+    $destVideoStart = ConvertTo-Number (Get-Field $destVideo[0] 'start_time')
+    $droppedFrames = 0
+    $droppedSecs = 0.0
+    if ($srcVideo.Count -gt 0) {
+        $srcFrames = Get-FrameCount $SourceFile $srcVideo[0]
+        $destFrames = Get-FrameCount $DestFile $destVideo[0]
+        $frameSecs = Get-FrameSeconds $srcVideo[0]
+        if ($srcFrames -gt 0 -and $destFrames -gt 0) {
+            $droppedFrames = [int]($srcFrames - $destFrames)
+            if ($droppedFrames -gt 240) {
+                throw "The encode has $droppedFrames fewer video frames than the source ($destFrames vs $srcFrames); can't tell where they went, so the audio can't be synced safely."
+            } elseif ($droppedFrames -lt 0) {
+                Write-Warning "The encode has $(-$droppedFrames) MORE video frames than the source ($destFrames vs $srcFrames); not adjusting for it. Check sync by ear."
+                $droppedFrames = 0
+            } elseif ($droppedFrames -gt 0) {
+                $droppedSecs = $droppedFrames * $frameSecs
+            }
+        }
+    }
+    # Where the encode's first frame was in the source's timeline.
+    $srcVideoRef = $srcVideoStart + $droppedSecs
+    $syncMs = [int][Math]::Round(($destVideoStart - $srcVideoRef) * 1000)
+    if ([Math]::Abs($syncMs) -lt 10) { $syncMs = 0 }
+    if ($syncMs -ne 0) {
+        $script:SubShiftNote = "shift its .srt subtitles by $syncMs ms (encode is missing $droppedFrames frame(s); video start $([Math]::Round($srcVideoStart, 3))s -> $([Math]::Round($destVideoStart, 3))s)"
+    }
+
     if ($srcVideo.Count -gt 0 -and (Test-DolbyVision $srcVideo[0]) -and -not $destHasDv) {
         Write-Warning 'The source has Dolby Vision but the encoded video does not. The output will be HDR10/SDR only.'
     }
@@ -628,6 +698,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             Lossless = Test-Lossless $codecName $codecProfile
             Title    = [string](Get-Field $tags 'title')
             Seconds  = Get-StreamSeconds $st
+            Start    = ConvertTo-Number (Get-Field $st 'start_time')
             SourceId = $sourceId
         }
     })
@@ -676,15 +747,16 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             ($_.Codec -eq 'ac3' -and $_.Channels -eq 6 -and $pick.Lossless -and -not $isTrueHdMain -and $pick.Channels -ge 6))
     })
 
+    $runtime = $sLen
+    if ($runtime -le 0) { $runtime = $vLen }
+    $clipLen = [Math]::Min($CheckClipSeconds, [Math]::Floor($runtime * 0.1))
+    if ($clipLen -lt 10) { $clipLen = [Math]::Max(1, [Math]::Floor($runtime / 2)) }
+    $starts = @(for ($c = 0; $c -lt $CheckClipCount; $c++) {
+        $runtime * (0.15 + 0.6 * $c / [Math]::Max(1, $CheckClipCount - 1))
+    })
+
     $verdicts = @{}   # source position -> verdict
     if ($toCompare.Count -gt 0) {
-        $runtime = $sLen
-        if ($runtime -le 0) { $runtime = $vLen }
-        $clipLen = [Math]::Min($CheckClipSeconds, [Math]::Floor($runtime * 0.1))
-        if ($clipLen -lt 10) { $clipLen = [Math]::Max(1, [Math]::Floor($runtime / 2)) }
-        $starts = @(for ($c = 0; $c -lt $CheckClipCount; $c++) {
-            $runtime * (0.15 + 0.6 * $c / [Math]::Max(1, $CheckClipCount - 1))
-        })
         Write-Host ("Comparing {0} track(s) with the main track, {1} x {2:N0}s clips..." -f
             $toCompare.Count, $starts.Count, $clipLen)
 
@@ -816,6 +888,39 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     }
     $passPos = @($passTracks | ForEach-Object { $_.Pos })
 
+    # ------------------------------------------------ lossless copies of a kept commentary
+    # Some discs carry the commentary twice: lossy and lossless. A lossless track (not the
+    # main track) with the same channel count is compared DIRECTLY with each kept
+    # commentary; if both directions are under the same-mix cutoff it's the same audio,
+    # so the lossless copy is dropped and the lossy commentary is kept as before.
+    $dupLines = [Collections.Generic.List[string]]::new()
+    $dupDropped = @()
+    foreach ($pt in $passTracks) {
+        $twins = @($keep | Where-Object {
+            $_.Lossless -and $_.Pos -ne $pick.Pos -and $_.Channels -eq $pt.Channels -and $_.Pos -notin $dupDropped })
+        if ($twins.Count -eq 0) { continue }
+        $ptCurves = @(foreach ($st0 in $starts) { ,(Get-LoudnessCurve $SourceFile $pt.Pos $st0 $clipLen) })
+        foreach ($tw in $twins) {
+            $maxL = 0.0; $maxQ = 0.0
+            for ($c = 0; $c -lt $starts.Count; $c++) {
+                $twCurve = Get-LoudnessCurve $SourceFile $tw.Pos $starts[$c] $clipLen
+                $maxL = [Math]::Max($maxL, (Get-ExtraSoundPercent $ptCurves[$c] $twCurve))
+                $maxQ = [Math]::Max($maxQ, (Get-ExtraSoundPercent $twCurve $ptCurves[$c]))
+            }
+            $isDup = ($maxL -lt $CommentaryCopyMaxPercent -and $maxQ -lt $CommentaryCopyMaxPercent)
+            $fate = 'different audio, kept as a master'
+            if ($isDup) { $fate = 'lossless copy of the commentary, dropped'; $dupDropped += $tw.Pos }
+            $line = ("{0} vs commentary audio {1}: louder {2:N1}%, quieter {3:N1}% -> {4}" -f
+                (Get-TrackDesc $tw), $pt.Pos, $maxL, $maxQ, $fate)
+            Write-Host "  $line"
+            $dupLines.Add($line)
+        }
+    }
+    if ($dupDropped.Count -gt 0) {
+        $keep = @($keep | Where-Object { $_.Pos -notin $dupDropped })
+        $keepPos = @($keep | ForEach-Object { $_.Pos })
+    }
+
     # ------------------------------------------------ plan the output audio
     $outputs = [Collections.Generic.List[object]]::new()
     $outputs.Add($compat)
@@ -863,6 +968,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             }
         }
     }
+    foreach ($dl in $dupLines) { $reportLines.Add($dl) }
     $script:StereoReport = $reportLines -join "`n      "
 
     # ------------------------------------------------ source length check (warning only)
@@ -932,6 +1038,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $mk.AddRange([string[]]@('--language', "${tid}:$AudioLanguage", '--track-name', "${tid}:$($o.Title)",
             '--default-track-flag', "${tid}:$(if ($o.IsDefault) { 'yes' } else { 'no' })"))
         if ($o.IsCommentary) { $mk.AddRange([string[]]@('--commentary-flag', "${tid}:yes")) }
+        if ($syncMs -ne 0) { $mk.AddRange([string[]]@('--sync', "${tid}:$syncMs")) }
         $trackOpts[$i] = "1:$tid"
     }
     $mk.Add($SourceFile)
@@ -939,8 +1046,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $o = $outputs[$i]
         if ($o.From -ne 'encode') { continue }
         $mk.AddRange([string[]]@('--no-chapters', '--no-global-tags', '--language', "0:$AudioLanguage",
-            '--track-name', "0:$($o.Title)", '--default-track-flag', "0:$(if ($o.IsDefault) { 'yes' } else { 'no' })",
-            $o.TempFile))
+            '--track-name', "0:$($o.Title)", '--default-track-flag', "0:$(if ($o.IsDefault) { 'yes' } else { 'no' })"))
+        if ($syncMs -ne 0) { $mk.AddRange([string[]]@('--sync', "0:$syncMs")) }
+        $mk.Add($o.TempFile)
         $trackOpts[$i] = "${fileNo}:0"
         $fileNo++
     }
@@ -949,6 +1057,16 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 
     # ------------------------------------------------ report
     Write-Host "Metadata: $titleDesc"
+    if ($droppedFrames -gt 0) {
+        Write-Host ("Sync: the encode is missing the source's first {0} video frame(s) ({1:N3}s), dropped by the encoder" -f
+            $droppedFrames, $droppedSecs) -ForegroundColor Yellow
+    }
+    if ($syncMs -ne 0) {
+        Write-Host ("Sync: encode's first frame is at {0:N3}s in the source's timeline and {1:N3}s in the encode; shifting all audio by {2} ms" -f
+            $srcVideoRef, $destVideoStart, $syncMs) -ForegroundColor Yellow
+    } else {
+        Write-Host ("Sync: video starts at {0:N3}s in both; no shift needed" -f $destVideoStart)
+    }
     if ($currentLayout.Count -gt 0) {
         Write-Host "Encoded file's audio now: $($currentLayout -join ', ')  (will be replaced)"
     } else {
@@ -980,6 +1098,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     if ($destIsMp4) { $what += ' (MP4 migrated to MKV)' }
 
     if (-not $script:Cmdlet.ShouldProcess($DestFile, $action)) {
+        if ($syncMs -ne 0) { $what += " (audio shifted $syncMs ms; $droppedFrames dropped frame(s))" }
         return New-Result 'Planned' "${what}: $trackLabel; $titleDesc"
     }
 
@@ -1039,12 +1158,44 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     if ($vLen -gt 0 -and [Math]::Abs($vLen - $oLen) -gt 2) {
         $problems.Add(("the remux is {0} but the original is {1}" -f (Format-Duration $oLen), (Format-Duration $vLen)))
     }
+    # Sync: each audio track's start relative to the video must match the source's.
+    $outVideoStart = 0.0
+    if ($outVideo.Count -gt 0) { $outVideoStart = ConvertTo-Number (Get-Field $outVideo[0] 'start_time') }
+    $syncBad = $false
+    for ($i = 0; $i -lt [Math]::Min($outAudio.Count, $outputs.Count); $i++) {
+        $srcTrack = $audio[$outputs[$i].SrcPos]
+        $wantRel = $srcTrack.Start - $srcVideoRef
+        $gotRel = (ConvertTo-Number (Get-Field $outAudio[$i] 'start_time')) - $outVideoStart
+        $offMs = [int][Math]::Round(($gotRel - $wantRel) * 1000)
+        # Audio shifted to before the file's 0 gets its start cut off, so it starts at ~0
+        # whether or not it was shifted. Then the track's END is checked instead: the end
+        # can't be cut, so it moves by exactly the shift.
+        if (($wantRel + $outVideoStart) -lt 0 -and ($gotRel + $outVideoStart) -le 0.05) {
+            $gotLenSync = Get-StreamSeconds $outAudio[$i]
+            if ($gotLenSync -gt 0 -and $srcTrack.Seconds -gt 0) {
+                $wantEnd = $wantRel + $srcTrack.Seconds
+                $gotEnd = $gotRel + $gotLenSync
+                $offMs = [int][Math]::Round(($gotEnd - $wantEnd) * 1000)
+            } else {
+                $offMs = 0
+                $notes.Add("a:$i starts before the video, and its length is unknown, so its sync couldn't be verified")
+            }
+        }
+        if ([Math]::Abs($offMs) -gt 50) {
+            $problems.Add(("a:{0} ({1}) is out of sync by {2} ms (starts {3:N3}s after the video, source: {4:N3}s)" -f
+                $i, $outputs[$i].Title, $offMs, $gotRel, $wantRel))
+            $syncBad = $true
+        }
+    }
+    if (-not $syncBad) { Write-Host '  sync: every audio track starts where it does in the source (within 50 ms)' -ForegroundColor Green }
+
     # Each audio track compared with its OWN source track (some discs have audio that
     # legitimately ends a few seconds before the picture).
     for ($i = 0; $i -lt [Math]::Min($outAudio.Count, $outputs.Count); $i++) {
         $gotLen = Get-StreamSeconds $outAudio[$i]
         $srcTrack = $audio[$outputs[$i].SrcPos]
-        if ($gotLen -gt 0 -and $srcTrack.Seconds -gt 0 -and [Math]::Abs($gotLen - $srcTrack.Seconds) -gt 2) {
+        $cutSecs = [Math]::Max(0, -(($srcTrack.Start - $srcVideoRef) + $outVideoStart))
+        if ($gotLen -gt 0 -and $srcTrack.Seconds -gt 0 -and [Math]::Abs($gotLen - ($srcTrack.Seconds - $cutSecs)) -gt 2) {
             $problems.Add(("a:{0} ({1}) is {2} but its source track (audio {3}) is {4}" -f
                 $i, $outputs[$i].Title, (Format-Duration $gotLen), $outputs[$i].SrcPos, (Format-Duration $srcTrack.Seconds)))
         }
@@ -1078,6 +1229,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         }
     }
 
+    if ($syncMs -ne 0) { $what += " (audio shifted $syncMs ms; $droppedFrames dropped frame(s))" }
     $msg = "${what}: $trackLabel; $titleDesc"
     if ($notes.Count -gt 0) { $msg += "; NOTE: $($notes -join '; ')" }
     return New-Result 'Done' $msg
@@ -1116,6 +1268,7 @@ $noLosslessTitles = [Collections.Generic.List[string]]::new()
 $stereoChecks     = [Collections.Generic.List[string]]::new()
 $lengthChecks     = [Collections.Generic.List[string]]::new()
 $subBackups       = [Collections.Generic.List[string]]::new()
+$subShifts        = [Collections.Generic.List[string]]::new()
 
 
 # -PassthruCommentaries: not given = Auto (keep detected commentary); "None"; or track
@@ -1207,10 +1360,12 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
         $script:FlagNoLossless = $false
         $script:StereoReport = ''
         $script:LengthReport = ''
+        $script:SubShiftNote = ''
         $r = Invoke-AudioRebuild $p.Source $p.Video
         if ($script:FlagNoLossless) { $noLosslessTitles.Add("$name  ($($r.Status): $($r.Message))") }
         if ($script:StereoReport) { $stereoChecks.Add("$name`n      $($script:StereoReport)") }
         if ($script:LengthReport) { $lengthChecks.Add("$name`n      $($script:LengthReport)") }
+        if ($script:SubShiftNote) { $subShifts.Add("$name`n      $($script:SubShiftNote)") }
         switch ($r.Status) {
             'Done'    { $done.Add("$name  ($($r.Message))") }
             'Planned' { $planned.Add("$name  ($($r.Message))") }
@@ -1248,6 +1403,7 @@ function Add-Section([string]$Title, $Items) {
     foreach ($item in $Items) { $lines.Add("  $item") }
 }
 Add-Section 'FAILED' $failed
+Add-Section 'SUBTITLES TO FIX: audio was shifted to match the encode, so OCR''d subtitles from the source need the same shift' $subShifts
 Add-Section 'Folders skipped: no mirrored encoded files' $skippedDirs
 Add-Section 'MKVs without a mirrored encoded file (in otherwise matched folders)' $unmatched
 Add-Section 'No lossless audio in the source (best lossy track used)' $noLosslessTitles
