@@ -69,6 +69,8 @@
 # leave CROP unset and rely on the automatic per-pair crop/scale detection below instead.
 # If the encode is cropped (e.g. HandBrake auto-crop of letterbox bars), the original is
 # center-cropped to match; if it is scaled, the encode is scaled up to the original size.
+# Set REF_CROP=W:H:X:Y to crop only the original at an exact position instead (what an
+# encoder that cropped asymmetrically actually kept); it overrides both of the above.
 
 set -u
 
@@ -307,6 +309,15 @@ score_pair() {
     echo "CROP=${CROP}: comparing the center ${CROP} region of both files."
   fi
 
+  # Optional: the exact crop the encoder applied, as W:H:X:Y (ffmpeg crop order). Crops only
+  # the ORIGINAL, at that exact offset, and overrides the automatic centered crop above --
+  # needed when the crop isn't symmetric (e.g. top 264 / bottom 266), where a centered crop
+  # would land a pixel off and quietly lower every score.
+  if [ -n "${REF_CROP:-}" ]; then
+    DSCALE=""; RCROP="crop=${REF_CROP},"
+    echo "REF_CROP=${REF_CROP}: cropping the original at exactly that position."
+  fi
+
   local OFFS=()
   if [ "$FULL" -eq 1 ]; then
     OFFS=()
@@ -490,4 +501,3 @@ if [ "$BATCH" -eq 1 ]; then
 else
   exit "$status"
 fi
-

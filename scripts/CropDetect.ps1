@@ -22,6 +22,16 @@
 
 .EXAMPLE
     CropDetect -Source ".\Movie (1975) [tmdbid-12345] - 2160p.mkv" -StepPercent 2
+
+.EXAMPLE
+    CropDetect -Source ".\movie.mkv" -Plumbing
+    Machine-readable mode for scripts: writes one compressed JSON line per source to the
+    output stream with the Suggested crop, e.g.
+    {"File":"D:\\movie.mkv","SourceWidth":3840,"SourceHeight":2160,"Width":3840,"Height":1632,
+     "Left":0,"Top":264,"Right":0,"Bottom":264,"Samples":"20/20","EdgeDark":"L9% R9% T0% B1%"}
+    Status text still goes to the host/information stream (callers can redirect it with 6>),
+    progress bars are suppressed, and nothing is written for a file that can't be analysed.
+    Cannot be combined with -Dest.
 #>
 [CmdletBinding()]
 param(
@@ -63,8 +73,16 @@ param(
     [switch]$HwDecode,
 
     # Report location. Defaults to Desktop\CropReport_yyyy-MM-dd_HHmmss.md
-    [string]$ReportPath
+    [string]$ReportPath,
+
+    # Machine-readable output for other scripts (see examples). Analysis only.
+    [switch]$Plumbing
 )
+
+if ($Plumbing) {
+    if ($Dest) { throw '-Plumbing cannot be combined with -Dest.' }
+    $ProgressPreference = 'SilentlyContinue'
+}
 
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
 $started = Get-Date
@@ -359,6 +377,15 @@ foreach ($src in $sources) {
         $boxes = Get-ContentBoxes -Path $src.FullName -Info $sInfo
         if (-not $boxes) { Write-Host '  [UNKNOWN] could not detect (all samples black?)' -ForegroundColor Yellow; continue }
         $so = $boxes.Soft; $st = $boxes.Strict; $sg = $boxes.Barred
+        if ($Plumbing) {
+            [pscustomobject]@{
+                File = $src.FullName; SourceWidth = $sInfo.Width; SourceHeight = $sInfo.Height
+                Width = $sg.Width; Height = $sg.Height
+                Left = $sg.Left; Top = $sg.Top; Right = $sg.Right; Bottom = $sg.Bottom
+                Samples = $boxes.Samples; EdgeDark = $boxes.EdgeDark
+            } | ConvertTo-Json -Compress
+            continue
+        }
         $line = { param($label, $b, $note, $color)
             Write-Host ("  {0,-10}: {1}x{2}   crop T{3} B{4} L{5} R{6}   (ffmpeg crop={1}:{2}:{5}:{3})   {7}" -f `
                 $label, $b.Width, $b.Height, $b.Top, $b.Bottom, $b.Left, $b.Right, $note) -ForegroundColor $color }
