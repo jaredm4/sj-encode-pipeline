@@ -533,12 +533,18 @@ function Export-SubtitleBackup([string]$SourceFile, [string]$DestFile) {
     $reviewSubs = Join-Path $dir ($base + '.remux.mks.originals')
     $partialSubs = $reviewSubs + '.partial'
 
-    if ((Test-Path -LiteralPath $finalSubs) -and -not $Force) { return '' }
+    $haveFinal = Test-Path -LiteralPath $finalSubs
+    $haveReview = Test-Path -LiteralPath $reviewSubs
+    # A final backup and no review copy waiting: nothing to do (-Force redoes it).
+    if ($haveFinal -and -not $haveReview -and -not $Force) { return '' }
+    # A review copy waiting but no -Replace: leave it for review (-Force redoes it).
+    if ($haveReview -and -not $Replace -and -not $Force) { return '' }
     $srcSubCount = @(Get-MkvTracks $SourceFile | Where-Object { $_.type -eq 'subtitles' }).Count
     if ($srcSubCount -eq 0) { return '' }
 
-    # A verified review copy from an earlier run: leave it, or move it into place.
-    if ((Test-Path -LiteralPath $reviewSubs) -and -not $Force) {
+    # A verified review copy from an earlier run, with -Replace: move it into place. It
+    # replaces an older final backup, if there is one (the review copy is newer).
+    if ($haveReview -and -not $Force) {
         if (-not $Replace) { return '' }
         $gotCount = @(Get-MkvTracks $reviewSubs | Where-Object { $_.type -eq 'subtitles' }).Count
         if ($gotCount -ne $srcSubCount) {
@@ -548,7 +554,9 @@ function Export-SubtitleBackup([string]$SourceFile, [string]$DestFile) {
             return "reviewed backup would be moved to $([IO.Path]::GetFileName($finalSubs))"
         }
         Move-Item -LiteralPath $reviewSubs -Destination $finalSubs -Force
-        return "reviewed backup moved to $([IO.Path]::GetFileName($finalSubs))"
+        $how = 'moved to'
+        if ($haveFinal) { $how = 'replaced the older' }
+        return "reviewed backup $how $([IO.Path]::GetFileName($finalSubs))"
     }
 
     $target = $reviewSubs
@@ -566,6 +574,9 @@ function Export-SubtitleBackup([string]$SourceFile, [string]$DestFile) {
         throw "Subtitle backup has $gotCount track(s), the source has $srcSubCount. Left for inspection: $partialSubs"
     }
     Move-Item -LiteralPath $partialSubs -Destination $target -Force
+    if ($Replace -and (Test-Path -LiteralPath $reviewSubs)) {
+        Remove-Item -LiteralPath $reviewSubs -Force   # stale review copy, superseded by this one
+    }
     return "backed up $srcSubCount subtitle track(s) to $([IO.Path]::GetFileName($target))"
 }
 
