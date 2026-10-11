@@ -46,14 +46,17 @@
            section). AC-3, E-AC-3 or AAC is copied as-is; anything else (e.g. lossy
            DTS) is converted (AC-3 5.1 or AAC) and the original is kept as a master.
     4. Comparison: each lossy track that could be a copy or a commentary is compared
-       with the main track in 5 clips of up to 60 s (at 15-75% of the runtime). Both
+       with the main track in 7 clips of up to 60 s (one starting 5 s in, where the
+       film is often quiet while commentators introduce themselves, and six spread over
+       15-80% of the runtime). Both
        are mixed to mono and their loudness is measured 10 times a second. Two shares
        are counted: moments where the track is clearly LOUDER than the main track
        predicts (someone talking over the film), and moments where it is clearly
        QUIETER (something missing, e.g. an isolated score). Then:
-         - louder 15%+ in at least 4 of the 5 clips -> commentary (kept automatically,
-           if stereo or mono). A commentator talks through the whole film; a different
-           mix, like an original theatrical stereo mix, only differs in some scenes.
+         - median louder share across the clips 30%+ -> commentary (kept
+           automatically, if stereo or mono). A commentator talks through most of the
+           film (the median tolerates a couple of quiet clips); a different mix, like an
+           original theatrical stereo mix, only differs in some scenes.
          - louder 3%+ in some clip, but quieter under 10% -> narration / audio
            description (dropped): the film plus a narrator, nothing removed.
          - louder and quieter both under 3% -> same mix as the main track (usable as
@@ -101,12 +104,11 @@
 
     Subtitle backup: if the source MKV has subtitle tracks (e.g. PGS), they are all
     copied, unchanged, into one Matroska subtitle file next to the encoded file, as a
-    backup for when the source MKVs are deleted. The ".originals" extension keeps
-    Jellyfin from showing it as an extra subtitle. It follows the same flow as the
-    remux: "<name>.remux.mks.originals" for review without -Replace, then
-    "<name>.mks.originals" (moved into place by -Replace, or written directly with
-    -Replace). Verified by its track count; existing backups are skipped. This runs
-    for every title, even when the audio needs no changes.
+    backup for when the source MKVs are deleted. It follows the same flow as the
+    remux: "<name>.remux.mks" for review without -Replace, then "<name>.mks" (moved
+    into place by -Replace, or written directly with -Replace). Verified by its track
+    count; existing backups are skipped. This runs for every title, even when the
+    audio needs no changes.
     New audio is encoded to temporary files in your local temp folder, which are
     deleted afterwards.
 
@@ -163,6 +165,36 @@
     run if there is one (after a quick check, without redoing any analysis); otherwise
     the remux is created first.
     Default: off (writes "<name>.remux.mkv" next to the original).
+.PARAMETER SkipSubtitles
+    Don't back up subtitles at all (no .mks files are made, moved or checked),
+    e.g. when re-running only to fix audio on titles whose backups already exist
+    elsewhere. Audio work is unchanged.
+    Default: off (subtitles are backed up).
+.PARAMETER LogPath
+    Where to write the log: everything shown on screen, then the summary. An existing
+    log is added to, not replaced (a rerun of the same title keeps the earlier run).
+    Default: "Add-BluRayAudio <date> <time>.log" on your Desktop.
+.PARAMETER Plumbing
+    For other scripts (Encode-Batch uses it). Single files only. Nothing is shown; the
+    log gets it all (see -LogPath), and stdout gets one line of JSON when done:
+      Status        Done, Skipped, Planned (with -WhatIf) or Failed
+      Message       what happened, or why it failed
+      Output        the file with the new audio
+      Summary       e.g. "Dolby Digital 5.1 (default) + TrueHD Atmos 7.1 (master) + 1 commentary"
+      Tracks        the output audio tracks in order: Track, Role (default, commentary or
+                    master), Name, Codec, Channels, Kbps, Title, Made (copied or encoded),
+                    SourceTrack and SourceName (the source track it came from)
+      Dropped       source tracks not kept: SourceTrack, Name, Channels, Kbps, Title,
+                    Reason, and the comparison's Louder/Quieter/Median shares if compared
+      SyncMs        audio shift (0 = none); DroppedFrames: video frames the encoder dropped
+      SubtitleShift what to do with OCR'd subtitles when the audio was shifted, or ""
+      NoLossless    true if the source had no lossless track
+      Subtitles     the backup: File, Tracks, Message, Error
+      Warnings      every warning, "SUBTITLES TO FIX: ..." first when there is a shift
+      LogPath       where the log went
+    Exit code: 0, or 1 if anything failed (also reported as Status Failed or
+    Subtitles.Error).
+    Default: off.
 .PARAMETER Force
     Redo remuxes even if a .remux.mkv exists (overwriting it, also with -Replace), even
     if the encoded MKV's audio already matches the plan, and redo subtitle backups
@@ -193,6 +225,9 @@ param(
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
     [switch]$Replace,
+    [switch]$SkipSubtitles,
+    [string]$LogPath = '',
+    [switch]$Plumbing,
     [switch]$Force
 )
 
@@ -201,8 +236,10 @@ $ErrorActionPreference = 'Stop'
 $script:Cmdlet = $PSCmdlet
 
 # ---- Tunables (adjust after testing on your discs) ----
-$CommentaryMinPercent = 15    # louder share a clip needs to count toward commentary...
-$CommentaryMinClips   = 4     # ...in at least this many clips (a commentator talks throughout)
+$CommentaryMinMedian  = 30    # median louder share across the clips at or above: commentary.
+                              # A commentator talks through most of the film; the median
+                              # tolerates a couple of quiet clips, while a different mix (e.g.
+                              # an original theatrical stereo mix) only differs in some scenes.
 $NarrationMinPercent  = 3     # louder share at or above (in any clip): narration...
 $NarrationMaxQuieter  = 10    # ...if its quieter share stays below this (nothing removed)
 $SameMixMaxPercent    = 3     # louder and quieter shares both below this: same mix
@@ -212,12 +249,65 @@ $CoreMinKbps          = 448   # minimum bitrate for a TrueHD's AC-3 core
 # object audio to preserve. Xiph's top recommendations x1.5 for headroom (as 128 -> 192
 # for stereo). libopus allows at most 256 kbps per channel.
 $OpusKbps = @{ 1 = 96; 2 = 192; 6 = 384; 8 = 672 }
-$CheckClipCount       = 5     # comparison clips per title, spread over 15-75% of the runtime
+$CheckClipCount       = 6     # comparison clips per title, spread over 15-80% of the runtime...
+$CheckOpeningClip     = $true # ...plus one starting 5 s in: the opening is often quiet in the
+                              # film, while commentators introduce themselves right away
 $CheckClipSeconds     = 60    # longest clip length
 
 # Note: PowerShell variable names are case-insensitive, so names in the same scope
 # differ by more than case. Property shorthand like "ForEach-Object Name" is avoided:
 # it honors -WhatIf and then returns nothing ("ForEach-Object { $_.Name }" is used).
+
+# ================================================================ output and log
+
+# Everything shown is also kept for the log (written at the end). With -Plumbing nothing is
+# shown: under "powershell -File", Write-Host and warnings land on stdout, which has to hold
+# only the JSON result line. Warnings are also collected for that result.
+$script:LogLines = [Collections.Generic.List[string]]::new()
+$script:Warnings = [Collections.Generic.List[string]]::new()
+$script:LogLines.Add(('Add-BluRayAudio {0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date)))
+
+function Write-Host {
+    param([Parameter(Position = 0, ValueFromPipeline)][object]$Object = '',
+          [ConsoleColor]$ForegroundColor, [ConsoleColor]$BackgroundColor, [switch]$NoNewline)
+    process {
+        foreach ($l in ("$Object" -split "`r?`n")) { $script:LogLines.Add($l) }
+        if (-not $Plumbing) { Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters }
+    }
+}
+
+function Write-Warning {
+    param([Parameter(Position = 0, Mandatory)][string]$Message)
+    $script:Warnings.Add($Message)
+    $script:LogLines.Add("WARNING: $Message")
+    if (-not $Plumbing) { Microsoft.PowerShell.Utility\Write-Warning $Message }
+}
+
+# Tables (Format-Table | Out-Host) go through Write-Host, so they reach the log too.
+function Out-Host {
+    param([Parameter(ValueFromPipeline)]$InputObject)
+    begin { $items = [Collections.Generic.List[object]]::new() }
+    process { $items.Add($InputObject) }
+    end {
+        $text = ($items | Out-String -Width 250).TrimEnd()
+        foreach ($l in ($text -split "`r?`n")) { Write-Host $l }
+    }
+}
+
+# -Plumbing: runs ffmpeg or mkvmerge with its output going to the log instead of the screen
+# (progress lines left out). Without -Plumbing the tools are run directly, so their output
+# shows live. Check $LASTEXITCODE afterwards either way.
+function Invoke-ToolLogged([string]$Exe, [string[]]$ArgList) {
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'   # stderr lines arrive as error records under 2>&1
+    try {
+        & $Exe @ArgList 2>&1 | ForEach-Object {
+            foreach ($l in ("$_" -split "`r|`n")) {
+                if ($l.Trim() -and $l -notmatch '^\s*(Progress: \d+%|size=|frame=)') { $script:LogLines.Add("    $l") }
+            }
+        }
+    } finally { $ErrorActionPreference = $eap }
+}
 
 # ================================================================ helpers
 
@@ -521,16 +611,15 @@ function Get-TagsXml($TitleInfo) {
 }
 
 # Backup of all of a source MKV's subtitle tracks (e.g. PGS), unchanged, in one Matroska
-# subtitle file next to the encoded file. The ".originals" extension keeps Jellyfin from
-# treating it as an extra subtitle. Same flow as the audio remux:
-#   "<name>.remux.mks.originals.partial" while writing,
-#   "<name>.remux.mks.originals" once verified (for review, without -Replace),
-#   "<name>.mks.originals" final (with -Replace).
+# subtitle file next to the encoded file. Same flow as the audio remux:
+#   "<name>.remux.mks.partial" while writing,
+#   "<name>.remux.mks" once verified (for review, without -Replace),
+#   "<name>.mks" final (with -Replace).
 function Export-SubtitleBackup([string]$SourceFile, [string]$DestFile) {
     $dir = [IO.Path]::GetDirectoryName($DestFile)
     $base = [IO.Path]::GetFileNameWithoutExtension($DestFile)
-    $finalSubs = Join-Path $dir ($base + '.mks.originals')
-    $reviewSubs = Join-Path $dir ($base + '.remux.mks.originals')
+    $finalSubs = Join-Path $dir ($base + '.mks')
+    $reviewSubs = Join-Path $dir ($base + '.remux.mks')
     $partialSubs = $reviewSubs + '.partial'
 
     $haveFinal = Test-Path -LiteralPath $finalSubs
@@ -564,7 +653,8 @@ function Export-SubtitleBackup([string]$SourceFile, [string]$DestFile) {
     if (-not $script:Cmdlet.ShouldProcess($target, "Back up $srcSubCount subtitle track(s)")) {
         return "would back up $srcSubCount subtitle track(s) to $([IO.Path]::GetFileName($target))"
     }
-    & $script:mkvmerge --quiet --output $partialSubs --no-video --no-audio --no-chapters --no-attachments --no-global-tags $SourceFile
+    $subArgs = @('--quiet', '--output', $partialSubs, '--no-video', '--no-audio', '--no-chapters', '--no-attachments', '--no-global-tags', $SourceFile)
+    if ($Plumbing) { Invoke-ToolLogged $script:mkvmerge $subArgs } else { & $script:mkvmerge @subArgs }
     if ($LASTEXITCODE -ge 2) {
         Remove-Item -LiteralPath $partialSubs -Force -ErrorAction SilentlyContinue
         throw "mkvmerge failed backing up subtitles (exit code $LASTEXITCODE)"
@@ -684,6 +774,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $srcVideoRef = $srcVideoStart + $droppedSecs
     $syncMs = [int][Math]::Round(($destVideoStart - $srcVideoRef) * 1000)
     if ([Math]::Abs($syncMs) -lt 10) { $syncMs = 0 }
+    $script:PlanSyncMs = $syncMs
+    $script:PlanDroppedFrames = $droppedFrames
     if ($syncMs -ne 0) {
         $script:SubShiftNote = "shift its .srt subtitles by $syncMs ms (encode is missing $droppedFrames frame(s); video start $([Math]::Round($srcVideoStart, 3))s -> $([Math]::Round($destVideoStart, 3))s)"
     }
@@ -779,8 +871,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $clipLen = [Math]::Min($CheckClipSeconds, [Math]::Floor($runtime * 0.1))
     if ($clipLen -lt 10) { $clipLen = [Math]::Max(1, [Math]::Floor($runtime / 2)) }
     $starts = @(for ($c = 0; $c -lt $CheckClipCount; $c++) {
-        $runtime * (0.15 + 0.6 * $c / [Math]::Max(1, $CheckClipCount - 1))
+        $runtime * (0.15 + 0.65 * $c / [Math]::Max(1, $CheckClipCount - 1))
     })
+    # Opening clip, only when it fits before the first spread clip.
+    if ($CheckOpeningClip -and (5 + $clipLen) -le $starts[0]) { $starts = @(5.0) + $starts }
 
     $verdicts = @{}   # source position -> verdict
     if ($toCompare.Count -gt 0) {
@@ -802,20 +896,23 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $topQuieter = ($quieter | Measure-Object -Maximum).Maximum
             # Commentary talks through the whole film: high in (nearly) every clip. A different
             # mix (e.g. an original theatrical stereo mix) only differs in some scenes.
-            $clipsOver = @($louder | Where-Object { $_ -ge $CommentaryMinPercent }).Count
-            $needClips = [Math]::Min($CommentaryMinClips, $starts.Count)
+            $sortedL = @($louder | Sort-Object)
+            $medLouder = $sortedL[[int][Math]::Floor(($sortedL.Count - 1) / 2)]
+            if ($sortedL.Count % 2 -eq 0 -and $sortedL.Count -gt 0) {
+                $medLouder = ($sortedL[$sortedL.Count / 2 - 1] + $sortedL[$sortedL.Count / 2]) / 2
+            }
             $kind = 'different mix'
-            if ($clipsOver -ge $needClips) { $kind = 'commentary' }
+            if ($medLouder -ge $CommentaryMinMedian) { $kind = 'commentary' }
             elseif ($topLouder -ge $NarrationMinPercent -and $topQuieter -lt $NarrationMaxQuieter) { $kind = 'narration' }
             elseif ($topLouder -lt $SameMixMaxPercent -and $topQuieter -lt $SameMixMaxPercent) { $kind = 'same mix' }
             $verdicts[$cand.Pos] = [pscustomobject]@{
                 Kind = $kind; Louder = $topLouder; Quieter = $topQuieter
-                ClipsOver = "$clipsOver/$($starts.Count)"
+                Median = $medLouder
                 Clips = (($louder | ForEach-Object { '{0:N1}' -f $_ }) -join ' / ')
             }
-            Write-Host ("  {0} -> {1} (louder {2:N1}%, quieter {3:N1}%; louder per clip {4}; {5} clips at {6}%+)" -f
+            Write-Host ("  {0} -> {1} (louder {2:N1}%, quieter {3:N1}%; louder per clip {4}; median {5:N1}%, commentary at {6}%+)" -f
                 (Get-TrackDesc $cand), $kind, $topLouder, $topQuieter, $verdicts[$cand.Pos].Clips,
-                $verdicts[$cand.Pos].ClipsOver, $CommentaryMinPercent)
+                $medLouder, $CommentaryMinMedian)
         }
     }
 
@@ -979,6 +1076,45 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         if ($_.From -eq 'encode' -and $_.SrcPos -eq $pick.Pos) { "$($_.Title) (from $srcLabel)" } else { $_.Title }
     })) -join ', '
 
+    # For -Plumbing: the planned tracks with their roles, and what was dropped and why.
+    $script:PlanTracks = @(for ($i = 0; $i -lt $outputs.Count; $i++) {
+        $o = $outputs[$i]
+        $s = $audio[$o.SrcPos]
+        $role = 'master'
+        if ($o.IsDefault) { $role = 'default' } elseif ($o.IsCommentary) { $role = 'commentary' }
+        $srcName = "$($s.Name) $(Get-ChannelLabel $s.Channels)"
+        $outCh = [int](($o.Layout -split ' ')[1])
+        $kb = $o.Kbps
+        if ($kb -le 0 -and $s.BitRate -gt 0) { $kb = [int][Math]::Round($s.BitRate / 1000) }
+        $made = 'copied'
+        if ($o.From -eq 'encode') { $made = 'encoded' }
+        $trackName = $o.Title
+        if ($o.IsCommentary) { $trackName = $srcName }
+        [ordered]@{
+            Track = $i; Role = $role; Name = $trackName; Codec = ($o.Layout -split ' ')[0]; Channels = $outCh
+            Kbps = $kb; Title = $o.Title; Made = $made; SourceTrack = $o.SrcPos; SourceName = $srcName
+        }
+    })
+    $script:PlanDropped = @(foreach ($d in @($audio | Where-Object { $_.Pos -notin $usedPos })) {
+        $v = $null
+        if ($verdicts.ContainsKey($d.Pos)) { $v = $verdicts[$d.Pos] }
+        if ($d.Pos -in $dupDropped) { $reason = 'lossless copy of a kept commentary' }
+        elseif ($v -and $v.Kind -eq 'commentary') { $reason = 'commentary, not kept (-PassthruCommentaries)' }
+        elseif ($v) { $reason = $v.Kind }
+        elseif ($masters.Count -gt 0) { $reason = 'lossy surround, not compared (the lossless master is kept)' }
+        else { $reason = 'not compared' }
+        $entry = [ordered]@{
+            SourceTrack = $d.Pos; Name = "$($d.Name) $(Get-ChannelLabel $d.Channels)"; Channels = $d.Channels
+            Kbps = [int][Math]::Round($d.BitRate / 1000); Title = $d.Title; Reason = $reason
+        }
+        if ($v) {
+            $entry.Louder = [Math]::Round($v.Louder, 1)
+            $entry.Quieter = [Math]::Round($v.Quieter, 1)
+            $entry.Median = [Math]::Round($v.Median, 1)
+        }
+        $entry
+    })
+
     # Comparison report: one line per compared track, with what happens to it.
     $keptWord = 'kept'
     if ($WhatIfPreference) { $keptWord = 'would be kept' }
@@ -988,8 +1124,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $fate = 'dropped'
         if ($cand.Pos -eq $compat.SrcPos -and $compat.From -eq 'source') { $fate = "used as the default track" }
         elseif ($cand.Pos -in $passPos) { $fate = "$keptWord as commentary" }
-        $reportLines.Add(("{0} -> {1} (louder {2:N1}%, quieter {3:N1}%, louder per clip {4}) -> {5}" -f
-            (Get-TrackDesc $cand), $v.Kind, $v.Louder, $v.Quieter, $v.Clips, $fate))
+        $reportLines.Add(("{0} -> {1} (louder {2:N1}%, quieter {3:N1}%, louder per clip {4}, median {5:N1}%) -> {6}" -f
+            (Get-TrackDesc $cand), $v.Kind, $v.Louder, $v.Quieter, $v.Clips, $v.Median, $fate))
     }
     if ($script:PassMode -eq 'List') {
         foreach ($pt in $passTracks) {
@@ -1035,7 +1171,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $encodeCmds = [Collections.Generic.List[object]]::new()
     $enc = [Collections.Generic.List[string]]::new()
     # -copyts keeps the source track's start time, so a track that starts late stays in sync.
-    $enc.AddRange([string[]]@('-hide_banner', '-v', 'warning', '-stats', '-nostdin', '-copyts', '-i', $SourceFile))
+    $stats = '-stats'
+    if ($Plumbing) { $stats = '-nostats' }   # no progress lines in the log
+    $enc.AddRange([string[]]@('-hide_banner', '-v', 'warning', $stats, '-nostdin', '-copyts', '-i', $SourceFile))
     foreach ($o in $outputs) {
         if ($o.From -ne 'encode') { continue }
         $o.TempFile = Join-Path $tempDir ('abr-' + [guid]::NewGuid().ToString('N') + '.mka')
@@ -1148,11 +1286,11 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     try {
         [IO.File]::WriteAllText($tagsFile, (Get-TagsXml $titleInfo), [Text.UTF8Encoding]::new($false))
         foreach ($enc in $encodeCmds) {
-            & $script:ffmpeg @enc
+            if ($Plumbing) { Invoke-ToolLogged $script:ffmpeg $enc } else { & $script:ffmpeg @enc }
             if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed with exit code $LASTEXITCODE" }
         }
         $mkArgs = $mk.ToArray()
-        & $script:mkvmerge @mkArgs
+        if ($Plumbing) { Invoke-ToolLogged $script:mkvmerge $mkArgs } else { & $script:mkvmerge @mkArgs }
         if ($LASTEXITCODE -ge 2) { throw "mkvmerge failed with exit code $LASTEXITCODE" }
         if ($LASTEXITCODE -eq 1) { $mkWarnings = $true }
     } finally {
@@ -1279,8 +1417,97 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 # ================================================================ main
 
 $startTime = Get-Date
-$logPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
-    ('Add-BluRayAudio {0:yyyy-MM-dd HHmmss}.log' -f $startTime)
+$logPath = $LogPath
+if (-not $logPath) {
+    $logPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
+        ('Add-BluRayAudio {0:yyyy-MM-dd HHmmss}.log' -f $startTime)
+}
+$script:LogSaved = $false
+
+# Writes the log (everything shown, then the summary). An existing log is added to.
+function Save-Log {
+    if ($script:LogSaved) { return }
+    $script:LogSaved = $true
+    try {
+        $dirOfLog = [IO.Path]::GetDirectoryName($logPath)
+        if ($dirOfLog -and -not [IO.Directory]::Exists($dirOfLog)) { [void][IO.Directory]::CreateDirectory($dirOfLog) }
+        $sep = @()
+        if ([IO.File]::Exists($logPath)) { $sep = @('', '') }
+        [IO.File]::AppendAllLines($logPath, [string[]]($sep + $script:LogLines), [Text.UTF8Encoding]::new($false))
+        if (-not $Plumbing) { Microsoft.PowerShell.Utility\Write-Host "`nLog saved to $logPath" }
+    } catch {
+        Write-Warning "Could not write the log to ${logPath}: $($_.Exception.Message)"
+    }
+}
+
+# e.g. "Dolby Digital 5.1 (default) + TrueHD Atmos 7.1 (master) + 1 commentary"
+function Get-AudioSummary($Tracks) {
+    $parts = [Collections.Generic.List[string]]::new()
+    foreach ($t in @($Tracks | Where-Object { $_.Role -eq 'default' })) { $parts.Add("$($t.Name) (default)") }
+    foreach ($t in @($Tracks | Where-Object { $_.Role -eq 'master' })) { $parts.Add("$($t.Name) (master)") }
+    $nc = @($Tracks | Where-Object { $_.Role -eq 'commentary' }).Count
+    if ($nc -eq 1) { $parts.Add('1 commentary') } elseif ($nc -gt 1) { $parts.Add("$nc commentaries") }
+    return ($parts -join ' + ')
+}
+
+# Output tracks read back from a finished file, when there is no plan (a reviewed .remux.mkv
+# swapped in). Roles come from the default and commentary flags; the rest count as masters.
+function Get-ProbedTracks([string]$File) {
+    $list = @(Get-Streams $File | Where-Object { $_.codec_type -eq 'audio' })
+    return @(for ($i = 0; $i -lt $list.Count; $i++) {
+        $st = $list[$i]
+        $disp = Get-Field $st 'disposition'
+        $tags = Get-Field $st 'tags'
+        $role = 'master'
+        if ((ConvertTo-Number (Get-Field $disp 'default')) -eq 1) { $role = 'default' }
+        elseif ((ConvertTo-Number (Get-Field $disp 'comment')) -eq 1) { $role = 'commentary' }
+        $br = ConvertTo-Number (Get-Field $st 'bit_rate')
+        if ($br -le 0) { $br = ConvertTo-Number (Get-Field $tags 'BPS') }
+        $ch = [int](ConvertTo-Number (Get-Field $st 'channels'))
+        [ordered]@{
+            Track = $i; Role = $role; Name = "$(Get-FriendlyName ([string]$st.codec_name) ([string](Get-Field $st 'profile'))) $(Get-ChannelLabel $ch)"
+            Codec = [string]$st.codec_name; Channels = $ch; Kbps = [int][Math]::Round($br / 1000)
+            Title = [string](Get-Field $tags 'title'); Made = 'copied'; SourceTrack = -1; SourceName = ''
+        }
+    })
+}
+
+# -Plumbing: the one JSON line on stdout.
+function Write-PlumbingResult([string]$Status, [string]$Message, [string]$Output = '') {
+    $tracks = @($script:PlanTracks)
+    if ($tracks.Count -eq 0 -and $Status -in 'Done', 'Skipped' -and $Output -and (Test-Path -LiteralPath $Output)) {
+        try { $tracks = @(Get-ProbedTracks $Output) } catch { $tracks = @() }
+    }
+    $warn = [Collections.Generic.List[string]]::new()
+    if ($script:SubShiftNote) { $warn.Add("SUBTITLES TO FIX: $($script:SubShiftNote)") }
+    foreach ($w in $script:Warnings) { if ($w -ne $Message -and $w -notin $warn) { $warn.Add($w) } }
+    $result = [ordered]@{
+        Status = $Status; Message = $Message; Output = $Output
+        Summary = (Get-AudioSummary $tracks); Tracks = $tracks; Dropped = @($script:PlanDropped)
+        SyncMs = $script:PlanSyncMs; DroppedFrames = $script:PlanDroppedFrames; SubtitleShift = [string]$script:SubShiftNote
+        NoLossless = [bool]$script:FlagNoLossless; Subtitles = $script:SubInfo
+        Warnings = @($warn); LogPath = $logPath
+    }
+    [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 6 -Compress))
+}
+
+$script:PlanTracks = @()
+$script:PlanDropped = @()
+$script:PlanSyncMs = 0
+$script:PlanDroppedFrames = 0
+$script:SubShiftNote = ''
+$script:FlagNoLossless = $false
+$script:SubInfo = [ordered]@{ File = ''; Tracks = 0; Message = ''; Error = '' }
+
+# Anything that stops the script outside the per-title handling (a missing tool, bad
+# arguments): still save the log and, with -Plumbing, report it as Failed.
+trap {
+    $msg = $_.Exception.Message
+    $script:LogLines.Add("ERROR: $msg")
+    if ($Plumbing) { Write-PlumbingResult 'Failed' $msg }
+    Save-Log
+    break
+}
 
 $script:ffmpeg = Get-Tool 'ffmpeg'
 $script:ffprobe = Get-Tool 'ffprobe'
@@ -1343,6 +1570,7 @@ if ($PassthruTitles.Count -gt 0) {
     }
 }
 
+if ($Plumbing -and $batch) { throw '-Plumbing only works with single files.' }
 if (-not $batch) {
     if ([IO.Path]::GetExtension($Dest) -notin @('.mkv', '.mp4')) { throw '-Dest must be an .mkv or .mp4 file.' }
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
@@ -1402,7 +1630,12 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
         $script:StereoReport = ''
         $script:LengthReport = ''
         $script:SubShiftNote = ''
+        $script:PlanTracks = @()
+        $script:PlanDropped = @()
+        $script:PlanSyncMs = 0
+        $script:PlanDroppedFrames = 0
         $r = Invoke-AudioRebuild $p.Source $p.Video
+        $lastResult = $r
         if ($script:FlagNoLossless) { $noLosslessTitles.Add("$name  ($($r.Status): $($r.Message))") }
         if ($script:StereoReport) { $stereoChecks.Add("$name`n      $($script:StereoReport)") }
         if ($script:LengthReport) { $lengthChecks.Add("$name`n      $($script:LengthReport)") }
@@ -1414,14 +1647,29 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
         }
     } catch {
         $failed.Add("$name`n      $($_.Exception.Message)")
+        $lastResult = New-Result 'Failed' $_.Exception.Message
         Write-Warning $_.Exception.Message
     }
-    try {
+    if (-not $SkipSubtitles) { try {
         $subMsg = Export-SubtitleBackup $p.Source $p.Video
+        $script:SubInfo.Message = $subMsg
         if ($subMsg) { $subBackups.Add("$name  ($subMsg)"); Write-Host "Subtitles: $subMsg" }
     } catch {
         $failed.Add("$name (subtitle backup)`n      $($_.Exception.Message)")
+        $script:SubInfo.Error = $_.Exception.Message
         Write-Warning $_.Exception.Message
+    } }
+    if ($Plumbing -and -not $SkipSubtitles) {
+        # The backup that's there now (made by this run or an earlier one) and its track count.
+        $vDir = [IO.Path]::GetDirectoryName($p.Video)
+        $vBase = [IO.Path]::GetFileNameWithoutExtension($p.Video)
+        foreach ($cand in @(($vBase + '.mks'), ($vBase + '.remux.mks'))) {
+            $full = Join-Path $vDir $cand
+            if (-not (Test-Path -LiteralPath $full)) { continue }
+            $script:SubInfo.File = $cand
+            try { $script:SubInfo.Tracks = @(Get-MkvTracks $full | Where-Object { $_.type -eq 'subtitles' }).Count } catch { }
+            break
+        }
     }
 }
 
@@ -1459,11 +1707,17 @@ Write-Host ''
 Write-Host ('=' * 70)
 foreach ($l in $lines) { Write-Host $l }
 
-try {
-    Set-Content -LiteralPath $logPath -Value $lines -Encoding UTF8 -WhatIf:$false
-    Write-Host "`nLog saved to $logPath"
-} catch {
-    Write-Warning "Could not write the log to ${logPath}: $($_.Exception.Message)"
+if ($Plumbing) {
+    # Single file: where the audio ended up (the .remux.mkv for review without -Replace).
+    $pv = $pairs[0].Video
+    $outName = [IO.Path]::GetFileNameWithoutExtension($pv) + '.mkv'
+    if (-not $Replace) { $outName = [IO.Path]::GetFileNameWithoutExtension($pv) + '.remux.mkv' }
+    $outPath = Join-Path ([IO.Path]::GetDirectoryName($pv)) $outName
+    if (-not $lastResult) { $lastResult = New-Result 'Failed' 'no result' }
+    Save-Log
+    Write-PlumbingResult $lastResult.Status $lastResult.Message $outPath
+} else {
+    Save-Log
 }
 
 if ($failed.Count -gt 0) { exit 1 }

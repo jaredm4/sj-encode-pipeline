@@ -10,16 +10,30 @@
 
       Dest\<same sub-folders>\
           <name>.mkv                   the finished encode, with audio (ladder mode, see below)
-          <name>.mks.originals         subtitle backup from Add-BluRayAudio
+          <name>.mks                   subtitle backup from Add-BluRayAudio, until the folder is done
+          <folder> - subtitles.zip     all of the folder's subtitle backups, once every title in it is done
           <name>.encode.log            everything that happened to this title, every run
-          <name>.audio.log             Add-BluRayAudio's own log
+          <name>.audio.log             Add-BluRayAudio's own log (every detail of the audio step)
+          <name>.crop.json             CropDetect's result (delete it to redo the crop)
           <name>.results.json          machine-readable variant results
           <name>.final.json            what was kept, and the finishing progress
-          <name> - p8.1.mkv            only for Dolby Vision profile 7 sources (converted copy, kept)
+          <name>.dovi.json             Dolby Vision 7 decision: converted, converted with clipped
+                                       highlights, or kept as profile 7 (see "Dolby Vision 7")
+          <name> - 2160p.mkv           a title kept as Dolby Vision 7: the original video, with audio
+          <name> - 1080p.mkv           ...and its 1080p SDR copy (searched and finished like any title;
+                                       its files are named "<name> - 1080p.*")
           <variant name>\<name>.mkv    one folder per variant while a title is in progress
           <variant name>\<name>.vmaf.txt  (and kept afterwards in fixed mode / -KeepVariants)
 
-      Dest\_encode-batch_<timestamp>.log / .md / .csv   run log, summary table, summary data
+      WorkDir (default: Dest)\<same sub-folders>\
+          <name> - source.mkv          local copy of the source, until the title is finished
+          <name> - p7 source.mkv       Dolby Vision 7 copy being checked / converted
+          <name> - p8.1.mkv            converted Dolby Vision 7 copy, until the title is finished
+          <name> - 1080p ref.mkv       near-lossless 1080p SDR reference for a 1080p copy, until it's finished
+
+      Dest\_encode-batch_<timestamp>.log / .md          this run's log and summary (what it touched)
+      Dest\_encode-batch_all.md / .csv                  every title under -Source, from all runs; only
+                                                       written once the whole batch is complete
 
     Two modes:
       Ladder (default): -Ladder is a list of rungs, weakest/smallest first (cqp28 aq8 ... cqp20
@@ -56,24 +70,32 @@
 
     Finishing a title (ladder mode, when a variant is suggested), one title at a time:
       1. Add-BluRayAudio -Source <source MKV> -Dest <suggested variant> -Replace adds the audio
-         (and writes its subtitle backup, <name>.mks.originals). Its output goes into the
-         title's .encode.log, and its own log file is moved from the Desktop to
-         <name>.audio.log next to it.
-      2. The suggested MKV (and subtitle backup) move up to Dest\<same sub-folders>\<name>.mkv.
-      3. This title's other variants (and their VMAF files) are deleted; empty variant folders
-         are removed.
+         (and writes its subtitle backup, <name>.mks). It runs with -Plumbing: its details go
+         to <name>.audio.log, and what it reports back (the audio tracks and their roles, the
+         dropped tracks and why, any sync shift, the subtitle backup, warnings) goes into
+         final.json, the title's .encode.log and the reports. Warnings include "SUBTITLES TO
+         FIX" when the audio had to be shifted (OCR'd subtitles need the same shift).
+      2. The suggested MKV moves up to Dest\<same sub-folders>\<name>.mkv, and the subtitle backup
+         to <name>.mks next to it.
+      3. This title's other variants (and their VMAF files) are deleted. Variant folders left
+         empty are removed once every title in the folder is done.
+      When every title in a folder (e.g. a season) is done, its <name>.mks files are bundled into
+      "<folder> - subtitles.zip" there (stored, not compressed; added to it if it exists), so
+      Jellyfin doesn't see them. Loose .mks files from earlier runs are bundled the same way.
       Progress is saved in <name>.final.json, so an interrupted finish resumes where it was,
       and a finished one is skipped on later runs (its pick still guides its folder).
       If the audio step fails, nothing is moved or deleted. Titles with no passing variant
-      keep all their variants for review. -NoAudio / -KeepVariants skip steps 1 / 3.
+      keep all their variants for review; after reviewing them, re-run with -UseSourceFallback
+      to finish those titles with their source instead (the local copy, or a fresh copy of the
+      source, goes through the same steps, and the failed encodes are deleted). For Dolby
+      Vision 7 titles the converted "<name> - p8.1.mkv" is used. A Dolby Vision 7 title's
+      p8.1 copy is deleted once it's finished. -NoAudio / -KeepVariants skip steps 1 / 3.
       Fixed mode (-Variants) never does any of this.
 
     Work is a queue, not one thread per title:
       - Prep (one title at a time, no encoder slot used): probe with ffprobe (and mediainfo when
         installed); skip VC-1 (-SkipVC1) and Dolby Vision other than 7 / 8.1. For profile 7:
-        dovi_convert scan (on the source) -> copy to Dest -> inspect (local copy, only for CONVERT*)
-        -> convert --backup --delete -> verify it's now 8.1; anything not clearly safe is skipped and
-        logged, the local copy kept for review. Then CropDetect -Plumbing for the Suggested crop.
+        see "Dolby Vision 7" below. Then CropDetect -Plumbing for the Suggested crop.
       - Encodes (up to -Threads at once, GPU): each free slot takes the next encode of the oldest
         title that has one ready, so an earlier title's next rung always goes first. A title waiting on VMAF to choose its next rung doesn't hold a
         slot; the slot moves on to another title. Up to -Threads + 2 searches from scratch are in
@@ -88,8 +110,38 @@
     are redone, and a title whose search (or fixed variant list) is finished is skipped. In ladder
     mode, variant folders that aren't rungs (e.g. from an older fixed run) are left alone.
 
-    Disk space (Dest's drive) is checked before each title starts: below -MinFreeGB no new titles
-    are started (running ones finish); a profile 7 title needs -MinFreeDoviGB, otherwise it's skipped.
+    Local copies (-LocalCopy, default on): prep copies each source to Dest\...\<name> - source.mkv
+    (next title's copy is made while the current ones encode). Everything reads that copy, and
+    it's deleted when the title is finished (after the audio step), or right away if it ends
+    without a suggested variant. An interrupted copy is redone; a complete one is reused.
+    (Dolby Vision 7 titles use their converted "<name> - p8.1.mkv" copy instead.) Local copies
+    go to -WorkDir (default: Dest).
+
+    Disk space is checked before each title starts. Dest needs -MinFreeGB free (for the encodes);
+    the work drive needs room for the local copy, or -MinFreeDoviGB for a Dolby Vision 7 title
+    that still has to be downloaded and converted (one with its copy already there doesn't).
+    With no -WorkDir, both come out of Dest. At most -MaxDoviTitles Dolby Vision 7 titles hold
+    work files at once. When there isn't enough space, new titles wait until finished titles
+    free some (copies, p8.1 files and other variants are deleted); if nothing is left running
+    to free any, the run stops starting titles. A Dolby Vision 7 title's conversion also waits
+    for room (about twice the copy's size) after its inspect, for the same reason.
+
+    Dolby Vision 7: dovi_convert scan (on the source) -> copy to -WorkDir -> dovi_convert inspect
+    (the copy; it measures the brightness the enhancement layer adds) -> decide:
+      - SIMPLE / SAFE or MEL: convert to 8.1 (convert --yes --include-simple --force --delete),
+        then verify it's 8.1. Encoded like any HDR title, with its Dolby Vision 8.1 metadata.
+      - COMPLEX FEL with the FEL peak at most -DoviOvershootNits (100) above the base layer's
+        peak: converted to 8.1 anyway; the highlights above the base layer's peak are clipped.
+        Logged ("DOVI ..."), and noted in the reports.
+      - Anything else (Complex FEL beyond that, NO L1 METADATA): kept as profile 7. The untouched
+        copy gets the audio (and subtitle backup) only and becomes "<name> - 2160p.mkv"; a second
+        title "<name> - 1080p" is added: a near-lossless 1080p SDR reference is made from the
+        profile 7 video (cropped, tone-mapped, scaled to fit 1920x1080, in -WorkDir) and searched
+        and finished like any title, ending as "<name> - 1080p.mkv". Logged ("KEEP P7 ..."), and
+        noted in the reports. Its "% of source" is relative to that reference.
+    The decision is saved in "<name>.dovi.json". A season stays one format: once a title in a
+    folder is kept as profile 7, the folder's later Dolby Vision 7 titles are too (titles already
+    finished, or already converted and in progress, stay 8.1; check the reports for those).
 
 .PARAMETER Ladder
     Rungs for the search, weakest/smallest first. Same keys as -Variants.
@@ -126,6 +178,7 @@ param(
         @{ Cqp = 28; Aq = 8 },
         @{ Cqp = 26; Aq = 8 },
         @{ Cqp = 24; Aq = 8 },
+        @{ Cqp = 22; Aq = 4 },
         @{ Cqp = 22; Aq = 8 },
         @{ Cqp = 20; Aq = 8 }
     ),
@@ -142,8 +195,19 @@ param(
     # Skip VC-1 sources (encodes from them don't currently pass VMAF alignment). -SkipVC1:$false to include.
     [bool]$SkipVC1 = $true,
 
-    [int]$MinFreeGB = 100,
+    [int]$MinFreeGB = 200,
     [int]$MinFreeDoviGB = 400,
+
+    # Where the big working files go: local copies of sources ("<name> - source.mkv"), Dolby
+    # Vision 7 copies and their converted "<name> - p8.1.mkv". Mirrors the folders under -Source.
+    # Point it at another drive so these don't compete with the encodes for space; it can change
+    # between runs (files left in the old place are just made again; ones in Dest are still found).
+    # Default: Dest.
+    [string]$WorkDir = '',
+
+    # At most this many Dolby Vision 7 titles hold files in -WorkDir at once (downloading,
+    # converting, or encoding from the converted copy). Others wait their turn.
+    [ValidateRange(1, 4)][int]$MaxDoviTitles = 2,
 
     # VMAF bar a variant must meet to pass.
     [double]$MinMean = 93.5,
@@ -151,8 +215,15 @@ param(
     [double]$MinMin = 75,
 
     # Size rules, as video stream % of the source's video stream (see .DESCRIPTION).
-    [double]$MaxPct = 65,        # hard cap: bigger variants don't pass
+    [double]$MaxPct = 70,        # hard cap: bigger variants don't pass
     [double]$TargetPct = 20,     # the search aims here; the passer closest to it is suggested
+
+    # Top bar: a passing variant under -TargetPct that also meets ALL of these is good enough to
+    # take the extra space savings. The search stops climbing toward -TargetPct, and the biggest
+    # such variant is suggested (e.g. animation that compresses very well). -TopMean 101 turns it off.
+    [double]$TopMean = 97,
+    [double]$TopP1 = 85,
+    [double]$TopMin = 80,
 
     # Folder memory: a later title skips a rung next to its folder's pick when the title that set
     # the pick already tried that rung and this title's result at the pick is about the same:
@@ -168,15 +239,34 @@ param(
     [switch]$NoAudio,
     [switch]$KeepVariants,
 
+    # Ladder mode: a title where no variant passes is finished with its SOURCE instead (copied
+    # into place, then audio, subtitle backup, move up, failed encodes deleted), rather than left
+    # for review. Off by default: review the failures first, then re-run with this.
+    [switch]$UseSourceFallback,
+
+    # Copy each source to Dest (next to its log, as "<name> - source.mkv") during prep, so the
+    # encodes, VMAF scoring, CropDetect and Add-BluRayAudio all read it locally instead of from
+    # the NAS. Deleted once the title is finished. -LocalCopy:$false reads from the NAS directly.
+    [bool]$LocalCopy = $true,
+
     [string]$NVEncC = (Join-Path $env:APPDATA 'NVEnc\NVEncC64.exe'),
     [string]$CropDetect = (Join-Path $PSScriptRoot 'CropDetect.ps1'),
-    [ValidateSet('avhw', 'avsw')][string]$Decoder = 'avhw',
+    # How NVEncC decodes the source. avsw (default) = on the CPU, leaving the GPU's video decoder
+    # to compare_encode, which decodes two streams per score on it; avhw = on the GPU's decoder.
+    [ValidateSet('avhw', 'avsw')][string]$Decoder = 'avsw',
 
     # WSL side. Commands must be on PATH for a login shell (bash -l), or give full paths.
     [string]$WslDistro,
     [string]$WslMountRoot = '/mnt',
     [string]$CompareEncodeCmd = 'compare_encode',
     [string]$DoviConvertCmd = 'dovi_convert',
+
+    # Dolby Vision 7 titles whose enhancement layer adds brightness (Complex FEL) are still
+    # converted to 8.1 when inspect's FEL peak is at most this many nits above the base layer's
+    # peak (the highlights above the base layer's peak are clipped; noted in the log and reports).
+    # Above it, the title is kept as profile 7 ("<name> - 2160p.mkv", audio only) plus a 1080p
+    # SDR copy ("<name> - 1080p.mkv", searched and finished like any other title).
+    [int]$DoviOvershootNits = 100,
     [string]$RemountCmd = 'remount',
 
     # Encode only; don't run compare_encode.
@@ -269,6 +359,35 @@ $Helpers = {
         [Math]::Round((New-Object IO.DriveInfo $root).AvailableFreeSpace / 1GB, 1)
     }
 
+    # Copies a file via "<Dest>.partial" (renamed when complete), reporting progress to the status
+    # file. Large sequential reads: much faster from a NAS than the encoders' own small reads.
+    function Copy-FileWithProgress {
+        param([string]$Src, [string]$Dst, [hashtable]$StatusBase = @{})
+        $part = "$Dst.partial"
+        $total = (New-Object IO.FileInfo $Src).Length
+        $buf = New-Object byte[] (8MB)
+        $in = New-Object IO.FileStream($Src, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, 1MB, [IO.FileOptions]::SequentialScan)
+        try {
+            $out = New-Object IO.FileStream($part, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None, 1MB)
+            try {
+                $done = 0L; $t0 = Get-Date; $last = [DateTime]::MinValue
+                while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+                    $out.Write($buf, 0, $n); $done += $n
+                    if (((Get-Date) - $last).TotalSeconds -ge 2) {
+                        $last = Get-Date
+                        $secs = [Math]::Max([double]0.1, ((Get-Date) - $t0).TotalSeconds)
+                        $st = @{} + $StatusBase
+                        $st.Pct = [Math]::Round(100.0 * $done / [Math]::Max([double]1, [double]$total), 1)
+                        $st.Detail = '{0:N1} of {1:N1} GB, {2:N0} MB/s' -f ($done / 1GB), ($total / 1GB), ($done / 1MB / $secs)
+                        Set-Status $st
+                    }
+                }
+            } finally { $out.Dispose() }
+        } finally { $in.Dispose() }
+        if ((New-Object IO.FileInfo $part).Length -ne $total) { throw "copy of $Src is incomplete" }
+        Move-Item -LiteralPath $part -Destination $Dst -Force -ErrorAction Stop
+    }
+
     # Runs a program, streaming stdout+stderr into the log (minus progress lines, which go to the
     # status file instead). Returns ExitCode and the logged Lines.
     function Invoke-Logged {
@@ -317,7 +436,11 @@ $Helpers = {
                     # (careful: 0..-1 in PowerShell is "first and last", not empty)
                     if ($parts.Count -gt 1) { $parts = $parts[0..($parts.Count - 2)] } else { $parts = @() }
                 }
-                foreach ($line in $parts) {
+                foreach ($line0 in $parts) {
+                    # Colour/cursor codes (e.g. dovi_convert prints "\e[1mAction:\e[0m ...") would break matching.
+                    $line = $line0 -replace '\x1b\[[0-9;?]*[ -/]*[@-~]', ''
+                    # Animated spinner frames (dovi_convert: "Extracting RPU...  <spinner> (0m 05s)").
+                    if ($line -match '[\u2800-\u28FF|/\\-] \(\d+m \d{2}s\)\s*$') { continue }
                     if ($line -match $ProgressPattern) {
                         if (((Get-Date) - $throttle.Last).TotalSeconds -ge 2) {
                             $st.Pct = [double]$Matches[1]; $st.Detail = $Matches[2]
@@ -359,6 +482,8 @@ $Helpers = {
         $need = ($NeedPaths | ForEach-Object { ConvertTo-BashQuoted $_ }) -join ' '
         $prelude = @'
 set -u
+export NO_COLOR=1
+exec </dev/null
 if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"; fi
 eb_ensure_visible() {
   local p missing=0
@@ -549,19 +674,34 @@ eb_ensure_visible() {
     # Marks Pass / OverCap / Dominated / Suggested (and clears Hint) on variant rows, in place.
     # Suggested = the passing variant whose size is closest to TargetPct of the source, either
     # direction; ties go to the smaller file. Returns its name, or $null when nothing passes.
+    # Top bar: also passes TopMean/TopP1/TopMin while under TargetPct. If any variant does, the
+    # biggest of those is suggested instead (take the savings rather than climb to TargetPct).
+    function Test-TopBar {
+        param($Row, [double]$TargetPct, [double]$TopMean, [double]$TopP1, [double]$TopMin)
+        $null -ne $Row.Pct -and $Row.Pct -le $TargetPct -and $Row.Mean -ge $TopMean -and $Row.P1 -ge $TopP1 -and $Row.Min -ge $TopMin
+    }
+
     function Set-Suggestion {
-        param($Rows, [double]$MinMean, [double]$MinP1, [double]$MinMin, [double]$MaxPct = 65, [double]$TargetPct = 20)
+        param($Rows, [double]$MinMean, [double]$MinP1, [double]$MinMin, [double]$MaxPct = 65, [double]$TargetPct = 20,
+            [double]$TopMean = 1000, [double]$TopP1 = 1000, [double]$TopMin = 1000)
         foreach ($r in $Rows) {
-            foreach ($k in 'Pass', 'OverCap', 'Dominated', 'Suggested') {
+            foreach ($k in 'Pass', 'OverCap', 'Dominated', 'Suggested', 'Top') {
                 if ($r.PSObject.Properties[$k]) { $r.$k = $false } else { $r | Add-Member -NotePropertyName $k -NotePropertyValue $false }
             }
             if ($r.PSObject.Properties['Hint']) { $r.Hint = '' } else { $r | Add-Member -NotePropertyName Hint -NotePropertyValue '' }
+            if ($r.PSObject.Properties['Why']) { $r.Why = '' } else { $r | Add-Member -NotePropertyName Why -NotePropertyValue '' }
         }
         $scored = @($Rows | Where-Object { (Get-VariantClass $_ $MinMean $MinP1 $MinMin $MaxPct) -ne 'error' })
         foreach ($r in $scored) {
             $c = Get-VariantClass $r $MinMean $MinP1 $MinMin $MaxPct
             $r.Pass = $c -eq 'pass'
             $r.OverCap = $c -like '*overcap'
+            $why = @()
+            if ($r.Mean -lt $MinMean) { $why += 'mean {0:0.00} < {1}' -f $r.Mean, $MinMean }
+            if ($r.P1 -lt $MinP1) { $why += 'p1 {0:0.00} < {1}' -f $r.P1, $MinP1 }
+            if ($r.Min -lt $MinMin) { $why += 'min {0:0.00} < {1}' -f $r.Min, $MinMin }
+            if ($r.OverCap) { $why += '{0:0.#}% > {1}% cap' -f $r.Pct, $MaxPct }
+            $r.Why = $why -join ', '
             foreach ($o in $scored) {
                 if ($o -eq $r) { continue }
                 $noWorse = $o.VideoGB -le $r.VideoGB -and $o.Mean -ge $r.Mean -and $o.P1 -ge $r.P1 -and $o.Min -ge $r.Min
@@ -571,9 +711,27 @@ eb_ensure_visible() {
         }
         $passers = @($scored | Where-Object { $_.Pass })
         if (-not $passers.Count) { return $null }
+        $top = @($passers | Where-Object { Test-TopBar $_ $TargetPct $TopMean $TopP1 $TopMin })
+        foreach ($r in $top) { $r.Top = $true }
+        if ($top.Count) {
+            $pick = @($top | Sort-Object @{ Expression = { $_.Pct }; Descending = $true }, VideoGB)[0]
+            $pick.Suggested = $true
+            return $pick.Name
+        }
         $pick = @($passers | Sort-Object @{ Expression = { if ($null -eq $_.Pct) { 1e9 } else { [Math]::Abs($_.Pct - $TargetPct) } } }, VideoGB)[0]
         $pick.Suggested = $true
         return $pick.Name
+    }
+
+    # For a title where nothing passed (call after Set-Suggestion): the nearest miss, i.e. the
+    # highest-mean variant under the size cap (or the smallest one if all are over it), and why.
+    function Get-ClosestMiss {
+        param($Rows)
+        $scored = @($Rows | Where-Object { $_.PSObject.Properties['Why'] -and $_.Why })
+        if (-not $scored.Count) { return '' }
+        $under = @($scored | Where-Object { -not $_.OverCap })
+        $r = if ($under.Count) { @($under | Sort-Object Mean -Descending)[0] } else { @($scored | Sort-Object VideoGB)[0] }
+        '{0} {1:0.00}/{2:0.00}/{3:0.00} at {4:0.#}% ({5})' -f $r.Name, $r.Mean, $r.P1, $r.Min, $r.Pct, $r.Why
     }
 
     # One step of the ladder search. Rungs are indexed weakest/smallest (0) to strongest/biggest.
@@ -581,13 +739,15 @@ eb_ensure_visible() {
     # Returns the rung to encode next, -1 to wait for the ones in flight, or -2 when finished.
     #   - Start rungs first (all at once, so both encoder slots can take one).
     #   - Some pass: if the smallest passer is still above TargetPct, try the next smaller rung;
-    #     if the biggest passer is below TargetPct, try the next bigger one. Otherwise finished.
+    #     if the biggest passer is below TargetPct, try the next bigger one, unless a passer under
+    #     TargetPct meets the top bar (TopMean/TopP1/TopMin). Otherwise finished.
     #   - None pass: passes the bar but over the cap -> try smaller; fails the bar -> try bigger.
     #   - Never repeats a rung, so it always ends (at worst at an end of the ladder).
     #   - $Skip: rungs to treat as already answered (see Get-KnownRungReason); never proposed.
     function Get-LadderNext {
         param([hashtable]$Tried, [int]$Count, [int[]]$Start, [double]$MinMean, [double]$MinP1, [double]$MinMin,
-            [double]$MaxPct = 65, [double]$TargetPct = 20, [hashtable]$Skip = @{})
+            [double]$MaxPct = 65, [double]$TargetPct = 20, [hashtable]$Skip = @{},
+            [double]$TopMean = 1000, [double]$TopP1 = 1000, [double]$TopMin = 1000)
         foreach ($i in @($Start)) { if ($i -ge 0 -and $i -lt $Count -and -not $Tried.ContainsKey($i) -and -not $Skip.ContainsKey($i)) { return $i } }
         foreach ($k in @($Tried.Keys)) { if ($null -eq $Tried[$k]) { return -1 } }
         $ok = @(); $overcap = @(); $fail = @()
@@ -602,7 +762,9 @@ eb_ensure_visible() {
             $hi = [int]($ok | Measure-Object -Maximum).Maximum
             $loPct = $Tried[$lo].Pct; $hiPct = $Tried[$hi].Pct
             if (($null -eq $loPct -or $loPct -gt $TargetPct) -and (& $open ($lo - 1))) { return $lo - 1 }
-            if ($null -ne $hiPct -and $hiPct -lt $TargetPct -and (& $open ($hi + 1))) { return $hi + 1 }
+            # Under TargetPct but over the top bar: good enough, don't climb for size.
+            $topHit = @($ok | Where-Object { Test-TopBar $Tried[$_] $TargetPct $TopMean $TopP1 $TopMin }).Count
+            if ($null -ne $hiPct -and $hiPct -lt $TargetPct -and -not $topHit -and (& $open ($hi + 1))) { return $hi + 1 }
             return -2
         }
         if ($overcap.Count) { $i = [int]($overcap | Measure-Object -Minimum).Minimum - 1; if (& $open $i) { return $i } }
@@ -642,8 +804,10 @@ eb_ensure_visible() {
             $notes = @()
             if ($r.Suggested) { $notes += '**suggested**' }
             if ($r.Pass -and -not $r.Suggested) { $notes += 'passes' }
+            if ($r.PSObject.Properties['Top'] -and $r.Top) { $notes += 'top bar' }
             if ($r.PSObject.Properties['Hint'] -and $r.Hint) { $notes += $r.Hint }
-            if ($r.PSObject.Properties['OverCap'] -and $r.OverCap) { $notes += 'over the size cap' }
+            if ($r.PSObject.Properties['Why'] -and $r.Why) { $notes += $r.Why }
+            elseif ($r.PSObject.Properties['OverCap'] -and $r.OverCap) { $notes += 'over the size cap' }
             if ($r.Dominated) { $notes += 'dominated' }
             if ($r.Warning) { $notes += 'VMAF alignment warning' }
             if ($null -ne $r.Mbps -and $r.Mbps -gt 40) { $notes += 'avg > 40 Mbps (HEVC L5.1 Main limit)' }
@@ -682,6 +846,15 @@ $WorkerHeader = {
     $t0 = Get-Date
     $base = $Cfg.BaseName
     $titleDir = $Cfg.TitleDir
+    $workDir = if ($Cfg.PSObject.Properties['WorkDir'] -and $Cfg.WorkDir) { [string]$Cfg.WorkDir } else { $titleDir }
+    # A working file: in the work folder, or in Dest where earlier runs put it; the work folder if neither.
+    function Get-WorkFile([string]$suffix) {
+        $w = Join-Path $workDir "$base$suffix"
+        if ([IO.File]::Exists($w)) { return $w }
+        $d = Join-Path $titleDir "$base$suffix"
+        if ([IO.File]::Exists($d)) { return $d }
+        $w
+    }
     $tmp = $Cfg.TempDir
     $wsl = $Cfg.Wsl
 }
@@ -692,10 +865,84 @@ $PrepBody = {
         $status.Step = $name; $status.Remove('Pct'); $status.Remove('Detail')
         Set-Status $status
     }
-    function Done([string]$st, [string]$reason, $workSrc = $null, $isDv81 = $false, $crop = $null) {
+    function Done([string]$st, [string]$reason, $workSrc = $null, $isDv81 = $false, $crop = $null, $localCopy = $null) {
         if ($reason) { Write-Log "PREP: $st - $reason" } else { Write-Log "PREP: $st" }
-        [pscustomobject]@{ Status = $st; Reason = $reason; WorkSrc = $workSrc; IsDv81 = [bool]$isDv81; Crop = $crop
+        [pscustomobject]@{ Status = $st; Reason = $reason; WorkSrc = $workSrc; IsDv81 = [bool]$isDv81; Crop = $crop; LocalCopy = $localCopy
                            Seconds = [int]((Get-Date) - $t0).TotalSeconds }
+    }
+
+    # Waits until the work folder has $needGB free (re-checked every 30 s). The main loop gives up
+    # on the title if nothing else is running that could ever free the space.
+    function Wait-WorkSpace([double]$needGB, [string]$what) {
+        $logged = $false
+        while (($freeW = Get-FreeGB $workDir) -lt $needGB) {
+            if (-not $logged) { Write-Log "Waiting for space to ${what}: needs $needGB GB free in $workDir, $freeW GB now"; $logged = $true }
+            $status.Step = "waiting for space to $what ($needGB GB needed, $freeW GB free)"; Set-Status $status
+            Start-Sleep -Seconds 30
+        }
+        if ($logged) { Write-Log "Space available ($freeW GB free): going on to $what" }
+    }
+
+    # 1080p SDR copy of a title kept as Dolby Vision 7 (the main loop adds these titles). Makes a
+    # near-lossless 1080p SDR reference from the profile 7 video (its base layer: cropped, tone-mapped
+    # from HDR, scaled to fit 1920x1080), which the ladder then encodes from and scores against.
+    function Invoke-DerivedPrep {
+        $refPath = Join-Path $workDir "$($Cfg.ParentBase) - 1080p ref.mkv"
+        $parentCrop = Join-Path $titleDir "$($Cfg.ParentBase).crop.json"
+        $myCrop = Join-Path $titleDir "$base.crop.json"
+        $src = @($Cfg.RefSources | Where-Object { $_ -and [IO.File]::Exists($_) } | Select-Object -First 1)
+        $crop = $null
+        if ([IO.File]::Exists($parentCrop)) { try { $crop = [IO.File]::ReadAllText($parentCrop) | ConvertFrom-Json } catch { } }
+        if (-not $crop -and $src.Count) {
+            Step 'CropDetect'
+            $cdArgs = @{ Source = $src[0]; Plumbing = $true }
+            if ($Cfg.PSObject.Properties['CropHw'] -and $Cfg.CropHw) { $cdArgs.HwDecode = $true }
+            Write-Log "> CropDetect -Source `"$($src[0])`" -Plumbing$(if ($cdArgs.HwDecode) { ' -HwDecode' })"
+            $cdOut = & $Cfg.CropDetect @cdArgs 6>&1 3>&1
+            foreach ($o in $cdOut) {
+                $txt = if ($o -is [System.Management.Automation.InformationRecord]) { [string]$o.MessageData } else { [string]$o }
+                if ($txt -match '^\s*\{.*"Width".*\}\s*$') { $crop = $txt | ConvertFrom-Json; [IO.File]::WriteAllText($parentCrop, $txt.Trim(), $script:Utf8) }
+                elseif ($txt.Trim() -and $txt.Trim() -notmatch '^[.x]+$') { Write-LogRaw "    $($txt.TrimEnd())" }
+            }
+        }
+        if (-not $crop) { return (Done 'Failed' 'no crop for the 1080p copy (CropDetect failed, or no profile 7 video left to read).') }
+        # Fit the cropped picture in 1920x1080, even dimensions.
+        $cw = [int]$crop.Width; $ch = [int]$crop.Height
+        $scale = [Math]::Min([double]1, [Math]::Min(1920.0 / $cw, 1080.0 / $ch))
+        $w = [int](2 * [Math]::Round($cw * $scale / 2)); $h = [int](2 * [Math]::Round($ch * $scale / 2))
+        if (-not [IO.File]::Exists($refPath)) {
+            if (-not $src.Count) { return (Done 'Failed' 'the profile 7 video to make the 1080p copy from is gone (local copy, finished 2160p file and source all missing).') }
+            [void][IO.Directory]::CreateDirectory($workDir)
+            Wait-WorkSpace ([Math]::Round(0.6 * (New-Object IO.FileInfo $src[0]).Length / 1GB + 20, 1)) 'make the 1080p SDR reference'
+            Step 'making the 1080p SDR reference'
+            $peak = 1000
+            if ($Cfg.SourcePeak -gt 0) { $peak = [int]$Cfg.SourcePeak }
+            $partial = "$refPath.partial.mkv"
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+            $a = @('--avsw', '--device', '0', '-i', $src[0])
+            if (($crop.Left + $crop.Top + $crop.Right + $crop.Bottom) -gt 0) { $a += @('--crop', ('{0},{1},{2},{3}' -f $crop.Left, $crop.Top, $crop.Right, $crop.Bottom)) }
+            $a += @('--output-res', "${w}x${h}", '--vpp-resize', 'spline36',
+                '--vpp-colorspace', "matrix=bt2020nc:bt709,colorprim=bt2020:bt709,transfer=smpte2084:bt709,range=limited:limited,hdr2sdr=hable,source_peak=$peak,ldr_nits=100",
+                '--colormatrix', 'bt709', '--colorprim', 'bt709', '--transfer', 'bt709',
+                '--video-metadata', 'clear', '--metadata', 'clear', '--chapter-copy', '-c', 'hevc', '--profile', 'main10', '--output-depth', '10',
+                '--cqp', '12', '--preset', 'P7', '--avsync', 'cfr', '-o', $partial)
+            Write-Log ("Making the 1080p SDR reference {0}x{1} from {2} (crop L{3} T{4} R{5} B{6}, tone-mapped from {7} nits)" -f $w, $h, $src[0], $crop.Left, $crop.Top, $crop.Right, $crop.Bottom, $peak)
+            $r = Invoke-Logged -Exe $Cfg.NVEncC -ArgList $a -TempDir $tmp -StatusBase $status
+            if ($r.ExitCode -ne 0 -or -not [IO.File]::Exists($partial)) { return (Done 'Failed' "NVEncC failed making the 1080p SDR reference (exit $($r.ExitCode)).") }
+            Move-Item -LiteralPath $partial -Destination $refPath -Force -ErrorAction Stop
+        } else {
+            Write-Log "Reusing the 1080p SDR reference $refPath"
+        }
+        # For the reports: the original picture, its crop, and the final 1080p size.
+        $show = [ordered]@{ SourceWidth = $crop.SourceWidth; SourceHeight = $crop.SourceHeight; Width = $w; Height = $h
+                            Left = $crop.Left; Top = $crop.Top; Right = $crop.Right; Bottom = $crop.Bottom; Scaled = $true }
+        [IO.File]::WriteAllText($myCrop, ($show | ConvertTo-Json -Compress), $script:Utf8)
+        # The encodes take the reference as is (already cropped and scaled).
+        $none = [pscustomobject]@{ Left = 0; Top = 0; Right = 0; Bottom = 0; Width = $w; Height = $h; SourceWidth = $w; SourceHeight = $h }
+        $ready = Done 'Ready' '' $refPath $false $none $null
+        $ready | Add-Member -NotePropertyName RefWidth -NotePropertyValue $w
+        $ready | Add-Member -NotePropertyName RefHeight -NotePropertyValue $h
+        $ready
     }
 
     function Invoke-Prep {
@@ -707,68 +954,180 @@ $PrepBody = {
         Write-Log "  ($($Cfg.Info.DvDetail))"
         if ($Cfg.Info.Hdr) { Write-Log ("  HDR: {0}  master-display {1}  max-cll {2}  HDR10+ {3}" -f (@($Cfg.Info.ColorArgs) -join ' '), $(if ($Cfg.Info.MasterDisplay) { $Cfg.Info.MasterDisplay } else { 'none' }), $(if ($Cfg.Info.MaxCll) { $Cfg.Info.MaxCll } else { 'none' }), $Cfg.Info.Hdr10Plus) }
 
+        if ($Cfg.PSObject.Properties['Derived'] -and $Cfg.Derived) { return (Invoke-DerivedPrep) }
+
         $workSrc = $Cfg.SourceFile
         $isDv81 = ($Cfg.Info.Dv -eq 'P8.1')
+        $localCopy = $null
+
+        # ---------------------------------------------------------------- local copy
+        if ($Cfg.LocalCopy -and $Cfg.Info.Dv -ne 'P7') {
+            [void][IO.Directory]::CreateDirectory($workDir)
+            $lc = Get-WorkFile ' - source.mkv'
+            $srcLen = (New-Object IO.FileInfo $Cfg.SourceFile).Length
+            if ([IO.File]::Exists($lc) -and (New-Object IO.FileInfo $lc).Length -eq $srcLen) {
+                Write-Log "Reusing local copy $lc"
+                $workSrc = $lc; $localCopy = $lc
+            } else {
+                $free = Get-FreeGB $workDir
+                $needGB = [Math]::Round($srcLen / 1GB, 1)
+                if ($free - $needGB -lt 10) {
+                    Write-Log "Not enough space for a local copy ($needGB GB, $free GB free): reading the source from its original location."
+                } else {
+                    Step 'copying source'
+                    Write-Log ("Copying source to {0} ({1} GB, {2} GB free)" -f $lc, $needGB, $free)
+                    $c0 = Get-Date
+                    Copy-FileWithProgress -Src $Cfg.SourceFile -Dst $lc -StatusBase $status
+                    $secs = [Math]::Max([double]1, ((Get-Date) - $c0).TotalSeconds)
+                    Write-Log ("Copied in {0} ({1:N0} MB/s)" -f [TimeSpan]::FromSeconds([int]$secs), ($srcLen / 1MB / $secs))
+                    $workSrc = $lc; $localCopy = $lc
+                }
+            }
+        }
 
         # ---------------------------------------------------------------- Dolby Vision profile 7
+        # scan on the source -> copy to the work folder -> inspect the copy -> decide:
+        #   SIMPLE / SAFE or MEL                    -> convert to 8.1
+        #   COMPLEX FEL within -DoviOvershootNits   -> convert to 8.1 anyway (highlights clipped; noted)
+        #   COMPLEX FEL beyond it, or NO L1         -> keep as profile 7 (status 'KeepP7'): the main loop
+        #                                              finishes the copy as "<name> - 2160p.mkv" (audio
+        #                                              only) and adds a 1080p SDR title for it
+        # The decision is saved as "<name>.dovi.json" in Dest. Once any title in a folder is kept as
+        # profile 7, the folder's later profile 7 titles follow (a season stays one format); ones
+        # already finished as 8.1 are left alone.
         if ($Cfg.Info.Dv -eq 'P7') {
-            $p81 = Join-Path $titleDir "$base - p8.1.mkv"
-            $p7copy = Join-Path $titleDir "$base - p7 source.mkv"
-            $review = "$p7copy.review.txt"
-            if ([IO.File]::Exists($p81)) {
+            [void][IO.Directory]::CreateDirectory($workDir)
+            $p81 = Get-WorkFile ' - p8.1.mkv'
+            $p7copy = Get-WorkFile ' - p7 source.mkv'
+            if (-not [IO.File]::Exists($p7copy)) { $p7copy = Join-Path $workDir "$base - p7 source.mkv" }
+            $decFile = Join-Path $titleDir "$base.dovi.json"
+            $saveDecision = { param([string]$decision, [string]$note, $basePeak, $felPeak, [string]$verdict)
+                $o = [ordered]@{ Decision = $decision; Note = $note; BasePeak = $basePeak; FelPeak = $felPeak; Verdict = $verdict
+                                 Limit = $Cfg.DoviOvershootNits; Time = (Get-Date).ToString('s') }
+                [IO.File]::WriteAllText($decFile, ($o | ConvertTo-Json -Compress), $script:Utf8) }
+            $readJson = { param($f) try { [IO.File]::ReadAllText($f) | ConvertFrom-Json } catch { $null } }
+            # An older version's "unsafe" flag: re-checked under the current rules.
+            $legacy = Join-Path $titleDir "$base - p7 source.mkv.review.txt"
+            if ([IO.File]::Exists($legacy)) {
+                Write-Log "Removing the unsafe flag from an earlier version ($(@(Get-Content -LiteralPath $legacy -TotalCount 1)[0])): re-checking with the current rules"
+                Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
+            }
+            $own = if ([IO.File]::Exists($decFile)) { & $readJson $decFile } else { $null }
+            $keepWhy = ''
+            foreach ($f in @([IO.Directory]::GetFiles($titleDir, '*.dovi.json') | Where-Object { $_ -ne $decFile })) {
+                $o = & $readJson $f
+                if ($o -and $o.Decision -eq 'keep-p7') {
+                    $keepWhy = "the rest of the season follows $([IO.Path]::GetFileName($f) -replace '\.dovi\.json$', ''): $($o.Note)"
+                    break
+                }
+            }
+            if (-not $keepWhy -and $own -and $own.Decision -eq 'keep-p7') { $keepWhy = [string]$own.Note }
+            $doviNote = ''
+
+            if (-not $keepWhy -and [IO.File]::Exists($p81)) {
                 Write-Log "Dolby Vision 7: reusing previously converted copy $p81"
-            } elseif ([IO.File]::Exists($review)) {
-                return (Done 'Skipped' "Dolby Vision 7 copy was flagged for manual review in an earlier run ($review). Delete that file to retry.")
-            } else {
+                if ($own -and $own.Note) { $doviNote = [string]$own.Note }
+            } elseif (-not $keepWhy) {
+                $dirW = ConvertTo-WslPath $workDir $wsl.MountRoot
                 Step 'dovi_convert scan'
                 $srcW = ConvertTo-WslPath $Cfg.SourceFile $wsl.MountRoot
                 $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($srcW) -StatusBase $status `
                     -Body ("cd /tmp && {0} scan {1}" -f $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $srcW))
-                $action = $null
-                foreach ($l in $r.Lines) { if ($l -match '^\s*Action:\s*(\S+)') { $action = $Matches[1] } }
-                if ($r.ExitCode -ne 0 -or -not $action) { return (Done 'Skipped' "dovi_convert scan failed (exit $($r.ExitCode)).") }
-                if ($action -ne 'CONVERT' -and $action -ne 'CONVERT*') { return (Done 'Skipped' "dovi_convert scan says Action: $action.") }
-
-                $free = Get-FreeGB $titleDir
-                if ($free -lt $Cfg.MinFreeDoviGB) { return (Done 'Skipped' "only $free GB free; Dolby Vision 7 conversion needs $($Cfg.MinFreeDoviGB) GB.") }
+                $action = $null; $dvStatus = ''
+                foreach ($l in $r.Lines) {
+                    if ($l -match '^\s*Action:\s*(.+?)\s*$') { $action = $Matches[1] }
+                    elseif ($l -match '^\s*Status:\s*(.+?)\s*$') { $dvStatus = $Matches[1] }
+                }
+                if ($r.ExitCode -ne 0 -or -not $action) {
+                    $last = @($r.Lines | Where-Object { $_.Trim() } | Select-Object -Last 1)
+                    return (Done 'Skipped' ("dovi_convert scan failed (exit {0}){1}." -f $r.ExitCode, $(if ($last.Count) { ": $($last[0].Trim())" })))
+                }
+                Write-Log "dovi_convert scan: $dvStatus -> Action: $action (inspect decides)"
+                # CONVERT / CONVERT* / SKIP (Complex) / MANUAL CHECK all go on to inspect, which measures the
+                # brightness properly. Anything else (an error, not profile 7) stops here.
+                if ($action -notmatch '^(CONVERT\*?|SKIP|MANUAL CHECK)$') { return (Done 'Skipped' "dovi_convert scan says $dvStatus, Action: $action.") }
 
                 if (-not [IO.File]::Exists($p7copy)) {
                     Step 'copying p7 source'
-                    Write-Log "Copying source to $p7copy ($free GB free)"
-                    $part = "$p7copy.partial"
-                    Copy-Item -LiteralPath $Cfg.SourceFile -Destination $part -Force -ErrorAction Stop
-                    Move-Item -LiteralPath $part -Destination $p7copy -Force -ErrorAction Stop
+                    $srcLen = (New-Object IO.FileInfo $Cfg.SourceFile).Length
+                    Write-Log ("Copying source to {0} ({1:N1} GB, {2} GB free there)" -f $p7copy, ($srcLen / 1GB), (Get-FreeGB $workDir))
+                    $c0 = Get-Date
+                    Copy-FileWithProgress -Src $Cfg.SourceFile -Dst $p7copy -StatusBase $status
+                    $secs = [Math]::Max([double]1, ((Get-Date) - $c0).TotalSeconds)
+                    Write-Log ("Copied in {0} ({1:N0} MB/s)" -f [TimeSpan]::FromSeconds([int]$secs), ($srcLen / 1MB / $secs))
                 } else {
                     Write-Log "Reusing existing local copy $p7copy"
                 }
                 $copyW = ConvertTo-WslPath $p7copy $wsl.MountRoot
-                $dirW = ConvertTo-WslPath $titleDir $wsl.MountRoot
 
-                if ($action -eq 'CONVERT*') {
-                    Step 'dovi_convert inspect'
-                    $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($copyW) -StatusBase $status `
-                        -Body ("cd {0} && {1} inspect {2}" -f (ConvertTo-BashQuoted $dirW), $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $copyW))
-                    $verdict = $null
-                    foreach ($l in $r.Lines) { if ($l -match '^\s*VERDICT:\s*(.+?)\s*$') { $verdict = $Matches[1] } }
-                    if ($r.ExitCode -ne 0 -or $verdict -ne 'SAFE') {
-                        $why = if ($verdict) { "VERDICT: $verdict" } else { "inspect failed (exit $($r.ExitCode))" }
-                        [IO.File]::WriteAllText($review, ("{0}`r`n`r`n{1}" -f $why, ($r.Lines -join "`r`n")), $script:Utf8)
-                        return (Done 'Skipped' "Dolby Vision 7 needs manual review ($why). Local copy kept: $p7copy")
-                    }
+                Step 'dovi_convert inspect'
+                $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($copyW) -StatusBase $status `
+                    -Body ("cd {0} && {1} inspect {2}" -f (ConvertTo-BashQuoted $dirW), $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $copyW))
+                $verdict = $null; $basePeak = 0; $felPeak = 0
+                foreach ($l in $r.Lines) {
+                    if ($l -match '^\s*VERDICT:\s*(.+?)\s*$') { $verdict = $Matches[1] }
+                    elseif ($l -match '^\s*Base Layer Peak[^:]*:\s*(\d+)') { $basePeak = [int]$Matches[1] }
+                    elseif ($l -match '^\s*FEL Peak Brightness:\s*(\d+)') { $felPeak = [int]$Matches[1] }
+                }
+                # dovi_convert's verdicts: "SIMPLE / SAFE", "MEL (Minimal Enhancement Layer)",
+                # "COMPLEX FEL (Active Brightness Expansion)", "NO L1 METADATA".
+                if ($r.ExitCode -ne 0 -or -not $verdict) {
+                    $last = @($r.Lines | Where-Object { $_.Trim() } | Select-Object -Last 1)
+                    return (Done 'Failed' ("dovi_convert inspect failed (exit {0}){1}. Local copy kept: {2}" -f $r.ExitCode, $(if ($last.Count) { ": $($last[0].Trim())" }), $p7copy))
+                }
+                $peaks = if ($basePeak -gt 0 -and $felPeak -gt 0) { "FEL peak $felPeak nits, base layer $basePeak nits" } else { 'peaks not reported' }
+                Write-Log "dovi_convert inspect: VERDICT: $verdict ($peaks)"
+                if ($verdict -match '^(SIMPLE / SAFE|MEL\b)') {
+                    & $saveDecision 'convert' '' $basePeak $felPeak $verdict
+                } elseif ($verdict -match '^COMPLEX' -and $basePeak -gt 0 -and $felPeak -gt 0 -and ($felPeak - $basePeak) -le $Cfg.DoviOvershootNits) {
+                    $doviNote = "converted to 8.1 although inspect found Complex FEL: FEL peak $felPeak nits vs base layer $basePeak nits (+$($felPeak - $basePeak), within +$($Cfg.DoviOvershootNits)); highlights above $basePeak nits are clipped"
+                    Write-Log "Dolby Vision 7: $doviNote"
+                    & $saveDecision 'convert-overshoot' $doviNote $basePeak $felPeak $verdict
+                } else {
+                    $keepWhy = if ($verdict -match '^COMPLEX' -and $basePeak -gt 0 -and $felPeak -gt 0) {
+                        "Complex FEL: FEL peak $felPeak nits vs base layer $basePeak nits (+$($felPeak - $basePeak), over +$($Cfg.DoviOvershootNits))"
+                    } else { "inspect VERDICT: $verdict ($peaks)" }
+                    & $saveDecision 'keep-p7' $keepWhy $basePeak $felPeak $verdict
                 }
 
-                Step 'dovi_convert convert'
-                $before = @(Get-ChildItem -LiteralPath $titleDir -File | ForEach-Object { $_.Name })
-                $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($copyW) -StatusBase $status `
-                    -Body ("cd {0} && {1} convert --backup --delete {2}" -f (ConvertTo-BashQuoted $dirW), $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $copyW))
-                $after = @(Get-ChildItem -LiteralPath $titleDir -File | ForEach-Object { $_.Name })
-                $new = @($after | Where-Object { $before -notcontains $_ })
-                if ($new.Count) { Write-Log "New files after convert: $($new -join ', ')" }
-                if ($r.ExitCode -ne 0) { return (Done 'Failed' "dovi_convert convert failed (exit $($r.ExitCode)). Files left in place for review.") }
-                $chk = Get-SourceInfo $p7copy
-                if ($chk.Dv -ne 'P8.1') { return (Done 'Failed' "after conversion the copy reports '$($chk.Dv)', not P8.1 ($($chk.DvDetail)). Files left in place for review.") }
-                Move-Item -LiteralPath $p7copy -Destination $p81 -Force -ErrorAction Stop
-                Write-Log "Converted to Dolby Vision 8.1: $p81"
+                if (-not $keepWhy) {
+                    Wait-WorkSpace ([Math]::Round(2 * (New-Object IO.FileInfo $p7copy).Length / 1GB + 20, 1)) 'convert'
+                    Step 'dovi_convert convert'
+                    # --yes: no prompts; --include-simple: --yes alone skips Simple FEL; --force: convert's own
+                    # quick check would refuse Complex FEL, but inspect (above) already decided;
+                    # --delete: removes the renamed original (.bak.dovi_convert) once converted.
+                    $before = @(Get-ChildItem -LiteralPath $workDir -File | ForEach-Object { $_.Name })
+                    $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($copyW) -StatusBase $status `
+                        -Body ("cd {0} && {1} convert --yes --include-simple --force --delete {2}" -f (ConvertTo-BashQuoted $dirW), $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $copyW))
+                    $after = @(Get-ChildItem -LiteralPath $workDir -File | ForEach-Object { $_.Name })
+                    $new = @($after | Where-Object { $before -notcontains $_ })
+                    if ($new.Count) { Write-Log "New files after convert: $($new -join ', ')" }
+                    if ($r.ExitCode -ne 0) { return (Done 'Failed' "dovi_convert convert failed (exit $($r.ExitCode)). Files left in place for review.") }
+                    $chk = Get-SourceInfo $p7copy
+                    if ($chk.Dv -ne 'P8.1') { return (Done 'Failed' "after conversion the copy reports '$($chk.Dv)', not P8.1 ($($chk.DvDetail)). Files left in place for review.") }
+                    $p81 = Join-Path ([IO.Path]::GetDirectoryName($p7copy)) "$base - p8.1.mkv"
+                    Move-Item -LiteralPath $p7copy -Destination $p81 -Force -ErrorAction Stop
+                    Write-Log "Converted to Dolby Vision 8.1: $p81"
+                }
+            }
+
+            if ($keepWhy) {
+                # Profile 7 route: the untouched copy is finished as "<name> - 2160p.mkv" (audio only),
+                # and a 1080p SDR title is made from it. A converted copy from before is no use now.
+                if (-not ($own -and $own.Decision -eq 'keep-p7')) { & $saveDecision 'keep-p7' $keepWhy 0 0 '' }
+                Write-Log "Dolby Vision 7: keeping as profile 7 ($keepWhy)"
+                if ([IO.File]::Exists($p81)) {
+                    Remove-Item -LiteralPath $p81 -Force -ErrorAction SilentlyContinue
+                    Write-Log "Deleted the earlier 8.1 conversion $p81 (the season stays profile 7)"
+                }
+                if (-not [IO.File]::Exists($p7copy)) {
+                    Step 'copying p7 source'
+                    Write-Log "Copying source to $p7copy ($(Get-FreeGB $workDir) GB free there)"
+                    Copy-FileWithProgress -Src $Cfg.SourceFile -Dst $p7copy -StatusBase $status
+                }
+                $r0 = Done 'KeepP7' $keepWhy
+                $r0 | Add-Member -NotePropertyName P7Copy -NotePropertyValue $p7copy
+                return $r0
             }
             $workSrc = $p81
             $isDv81 = $true
@@ -795,7 +1154,9 @@ $PrepBody = {
         }
         if (-not $crop) { return (Done 'Failed' 'CropDetect did not return a crop.') }
         Write-Log ("Crop: {0}x{1} (L{2} T{3} R{4} B{5}) from {6}x{7}" -f $crop.Width, $crop.Height, $crop.Left, $crop.Top, $crop.Right, $crop.Bottom, $crop.SourceWidth, $crop.SourceHeight)
-        return (Done 'Ready' '' $workSrc $isDv81 $crop)
+        $ready = Done 'Ready' '' $workSrc $isDv81 $crop $localCopy
+        if ($Cfg.Info.Dv -eq 'P7' -and $doviNote) { $ready | Add-Member -NotePropertyName DoviNote -NotePropertyValue $doviNote }
+        return $ready
       } catch {
         Write-Log "ERROR: $($_.Exception.Message)"
         Write-LogRaw ($_.ScriptStackTrace)
@@ -940,7 +1301,7 @@ $FinalizeBody = {
     $script:LogPrefix = '[finish] '
     $status = @{ Step = 'finishing'; Variant = $Cfg.Doc.Variant; Index = 0; Count = 0 }
     $doc = $Cfg.Doc
-    $res = [ordered]@{ Status = 'Failed'; Error = ''; Final = $doc.Final; FreedGB = 0; Deleted = 0; Audio = '' }
+    $res = [ordered]@{ Status = 'Failed'; Error = ''; Final = $doc.Final; FreedGB = 0; Deleted = 0; Audio = ''; AudioWarnings = @() }
     function Save-Doc([string]$state) {
         $doc.State = $state
         [IO.File]::WriteAllText($Cfg.FinalJson, ($doc | ConvertTo-Json -Depth 6), $script:Utf8)
@@ -950,37 +1311,101 @@ $FinalizeBody = {
         Write-Log "---- Finishing: $($doc.Variant) -> $($doc.Final)"
         $winner = $doc.Winner
         $winnerDir = [IO.Path]::GetDirectoryName($winner)
+        if ($doc.PSObject.Properties['FromSource'] -and $doc.FromSource -and -not [IO.File]::Exists($winner) -and -not [IO.File]::Exists($doc.Final)) {
+            [void][IO.Directory]::CreateDirectory($winnerDir)
+            $status.Step = 'putting the source in place'; Set-Status $status
+            if ($doc.PSObject.Properties['LinkFrom'] -and $doc.LinkFrom -and [IO.File]::Exists($doc.LinkFrom)) {
+                # Kept as Dolby Vision 7: a hard link to the untouched local copy (same folder, no copying).
+                try {
+                    [void](New-Item -ItemType HardLink -Path $winner -Target $doc.LinkFrom -ErrorAction Stop)
+                    Write-Log "Kept as Dolby Vision 7: $([IO.Path]::GetFileName($winner)) linked to the local copy $($doc.LinkFrom)"
+                } catch {
+                    Write-Log "Couldn't link to the local copy ($($_.Exception.Message)); copying it instead"
+                    Copy-FileWithProgress -Src $doc.LinkFrom -Dst $winner -StatusBase $status
+                }
+            } elseif ($doc.SourceVideo -and [IO.File]::Exists($doc.SourceVideo)) {
+                Write-Log "No variant passed: using the converted Dolby Vision copy $($doc.SourceVideo)"
+                Copy-FileWithProgress -Src $doc.SourceVideo -Dst $winner -StatusBase $status
+            } elseif ($doc.LocalCopy -and [IO.File]::Exists($doc.LocalCopy)) {
+                if ($doc.PSObject.Properties['KeepP7'] -and $doc.KeepP7) { Write-Log "Kept as Dolby Vision 7: the untouched local copy becomes $([IO.Path]::GetFileName($doc.Final))" }
+                else { Write-Log "No variant passed: using the local copy of the source" }
+                Move-Item -LiteralPath $doc.LocalCopy -Destination $winner -ErrorAction Stop
+                $doc.LocalCopy = ''
+            } else {
+                Write-Log "No variant passed: copying the source from $($doc.Source)"
+                Copy-FileWithProgress -Src $doc.Source -Dst $winner -StatusBase $status
+            }
+            Save-Doc 'source in place'
+        }
         if (-not $Cfg.NoAudio -and -not $doc.AudioDone) {
             if (-not [IO.File]::Exists($winner)) { $res.Error = "suggested encode not found: $winner"; Write-Log "FINISH FAILED: $($res.Error)"; return }
             $status.Step = 'adding audio (Add-BluRayAudio)'; Set-Status $status
-            $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Cfg.AddAudio, '-Source', $doc.Source, '-Dest', $winner, '-Replace')
-            $r = Invoke-Logged -Exe $Cfg.Exe -ArgList $a -TempDir $tmp -StatusBase $status -ProgressPattern '^\x00$'
-            # Its own log goes to the Desktop; keep it with the title instead.
+            # Audio and subtitles come from a local copy when there is one (the source's local copy, or a
+            # Dolby Vision title's converted 8.1 copy, which keeps every audio and subtitle track);
+            # the NAS source otherwise.
+            $audioSrc = $doc.Source
+            if ($doc.LocalCopy -and [IO.File]::Exists($doc.LocalCopy)) { $audioSrc = $doc.LocalCopy }
+            elseif ($doc.PSObject.Properties['AudioSource'] -and $doc.AudioSource -and [IO.File]::Exists($doc.AudioSource)) { $audioSrc = $doc.AudioSource }
+            # -Plumbing: its details go to <name>.audio.log, and it reports back one line of JSON
+            # (tracks, what was dropped, sync shift, subtitle backup, warnings), kept in final.json.
+            $audioLog = Join-Path $titleDir "$base.audio.log"
+            $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Cfg.AddAudio, '-Source', $audioSrc, '-Dest', $winner, '-Replace',
+                   '-LogPath', $audioLog, '-Plumbing')
+            Write-Log "> Add-BluRayAudio -Source `"$audioSrc`" -Dest `"$winner`" -Replace -LogPath `"$audioLog`" -Plumbing"
+            $r = Invoke-Logged -Exe $Cfg.Exe -ArgList $a -TempDir $tmp -StatusBase $status -ProgressPattern '^\x00$' -Quiet
+            $info = $null
             foreach ($l in $r.Lines) {
-                if ($l -match '^\s*Log saved to (.+?)\s*$' -and [IO.File]::Exists($Matches[1])) {
-                    Move-Item -LiteralPath $Matches[1] -Destination (Join-Path $titleDir "$base.audio.log") -Force -ErrorAction SilentlyContinue
-                }
+                if ($l.TrimStart().StartsWith('{')) { try { $info = $l | ConvertFrom-Json } catch { Write-LogRaw "    $l" } }
+                else { Write-LogRaw "    $l" }
             }
-            if ($r.ExitCode -ne 0) { $res.Error = "Add-BluRayAudio exit $($r.ExitCode) (details above in this log)"; Write-Log "FINISH FAILED: $($res.Error); nothing moved or deleted"; return }
+            if ($info) { $doc | Add-Member -NotePropertyName Audio -NotePropertyValue $info -Force }
+            if ($r.ExitCode -ne 0) {
+                $why = "exit $($r.ExitCode)"
+                if ($info -and $info.Status -eq 'Failed') { $why = $info.Message }
+                elseif ($info -and $info.Subtitles -and $info.Subtitles.Error) { $why = "subtitle backup: $($info.Subtitles.Error)" }
+                $res.Error = "Add-BluRayAudio failed: $why (see $audioLog)"
+                Write-Log "FINISH FAILED: $($res.Error); nothing moved or deleted"
+                if ($info) { Save-Doc $doc.State }
+                return
+            }
             $n = @(& ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 $winner 2>$null | Where-Object { "$_".Trim() }).Count
             if ($n -lt 1) { $res.Error = 'no audio track in the result'; Write-Log "FINISH FAILED: $($res.Error); nothing moved or deleted"; return }
-            $res.Audio = "$n audio track(s)"
-            Write-Log "Audio added: $n track(s)"
+            if ($info) {
+                Write-Log "Audio ($($info.Status)): $($info.Summary)"
+                foreach ($d in @($info.Dropped)) { if ($d) { Write-Log "  dropped: audio $($d.SourceTrack) $($d.Name)$(if ($d.Title) { " '$($d.Title)'" }) - $($d.Reason)" } }
+                if ($info.Subtitles -and $info.Subtitles.File) { Write-Log "  subtitle backup: $($info.Subtitles.File), $($info.Subtitles.Tracks) track(s)" }
+                foreach ($w in @($info.Warnings)) { if ($w) { Write-Log "  WARNING: $w" } }
+            } else {
+                Write-Log "Audio added: $n track(s) (no details reported; see $audioLog)"
+            }
             $doc.AudioDone = $true
             Save-Doc 'audio added'
+        }
+        if ($doc.PSObject.Properties['Audio'] -and $doc.Audio) {
+            $res.Audio = [string]$doc.Audio.Summary
+            $res.AudioWarnings = @($doc.Audio.Warnings | Where-Object { $_ })
         }
         # Move up to the mirrored folder (with the subtitle backup).
         $status.Step = 'moving into place'; Set-Status $status
         if ([IO.File]::Exists($winner)) {
             if ([IO.File]::Exists($doc.Final)) { $res.Error = "$($doc.Final) already exists; not overwriting it"; Write-Log "FINISH FAILED: $($res.Error)"; return }
-            Move-Item -LiteralPath $winner -Destination $doc.Final -ErrorAction Stop
+            if ([IO.Path]::GetPathRoot($winner) -ne [IO.Path]::GetPathRoot($doc.Final)) {
+                Copy-FileWithProgress -Src $winner -Dst $doc.Final -StatusBase $status   # another drive: with progress
+                Remove-Item -LiteralPath $winner -Force -ErrorAction Stop
+            } else {
+                Move-Item -LiteralPath $winner -Destination $doc.Final -ErrorAction Stop
+            }
             Write-Log "Moved to $($doc.Final)"
         } elseif (-not [IO.File]::Exists($doc.Final)) {
             $res.Error = "neither $winner nor $($doc.Final) exists"; Write-Log "FINISH FAILED: $($res.Error)"; return
         }
-        $subs = Join-Path $winnerDir "$base.mks.originals"
-        if ([IO.File]::Exists($subs)) { Move-Item -LiteralPath $subs -Destination (Join-Path $titleDir "$base.mks.originals") -Force -ErrorAction Stop }
+        $subName = [IO.Path]::GetFileNameWithoutExtension($winner) + '.mks'   # Add-BluRayAudio's subtitle backup
+        $subs = Join-Path $winnerDir $subName
+        if ([IO.File]::Exists($subs)) { Move-Item -LiteralPath $subs -Destination (Join-Path $titleDir $subName) -Force -ErrorAction Stop }
         Save-Doc 'moved'
+        if ([IO.Path]::GetFileName($winnerDir) -eq '_2160p' -and [IO.Directory]::Exists($winnerDir) -and -not @([IO.Directory]::GetFileSystemEntries($winnerDir)).Count) {
+            Remove-Item -LiteralPath $winnerDir -Force -ErrorAction SilentlyContinue
+        }
         # Delete this title's files in every variant folder (the other encodes, VMAF results,
         # leftovers), then any variant folder left empty.
         if (-not $Cfg.KeepVariants) {
@@ -995,13 +1420,33 @@ $FinalizeBody = {
                     Remove-Item -LiteralPath $f -Force -ErrorAction Stop
                     $count++
                 }
-                if (-not @([IO.Directory]::GetFileSystemEntries($d)).Count) { Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue }
+                # (empty variant folders are removed when the whole folder is done: another
+                # title in it may be about to encode into this one)
             }
             $res.Deleted = $count
             $res.FreedGB = [Math]::Round($bytes / 1GB, 2)
             Write-Log ("Deleted {0} file(s) from the other variants, {1} GB freed" -f $count, $res.FreedGB)
         }
         Save-Doc 'done'
+        if ($doc.PSObject.Properties['WorkFiles']) {
+            foreach ($wf in @($doc.WorkFiles)) {
+                if (-not $wf -or -not [IO.File]::Exists($wf)) { continue }
+                # A title kept as profile 7 and its 1080p copy share the local profile 7 copy (both read
+                # their audio from it): whichever finishes last deletes it.
+                if ($doc.PSObject.Properties['SharedFinalJson'] -and $doc.SharedFinalJson -and $wf -like '* - p7 source.mkv') {
+                    $pd = $null; try { $pd = [IO.File]::ReadAllText($doc.SharedFinalJson) | ConvertFrom-Json } catch { }
+                    if (-not ($pd -and $pd.State -eq 'done')) { Write-Log "Keeping $wf (shared with $([IO.Path]::GetFileName($doc.SharedFinalJson) -replace '\.final\.json$', ''), not finished yet)"; continue }
+                }
+                $gb = [Math]::Round((New-Object IO.FileInfo $wf).Length / 1GB, 1)
+                Remove-Item -LiteralPath $wf -Force -ErrorAction SilentlyContinue
+                if (-not [IO.File]::Exists($wf)) { Write-Log "Deleted $wf, $gb GB"; $res.FreedGB = [Math]::Round($res.FreedGB + $gb, 2) }
+            }
+        }
+        if ($doc.LocalCopy -and [IO.File]::Exists($doc.LocalCopy)) {
+            $gb = [Math]::Round((New-Object IO.FileInfo $doc.LocalCopy).Length / 1GB, 1)
+            Remove-Item -LiteralPath $doc.LocalCopy -Force -ErrorAction SilentlyContinue
+            if (-not [IO.File]::Exists($doc.LocalCopy)) { Write-Log "Local copy deleted: $($doc.LocalCopy), $gb GB"; $res.FreedGB = [Math]::Round($res.FreedGB + $gb, 2) }
+        }
         $res.Status = 'Done'
       } catch {
         $res.Error = $_.Exception.Message
@@ -1035,8 +1480,21 @@ function Resolve-UserPath([string]$Path) {
 $srcPath = Resolve-UserPath $Source
 $sep = [IO.Path]::DirectorySeparatorChar
 $dstRoot = (Resolve-UserPath $Dest).TrimEnd('\', '/')
+$workRoot = if ($WorkDir) { (Resolve-UserPath $WorkDir).TrimEnd('\', '/') } else { $dstRoot }
 if (-not ([IO.File]::Exists($srcPath) -or [IO.Directory]::Exists($srcPath))) { throw "Source not found: $srcPath" }
 [void][IO.Directory]::CreateDirectory($dstRoot)
+
+# One run per Dest at a time: two runs would copy, encode and delete the same files.
+$lockPath = Join-Path $dstRoot '_encode-batch.lock'
+if ([IO.File]::Exists($lockPath)) {
+    $other = $null
+    try { $other = [IO.File]::ReadAllText($lockPath) | ConvertFrom-Json } catch { }
+    $p = if ($other -and $other.Pid) { Get-Process -Id ([int]$other.Pid) -ErrorAction SilentlyContinue } else { $null }
+    if ($p -and $p.Id -ne $PID -and $p.ProcessName -match '^(powershell|pwsh)$' -and
+        ([Math]::Abs(($p.StartTime - [datetime]$other.Started).TotalSeconds) -lt 5)) {
+        throw "Another Encode-Batch is already running on $dstRoot (PID $($other.Pid), started $($other.Started)). Stop it first, or delete $lockPath if that's wrong."
+    }
+}
 
 $script:LogPath = Join-Path $dstRoot "_encode-batch_$runId.log"
 $script:EchoLog = $true
@@ -1081,10 +1539,14 @@ if (-not $fixedMode -and $SkipVmaf) { throw 'The ladder search needs VMAF scores
 Write-Log "Encode-Batch $runId" 'Cyan'
 Write-Log "Source: $srcPath"
 Write-Log "Dest:   $dstRoot ($(Get-FreeGB $dstRoot) GB free)"
+if ($workRoot -ne $dstRoot) {
+    [void][IO.Directory]::CreateDirectory($workRoot)
+    Write-Log "Work:   $workRoot ($(Get-FreeGB $workRoot) GB free): local copies and Dolby Vision 7 conversions"
+}
 if ($fixedMode) { Write-Log "Mode: fixed variants" } else { Write-Log "Mode: ladder search, target $TargetPct% of the source, cap $MaxPct% (rungs weakest first)" }
 $ri = 0
 foreach ($s in $specs) { Write-Log ("{0} '{1}': {2}" -f $(if ($fixedMode) { 'Variant' } else { "Rung $ri" }), $s.Name, ($s.Args -join ' ')); $ri++ }
-Write-Log "Bar: mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's"
+Write-Log "Bar: mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; top bar (under $TargetPct%, good enough): mean >= $TopMean, p1 >= $TopP1, min >= $TopMin"
 
 Write-Log ("Slots: {0} encode (GPU){1}" -f $Threads, $(if ($SkipVmaf) { ', VMAF off' } else { ", $VmafThreads VMAF (CPU)" }))
 
@@ -1177,7 +1639,8 @@ if ([IO.File]::Exists($srcPath)) {
     $files = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File -Filter '*.mkv' | Where-Object {
         $_.Extension -eq '.mkv' -and
         -not $_.FullName.StartsWith($dstRoot + $sep, [StringComparison]::OrdinalIgnoreCase) -and
-        $_.Name -notmatch ' - p7 source\.mkv$| - p8\.1\.mkv$|\.partial\.mkv$'
+        -not $_.FullName.StartsWith($workRoot + $sep, [StringComparison]::OrdinalIgnoreCase) -and
+        $_.Name -notmatch ' - p7 source\.mkv$| - p8\.1\.mkv$| - source\.mkv$|\.partial\.mkv$'
     } | Sort-Object FullName)
 }
 Write-Log "Found $($files.Count) .mkv file(s)." 'Cyan'
@@ -1191,11 +1654,13 @@ foreach ($f in $files) {
     $titleList.Add([pscustomobject]@{
         File = $f.FullName; Rel = $(if ($rel) { Join-Path $rel $f.Name } else { $f.Name })
         TitleDir = $titleDir; Base = $base; LogPath = (Join-Path $titleDir "$base.encode.log")
+        WorkDir = $(if ($rel) { Join-Path $workRoot $rel } else { $workRoot })
         Folder = $f.DirectoryName   # titles in the same source folder share ladder starting points
         Order = $titleList.Count
         State = 'queued'          # queued -> prepping -> ready -> done | skipped | failed
         Info = $null; Prep = $null; Tasks = @(); Start = $null; Reason = ''; StartRungs = $null; WaitingOn = ''; Seeded = $false; Skipped = @{}; SkipLogged = @()
-        Finalize = ''; FinalDoc = $null; FinalJson = (Join-Path $titleDir "$base.final.json")
+        Finalize = ''; FinalDoc = $null; FinalJson = (Join-Path $titleDir "$base.final.json"); Resolved = ''
+        IsDerived = $false; ParentBase = ''; HoldFor = $null; RefSources = @(); SourcePeak = 0
     })
 }
 
@@ -1203,14 +1668,43 @@ foreach ($f in $files) {
 $results = New-Object System.Collections.Generic.List[object]
 $skipped = New-Object System.Collections.Generic.List[object]
 $finished = New-Object System.Collections.Generic.List[object]
+$doviNotes = New-Object System.Collections.Generic.List[object]
 $running = @{}                       # job id -> info
 $slots = New-Object object[] $Threads
 $vmafSlots = New-Object object[] $VmafThreads
 $stopDispatch = $false
+$script:spaceWaitLogged = ''
 $prepStatusFile = Join-Path $tempDir 'prep.json'
 $folderSeed = @{}                    # source folder -> rung index the last finished title there picked
 $folderRef = @{}                     # source folder -> @{ Name; Pick; Rows } (see Set-FolderMemory)
 $specNames = @($specs | ForEach-Object { $_.Name })
+
+# A title kept as Dolby Vision 7 gets a 1080p SDR copy: its own title "<name> - 1080p", right after
+# it in the list, made from the profile 7 video (the local copy, else the finished 2160p file, else
+# the source) and searched/finished like any other. Its parent's finish (which moves the local
+# copy away) waits until the 1080p reference exists (HoldFor).
+function Add-DerivedTitle($t) {
+    $dBase = "$($t.Base) - 1080p"
+    $have = @($titleList | Where-Object { $_.IsDerived -and $_.Base -eq $dBase -and $_.TitleDir -eq $t.TitleDir })
+    if ($have.Count) { $t.HoldFor = $have[0]; return $have[0] }
+    $peak = 0
+    if ($t.Info -and $t.Info.MaxCll) { [void][int]::TryParse(([string]$t.Info.MaxCll -split ',')[0], [ref]$peak) }
+    $d = [pscustomobject]@{
+        File = $t.File; Rel = ($t.Rel -replace '\.mkv$', ' - 1080p.mkv'); TitleDir = $t.TitleDir; Base = $dBase
+        LogPath = (Join-Path $t.TitleDir "$dBase.encode.log"); WorkDir = $t.WorkDir
+        Folder = "$($t.Folder)|1080p"   # 1080p copies share ladder starting points only with each other
+        Order = $t.Order + 0.5; State = 'queued'
+        Info = $null; Prep = $null; Tasks = @(); Start = $null; Reason = ''; StartRungs = $null; WaitingOn = ''; Seeded = $false; Skipped = @{}; SkipLogged = @()
+        Finalize = ''; FinalDoc = $null; FinalJson = (Join-Path $t.TitleDir "$dBase.final.json"); Resolved = ''
+        IsDerived = $true; ParentBase = $t.Base; HoldFor = $null; CropHw = $false
+        RefSources = @((Get-WorkFile $t ' - p7 source.mkv'), (Join-Path $t.TitleDir "$($t.Base) - 2160p.mkv"), $t.File)
+        SourcePeak = $peak
+    }
+    $titleList.Insert($titleList.IndexOf($t) + 1, $d)
+    $t.HoldFor = $d
+    $d
+}
+
 $maxActive = $Threads + 2            # searches from scratch prepped or in progress at once (fixed mode: titles)
 
 function New-Row($spec, [string]$file) {
@@ -1238,8 +1732,89 @@ function Get-FinishedRow($t, $spec) {
     $row
 }
 
-function Add-Skip($t, [string]$reason) {
-    $t.State = 'skipped'; $t.Reason = $reason
+# ---- subtitle bundles: <folder> - subtitles.zip once every title of the folder is done
+$zipDirs = @{}                       # Dest folders with subtitle backups waiting to be bundled
+
+function Get-LooseSubtitles([string]$Dir) {
+    if (-not [IO.Directory]::Exists($Dir)) { return @() }
+    @([IO.Directory]::GetFiles($Dir, '*.mks') | Where-Object { [IO.Path]::GetExtension($_) -eq '.mks' })
+}
+
+function Test-FolderDone([string]$Dir) {
+    foreach ($o in $titleList) {
+        if ($o.TitleDir -ne $Dir) { continue }
+        if ($o.State -eq 'queued' -or $o.State -eq 'prepping' -or $o.State -eq 'ready') { return $false }
+        if ($o.Finalize -eq 'pending' -or $o.Finalize -eq 'running') { return $false }
+    }
+    $true
+}
+
+# Adds the folder's loose .mks files to "<folder> - subtitles.zip" (stored, no compression),
+# keeping what's already in it, then deletes the loose files once the zip is verified.
+function Compress-FolderSubtitles([string]$Dir) {
+    $loose = @(Get-LooseSubtitles $Dir)
+    if (-not $loose.Count) { return }
+    $zip = Join-Path $Dir ((Split-Path -Leaf $Dir) + ' - subtitles.zip')
+    $part = "$zip.partial"
+    try {
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $stored = [IO.Compression.CompressionLevel]::NoCompression
+        $new = @{}; foreach ($f in $loose) { $new[[IO.Path]::GetFileName($f)] = $true }
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        $outFs = New-Object IO.FileStream($part, [IO.FileMode]::CreateNew)
+        $out = New-Object IO.Compression.ZipArchive($outFs, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            if ([IO.File]::Exists($zip)) {   # carry over what's already bundled (streamed, not in memory)
+                $in = [IO.Compression.ZipFile]::OpenRead($zip)
+                try {
+                    foreach ($e in $in.Entries) {
+                        if ($new.ContainsKey($e.FullName)) { continue }
+                        $ne = $out.CreateEntry($e.FullName, $stored); $ne.LastWriteTime = $e.LastWriteTime
+                        $src = $e.Open(); $dst = $ne.Open()
+                        try { $src.CopyTo($dst) } finally { $dst.Dispose(); $src.Dispose() }
+                    }
+                } finally { $in.Dispose() }
+            }
+            foreach ($f in $loose) { [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($out, $f, [IO.Path]::GetFileName($f), $stored) }
+        } finally { $out.Dispose(); $outFs.Dispose() }
+        $chk = [IO.Compression.ZipFile]::OpenRead($part)
+        try {
+            foreach ($f in $loose) {
+                $e = $chk.GetEntry([IO.Path]::GetFileName($f))
+                if (-not $e -or $e.Length -ne (New-Object IO.FileInfo $f).Length) { throw "verification failed for $([IO.Path]::GetFileName($f))" }
+            }
+            $total = $chk.Entries.Count
+        } finally { $chk.Dispose() }
+        Move-Item -LiteralPath $part -Destination $zip -Force -ErrorAction Stop
+        foreach ($f in $loose) { Remove-Item -LiteralPath $f -Force -ErrorAction Stop }
+        Write-Log ("ZIP   {0}: {1} subtitle backup(s) added to {2} ({3} in total)" -f $Dir, $loose.Count, (Split-Path -Leaf $zip), $total) 'Cyan'
+    } catch {
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        Write-Log "Couldn't bundle the subtitle backups in ${Dir}: $($_.Exception.Message) (loose .mks files kept)" 'Yellow'
+    }
+}
+
+# Once nothing in the folder is in progress: bundle its subtitle backups and remove the variant
+# folders (rungs, _source) that finishing left empty.
+function Invoke-SubtitleBundles {
+    foreach ($d in @($zipDirs.Keys)) {
+        if (-not (Test-FolderDone $d)) { continue }
+        $zipDirs.Remove($d)
+        Compress-FolderSubtitles $d
+        foreach ($name in @($specs | ForEach-Object { $_.Name }) + '_source') {
+            $vd = Join-Path $d $name
+            if ([IO.Directory]::Exists($vd) -and -not @([IO.Directory]::GetFileSystemEntries($vd)).Count) {
+                Remove-Item -LiteralPath $vd -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+# $Resolved: set when nothing more will happen to this title with the current settings (it
+# counts as complete for the whole-batch report), e.g. 'Skipped' for VC-1.
+function Add-Skip($t, [string]$reason, [string]$Resolved = '') {
+    $t.State = 'skipped'; $t.Reason = $reason; $t.Resolved = $Resolved
+    if (Get-LooseSubtitles $t.TitleDir) { $zipDirs[$t.TitleDir] = $true }
     $skipped.Add([pscustomobject]@{ Title = $t.Rel; Reason = $reason })
     Write-Log "SKIP  $($t.Rel): $reason" 'DarkYellow'
 }
@@ -1261,7 +1836,7 @@ function Get-Tried($t) {
 function Get-LadderStepFor([hashtable]$Tried, $Start, [string]$Folder, [string]$Self, [hashtable]$Skipped) {
     $ref = if ($folderRef.ContainsKey($Folder) -and $folderRef[$Folder].Name -ne $Self) { $folderRef[$Folder] } else { $null }
     while ($true) {
-        $i = Get-LadderNext -Tried $Tried -Count $specs.Count -Start $Start -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -Skip $Skipped
+        $i = Get-LadderNext -Tried $Tried -Count $specs.Count -Start $Start -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -Skip $Skipped -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin
         if ($i -lt 0 -or -not $ref) { return $i }
         $why = Get-KnownRungReason -Ref $ref -Tried $Tried -Rung $i -Names $specNames -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -SimilarPct $SimilarPct -SimilarVmaf $SimilarVmaf
         if (-not $why) { return $i }
@@ -1378,18 +1953,61 @@ function Set-LadderHint($t, $rows, [string]$sugg) {
     if (-not $sugg) { return }
     $pick = @($rows | Where-Object { $_.Name -eq $sugg })[0]
     if ($fixedMode) {
-        if ($null -ne $pick.Pct -and $pick.Pct -lt $TargetPct) { $pick.Hint = "under $TargetPct%: try a lower CQP / more AQ" }
+        if ($null -ne $pick.Pct -and $pick.Pct -lt $TargetPct -and -not $pick.Top) { $pick.Hint = "under $TargetPct%: try a lower CQP / more AQ" }
         return
     }
     $i = Get-RungIndex $sugg
     $byRung = @{}
     foreach ($task in $t.Tasks) { if ($task.State -eq 'done' -and $task.Row) { $byRung[[int]$task.Rung] = $task.Row } }
     Set-FolderMemory $t.Folder $t.Base $byRung $i
-    if ($null -ne $pick.Pct -and $pick.Pct -lt $TargetPct -and $i -eq $specs.Count - 1) { $pick.Hint = "under $TargetPct% at the strongest rung: add a lower-CQP rung" }
+    if ($null -ne $pick.Pct -and $pick.Pct -lt $TargetPct -and $i -eq $specs.Count - 1 -and -not $pick.Top) { $pick.Hint = "under $TargetPct% at the strongest rung: add a lower-CQP rung" }
     elseif ($null -ne $pick.Pct -and $pick.Pct -gt $TargetPct -and $i -eq 0) { $pick.Hint = "over $TargetPct% at the weakest rung: a higher-CQP rung may pass smaller" }
 }
 
 function Get-VariantDirs($t) { @($specs | ForEach-Object { Join-Path $t.TitleDir $_.Name }) }
+
+# The title's local source copy ("<name> - source.mkv"), if there is one.
+# A working file ("<name> - source.mkv", " - p7 source.mkv", " - p8.1.mkv"): in the work folder,
+# or in Dest where runs without -WorkDir (or older versions) put it; the work folder if neither.
+function Get-WorkFile($t, [string]$suffix) {
+    $w = Join-Path $t.WorkDir "$($t.Base)$suffix"
+    if ([IO.File]::Exists($w)) { return $w }
+    $d = Join-Path $t.TitleDir "$($t.Base)$suffix"
+    if ([IO.File]::Exists($d)) { return $d }
+    $w
+}
+
+function Get-LocalCopyPath($t) {
+    if ($t.Prep -and $t.Prep.PSObject.Properties['LocalCopy'] -and $t.Prep.LocalCopy) { return [string]$t.Prep.LocalCopy }
+    $lc = Get-WorkFile $t ' - source.mkv'
+    if ([IO.File]::Exists($lc)) { return $lc }
+    ''
+}
+
+# Deletes the local copy (and with -Dovi, a Dolby Vision 7 title's p7 copy and converted p8.1 too).
+function Remove-LocalCopy($t, [string]$why, [switch]$Dovi) {
+    $lc = Get-LocalCopyPath $t
+    $list = @($lc, $(if ($lc) { "$lc.partial" }), (Join-Path $t.WorkDir "$($t.Base) - source.mkv.partial"))
+    if ($Dovi) {
+        $keepCopy = $false
+        if ($t.HoldFor) {
+            $dd = $null; try { $dd = [IO.File]::ReadAllText($t.HoldFor.FinalJson) | ConvertFrom-Json } catch { }
+            $keepCopy = -not ($dd -and $dd.State -eq 'done')   # its 1080p copy still needs it for audio
+        }
+        foreach ($wf in @(Get-DoviWorkFiles $t)) {
+            if ($keepCopy -and $wf -like '* - p7 source.mkv') { continue }
+            $list += @($wf, "$wf.partial")
+        }
+    }
+    foreach ($f in $list) {
+        if (-not $f -or -not [IO.File]::Exists($f)) { continue }
+        $gb = [Math]::Round((Get-Item -LiteralPath $f).Length / 1GB, 1)
+        try {
+            Remove-Item -LiteralPath $f -Force -ErrorAction Stop
+            Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  Local copy deleted ({1}): {2}, {3} GB`r`n" -f (Get-Date), $why, $f, $gb)
+        } catch { Write-Log "Couldn't delete local copy ${f}: $($_.Exception.Message)" 'Yellow' }
+    }
+}
 
 # Queues the finish (audio, move up, delete the rest) for a title with a suggested variant.
 function Request-Finalize($t, $rows, [string]$sugg) {
@@ -1397,11 +2015,92 @@ function Request-Finalize($t, $rows, [string]$sugg) {
         Title = $t.Rel; Source = $t.File; Variant = $sugg
         Winner = (Join-Path (Join-Path $t.TitleDir $sugg) "$($t.Base).mkv")
         Final = (Join-Path $t.TitleDir "$($t.Base).mkv")
-        AudioDone = [bool]$NoAudio; State = 'pending'; Variants = @($rows)
+        AudioDone = [bool]$NoAudio; State = 'pending'; Variants = @($rows); LocalCopy = (Get-LocalCopyPath $t)
+        WorkFiles = @(Get-DoviWorkFiles $t); AudioSource = (Get-AudioSourceCopy $t)
+        SharedFinalJson = $(if ($t.IsDerived) { Join-Path $t.TitleDir "$($t.ParentBase).final.json" } else { '' })
     }
     [IO.File]::WriteAllText($t.FinalJson, ($doc | ConvertTo-Json -Depth 6), $script:Utf8)
     $t.FinalDoc = [pscustomobject]$doc
     $t.Finalize = 'pending'
+}
+
+# A local file to take the audio from when there's no plain local copy: a Dolby Vision title's
+# converted 8.1 copy (same audio and subtitle tracks as the source). Not for 1080p copies, whose
+# reference has no audio. '' = use the source.
+function Get-AudioSourceCopy($t) {
+    if ($t.IsDerived) {
+        $pc = Get-ParentP7Copy $t
+        if ($pc -and [IO.File]::Exists($pc)) { return $pc }
+        return ''
+    }
+    $p81 = Get-WorkFile $t ' - p8.1.mkv'
+    if ([IO.File]::Exists($p81)) { return $p81 }
+    ''
+}
+
+# A 1080p copy's parent's local profile 7 copy (work folder, or Dest from older runs).
+function Get-ParentP7Copy($t) {
+    foreach ($d in $t.WorkDir, $t.TitleDir) {
+        $f = Join-Path $d "$($t.ParentBase) - p7 source.mkv"
+        if ([IO.File]::Exists($f)) { return $f }
+    }
+    ''
+}
+
+# A Dolby Vision 7 title's converted copy (and any leftover p7 copy), or a 1080p copy's SDR
+# reference: deleted once the title is finished.
+function Get-DoviWorkFiles($t) {
+    if ($t.IsDerived) {
+        $ref = if ($t.Prep) { [string]$t.Prep.WorkSrc } else { Join-Path $t.WorkDir "$($t.ParentBase) - 1080p ref.mkv" }
+        return @(@($ref, (Get-ParentP7Copy $t)) | Where-Object { $_ -and [IO.File]::Exists($_) })
+    }
+    @(' - p8.1.mkv', ' - p7 source.mkv' | ForEach-Object { Get-WorkFile $t $_ } | Where-Object { [IO.File]::Exists($_) })
+}
+
+# A title kept as Dolby Vision 7: its untouched local copy gets the audio and becomes
+# "<name> - 2160p.mkv" (same finishing steps as -UseSourceFallback, no encode).
+# A finish that can start now: pending, and (for a profile 7 title) its 1080p copy has made its
+# reference from the local copy the finish is about to move away.
+function Test-FinalizeReady($t) {
+    $t.Finalize -eq 'pending' -and -not ($t.HoldFor -and
+        ($t.HoldFor.State -eq 'prepping' -or ($t.HoldFor.State -eq 'queued' -and -not $stopDispatch)))
+}
+
+# The 2160p file starts as a hard link to the local copy (in the work folder, no extra space):
+# Add-BluRayAudio reads the untouched copy and replaces the link with the remux. The copy stays
+# for the 1080p copy's audio and is deleted when that one is finished.
+function Request-FinalizeP7($t, [string]$p7copy, [string]$why) {
+    $name = "$($t.Base) - 2160p.mkv"
+    $doc = [ordered]@{
+        Title = $t.Rel; Source = $t.File; Variant = 'p7 original'; FromSource = $true; KeepP7 = $why
+        Winner = (Join-Path (Join-Path ([IO.Path]::GetDirectoryName($p7copy)) '_2160p') $name)
+        Final = (Join-Path $t.TitleDir $name)
+        SourceVideo = ''; LinkFrom = $p7copy; AudioSource = $p7copy
+        AudioDone = [bool]$NoAudio; State = 'pending'; Variants = @(); LocalCopy = ''; WorkFiles = @($p7copy)
+        SharedFinalJson = (Join-Path $t.TitleDir "$($t.Base) - 1080p.final.json")
+    }
+    [IO.File]::WriteAllText($t.FinalJson, ($doc | ConvertTo-Json -Depth 6), $script:Utf8)
+    $t.FinalDoc = [pscustomobject]$doc
+    $t.Finalize = 'pending'
+}
+
+# -UseSourceFallback: finish a title that has no passing variant with its source instead.
+function Request-FinalizeSource($t, $rows) {
+    $p81 = Get-WorkFile $t ' - p8.1.mkv'
+    if ($t.IsDerived -and $t.Prep) { $p81 = [string]$t.Prep.WorkSrc }   # 1080p copy: its SDR reference is "the source"
+    $doc = [ordered]@{
+        Title = $t.Rel; Source = $t.File; Variant = 'source'; FromSource = $true
+        Winner = (Join-Path (Join-Path $t.TitleDir '_source') "$($t.Base).mkv")
+        Final = (Join-Path $t.TitleDir "$($t.Base).mkv")
+        SourceVideo = $(if ([IO.File]::Exists($p81)) { $p81 } else { '' })
+        AudioDone = [bool]$NoAudio; State = 'pending'; Variants = @($rows); LocalCopy = (Get-LocalCopyPath $t)
+        WorkFiles = @(Get-DoviWorkFiles $t); AudioSource = (Get-AudioSourceCopy $t)
+        SharedFinalJson = $(if ($t.IsDerived) { Join-Path $t.TitleDir "$($t.ParentBase).final.json" } else { '' })
+    }
+    [IO.File]::WriteAllText($t.FinalJson, ($doc | ConvertTo-Json -Depth 6), $script:Utf8)
+    $t.FinalDoc = [pscustomobject]$doc
+    $t.Finalize = 'pending'
+    Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  -UseSourceFallback: no variant passed, so the source will be finished instead.`r`n" -f (Get-Date))
 }
 
 # Folder memory from a finished title's saved rows (results / final.json), by variant name.
@@ -1416,7 +2115,7 @@ function Complete-Title($t) {
     $rows = @($t.Tasks | Sort-Object $(if ($fixedMode) { 'Index' } else { 'Rung' }) | ForEach-Object { $_.Row })
     $sugg = $null
     if (-not $SkipVmaf) {
-        $sugg = Set-Suggestion -Rows $rows -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct
+        $sugg = Set-Suggestion -Rows $rows -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin
         Set-LadderHint $t $rows $sugg
     }
     $hint = if ($sugg) { @($rows | Where-Object { $_.Suggested })[0].Hint } else { '' }
@@ -1430,7 +2129,8 @@ function Complete-Title($t) {
     }
     $results.Add($res)
 
-    $verdict = if ($sugg) { $sugg + $(if ($hint) { " ($hint)" } else { '' }) } elseif ($done) { 'none - no variant passes within the cap, keep the original' } else { 'none' }
+    $topPick = $sugg -and @($rows | Where-Object { $_.Suggested -and $_.PSObject.Properties['Top'] -and $_.Top }).Count
+    $verdict = if ($sugg) { $sugg + $(if ($topPick) { " (meets the top bar under $TargetPct%: taking the savings)" } elseif ($hint) { " ($hint)" } else { '' }) } elseif ($done) { "none - no variant passes within the cap, keep the original; closest: $(Get-ClosestMiss $rows)" } else { 'none' }
     $lines = @('', ('{0:yyyy-MM-dd HH:mm:ss}  Bar: mean >= {1}, p1 >= {2}, min >= {3}, size <= {4}%, target {5}%. Suggested: {6}' -f `
         (Get-Date), $MinMean, $MinP1, $MinMin, $MaxPct, $TargetPct, $verdict))
     $lines += Format-VariantTable $rows
@@ -1439,7 +2139,12 @@ function Complete-Title($t) {
     Add-LogText $t.LogPath (($lines -join "`r`n") + "`r`n")
     [IO.File]::WriteAllText((Join-Path $t.TitleDir "$($t.Base).results.json"), ($res | ConvertTo-Json -Depth 5), $script:Utf8)
     if ($finishing -and $sugg) { Request-Finalize $t $rows $sugg }
-    elseif ($finishing -and -not $SkipVmaf) { Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  No suggested variant: all variants kept for review.`r`n" -f (Get-Date)) }
+    elseif ($finishing -and $UseSourceFallback -and -not $fixedMode -and -not $SkipVmaf -and $done) { Request-FinalizeSource $t $rows }
+    else {
+        if ($st -eq 'Done') { $t.Resolved = $(if ($fixedMode) { 'Done (fixed variants)' } elseif ($sugg) { 'Searched (finishing off)' } elseif ($SkipVmaf) { 'Encoded (no VMAF)' } else { 'No variant passed' }) }
+        if ($finishing -and -not $SkipVmaf) { Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  No suggested variant: all variants kept for review.`r`n" -f (Get-Date)) }
+        Remove-LocalCopy $t $(if ($sugg) { 'title finished' } else { 'title finished without a suggested variant' })
+    }
 
     $color = switch ($st) { 'Done' { 'Green' } 'Partial' { 'Yellow' } default { 'Red' } }
     $msg = "TITLE {0}: {1} in {2}, {3} encode(s)" -f $t.Rel, $st, [TimeSpan]::FromSeconds($secs), $rows.Count
@@ -1455,7 +2160,8 @@ function Start-Prep($t) {
         Helpers = $Helpers.ToString(); EnvPath = $env:PATH; RunId = $runId
         SourceFile = $t.File; BaseName = $t.Base; TitleDir = $t.TitleDir; LogPath = $t.LogPath
         StatusFile = $prepStatusFile; TempDir = $tempDir; Info = $t.Info; Wsl = $wsl
-        CropDetect = $CropDetect; MinFreeDoviGB = $MinFreeDoviGB
+        CropDetect = $CropDetect; MinFreeDoviGB = $MinFreeDoviGB; LocalCopy = [bool]$LocalCopy; WorkDir = $t.WorkDir; DoviOvershootNits = $DoviOvershootNits
+        NVEncC = $NVEncC; Derived = [bool]$t.IsDerived; ParentBase = $t.ParentBase; CropHw = [bool]($t.IsDerived -and $t.CropHw); RefSources = @($t.RefSources); SourcePeak = $t.SourcePeak
     }
     $job = Start-Job -ScriptBlock $PrepWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 6 -Compress)
     $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'prep'; Title = $t; Task = $null; Slot = -1; Start = Get-Date; StatusFile = $prepStatusFile }
@@ -1463,12 +2169,21 @@ function Start-Prep($t) {
 
 function Start-Finalize($t) {
     $t.Finalize = 'running'
+    # (a title kept as Dolby Vision 7 finishes its own local copy, already named in its doc)
+    if (-not ($t.FinalDoc.PSObject.Properties['KeepP7'] -and $t.FinalDoc.KeepP7)) {
+        $t.FinalDoc | Add-Member -NotePropertyName LocalCopy -NotePropertyValue (Get-LocalCopyPath $t) -Force
+        # (a finish saved by an older version doesn't name the local 8.1 copy to take the audio from)
+        if (-not ($t.FinalDoc.PSObject.Properties['AudioSource'] -and $t.FinalDoc.AudioSource -and [IO.File]::Exists([string]$t.FinalDoc.AudioSource))) {
+            $t.FinalDoc | Add-Member -NotePropertyName AudioSource -NotePropertyValue (Get-AudioSourceCopy $t) -Force
+        }
+    }
     $statusFile = Join-Path $tempDir 'finish.json'
     Remove-Item -LiteralPath $statusFile -Force -ErrorAction SilentlyContinue
     $cfg = @{
         Helpers = $Helpers.ToString(); EnvPath = $env:PATH; RunId = $runId
         BaseName = $t.Base; TitleDir = $t.TitleDir; LogPath = $t.LogPath; StatusFile = $statusFile; TempDir = $tempDir; Wsl = $wsl
-        Doc = $t.FinalDoc; FinalJson = $t.FinalJson; VariantDirs = (Get-VariantDirs $t)
+        Doc = $t.FinalDoc; FinalJson = $t.FinalJson
+        VariantDirs = @(Get-VariantDirs $t) + @($(if ($t.FinalDoc.PSObject.Properties['FromSource'] -and $t.FinalDoc.FromSource) { Split-Path -Parent $t.FinalDoc.Winner }))
         AddAudio = $AddBluRayAudio; Exe = (Get-Process -Id $PID).Path; NoAudio = [bool]$NoAudio; KeepVariants = [bool]$KeepVariants
     }
     $job = Start-Job -ScriptBlock $FinalizeWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 8 -Compress)
@@ -1507,7 +2222,7 @@ function Get-NextPrepTitle {
         if ($t.State -ne 'queued') { continue }
         if ($fixedMode) {
             $all = @($specs | ForEach-Object { Get-FinishedRow $t $_ })
-            if (@($all | Where-Object { $_ }).Count -eq $specs.Count) { Add-Skip $t 'all variants already finished'; continue }
+            if (@($all | Where-Object { $_ }).Count -eq $specs.Count) { Add-Skip $t 'all variants already finished' 'Done (fixed variants)'; continue }
         } else {
             # Finished (or being finished) by an earlier run: final.json.
             if ([IO.File]::Exists($t.FinalJson)) {
@@ -1515,7 +2230,7 @@ function Get-NextPrepTitle {
                 try { $fd = [IO.File]::ReadAllText($t.FinalJson) | ConvertFrom-Json } catch { }
                 if ($fd -and $fd.Variant) {
                     Set-FolderMemoryFromRows $t $fd.Variants $fd.Variant
-                    if ($fd.State -eq 'done') { Add-Skip $t "finished: $($fd.Variant) -> $($fd.Final)"; continue }
+                    if ($fd.State -eq 'done') { Remove-LocalCopy $t 'left over from an earlier run' -Dovi; Add-Skip $t "finished: $($fd.Variant) -> $($fd.Final)"; continue }
                     if ($finishing) {
                         $t.FinalDoc = $fd; $t.Finalize = 'pending'; $t.State = 'done'
                         Write-Log "RESUME finishing $($t.Rel) ($($fd.State)): $($fd.Variant)" 'Cyan'
@@ -1527,9 +2242,10 @@ function Get-NextPrepTitle {
             $tried = @{}
             for ($i = 0; $i -lt $specs.Count; $i++) { $fr = Get-FinishedRow $t $specs[$i]; if ($fr) { $tried[$i] = $fr } }
             if ($tried.Count -and (Get-LadderStepFor $tried @() $t.Folder $t.Base @{}) -eq -2) {
-                $best = Set-Suggestion -Rows @($tried.Values) -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct
-                if ($best -and $finishing) {
-                    # Searched by an earlier run but not finished: finish it now (no prep needed).
+                $best = Set-Suggestion -Rows @($tried.Values) -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin
+                if (($best -or $UseSourceFallback) -and $finishing) {
+                    # Searched by an earlier run but not finished: finish it now (no prep needed);
+                    # with -UseSourceFallback, titles where nothing passed are finished with the source.
                     $tasks = @(); foreach ($k in @($tried.Keys | Sort-Object)) { $tasks += [pscustomobject]@{ Spec = $specs[$k]; Rung = [int]$k; Index = $tasks.Count + 1; State = 'done'; Row = $tried[$k] } }
                     $t.Tasks = $tasks; $t.StartRungs = @(); $t.State = 'ready'
                     Write-Log "DONE  $($t.Rel): ladder search already finished on disk" 'Cyan'
@@ -1537,7 +2253,8 @@ function Get-NextPrepTitle {
                     continue
                 }
                 if ($best) { Set-FolderMemory $t.Folder $t.Base $tried (Get-RungIndex $best) }
-                Add-Skip $t ("ladder search already finished ({0})" -f $(if ($best) { "suggested: $best" } else { 'no rung passed' }))
+                Remove-LocalCopy $t 'left over from an earlier run'
+                Add-Skip $t ("ladder search already finished ({0})" -f $(if ($best) { "suggested: $best" } else { "no rung passed; closest: $(Get-ClosestMiss @($tried.Values))" })) $(if ($best) { 'Searched (finishing off)' } else { 'No variant passed' })
                 continue
             }
         }
@@ -1550,24 +2267,71 @@ function Get-NextPrepTitle {
             if (@($titleList | Where-Object { $_.Folder -eq $t.Folder -and ($_.State -eq 'prepping' -or $_.State -eq 'ready') -and -not @($_.Tasks).Count }).Count) { continue }
         } elseif (@($titleList | Where-Object { Test-Searching $_ }).Count -ge $maxActive) { continue }
 
-        try { $t.Info = Get-SourceInfo $t.File } catch { Add-Skip $t "probe failed: $($_.Exception.Message)"; continue }
+        if ($t.IsDerived -and -not $t.Info) {
+            # The 1080p SDR copy: the parent's picture info, minus HDR / Dolby Vision (sizes come from prep).
+            $pi = $null
+            $par = @($titleList | Where-Object { -not $_.IsDerived -and $_.Base -eq $t.ParentBase -and $_.TitleDir -eq $t.TitleDir })
+            if ($par.Count -and $par[0].Info) { $pi = $par[0].Info }
+            if (-not $pi) { try { $pi = Get-SourceInfo $t.File } catch { Add-Skip $t "probe failed: $($_.Exception.Message)"; continue } }
+            if (-not $t.SourcePeak -and $pi.MaxCll) { $pk = 0; if ([int]::TryParse(([string]$pi.MaxCll -split ',')[0], [ref]$pk)) { $t.SourcePeak = $pk } }
+            $t.CropHw = ($pi.Width -ge 3800)
+            $t.Info = [pscustomobject]@{ Codec = 'hevc'; Width = 1920; Height = 1080; Fps = $pi.Fps; Duration = $pi.Duration; Transfer = 'bt709'
+                Hdr = $false; Hdr10Plus = $false; ColorArgs = @(); MasterDisplay = ''; MaxCll = ''; Dv = 'None'; DvDetail = '1080p SDR copy of a profile 7 title' }
+        }
+        if (-not $t.Info) { try { $t.Info = Get-SourceInfo $t.File } catch { Add-Skip $t "probe failed: $($_.Exception.Message)"; continue } }
         $info = $t.Info
-        if ($SkipVC1 -and $info.Codec -eq 'vc1') { Add-Skip $t 'VC-1 source (-SkipVC1)'; continue }
-        if ($info.Dv -ne 'None' -and $info.Dv -ne 'P7' -and $info.Dv -ne 'P8.1') { Add-Skip $t "unsupported Dolby Vision: $($info.Dv) [$($info.DvDetail)]"; continue }
+        if ($SkipVC1 -and $info.Codec -eq 'vc1') { Add-Skip $t 'VC-1 source (-SkipVC1)' 'Skipped'; continue }
+        if ($info.Dv -ne 'None' -and $info.Dv -ne 'P7' -and $info.Dv -ne 'P8.1') { Add-Skip $t "unsupported Dolby Vision: $($info.Dv) [$($info.DvDetail)]" 'Skipped'; continue }
         if ($info.Dv -eq 'P7' -and -not $doviAvailable) { Add-Skip $t 'Dolby Vision 7 but dovi_convert is unavailable'; continue }
+        $isP7 = ($info.Dv -eq 'P7')
+        # Dolby Vision 7: at most -MaxDoviTitles hold work files at once (this one waits its turn).
+        if ($isP7) {
+            $inFlight = @($titleList | Where-Object { $_ -ne $t -and $_.Info -and $_.Info.Dv -eq 'P7' -and
+                ($_.State -eq 'prepping' -or $_.State -eq 'ready' -or $_.Finalize -eq 'pending' -or $_.Finalize -eq 'running') }).Count
+            if ($inFlight -ge $MaxDoviTitles) { continue }
+        }
 
         [void][IO.Directory]::CreateDirectory($t.TitleDir)
+        [void][IO.Directory]::CreateDirectory($t.WorkDir)
         $free = Get-FreeGB $t.TitleDir
-        if ($free -lt $MinFreeGB) {
-            $script:stopDispatch = $true
-            Write-Log "Only $free GB free on $dstRoot (< $MinFreeGB GB): not starting any more titles." 'Red'
+        $workFree = Get-FreeGB $t.WorkDir
+        $sameDrive = ([IO.Path]::GetPathRoot($t.TitleDir) -eq [IO.Path]::GetPathRoot($t.WorkDir))
+        # What it still needs to copy into the work folder (nothing if a complete copy is there).
+        $needGB = 0; $workNeed = 0; $workWhy = ''
+        if ($isP7) {
+            $p81 = Get-WorkFile $t ' - p8.1.mkv'; $p7c = Get-WorkFile $t ' - p7 source.mkv'
+            if (-not [IO.File]::Exists($p81) -and -not [IO.File]::Exists($p7c)) { $workNeed = $MinFreeDoviGB; $workWhy = "$MinFreeDoviGB GB (-MinFreeDoviGB) to download and convert Dolby Vision 7" }
+        } elseif ($LocalCopy -and -not $t.IsDerived) {
+            $srcLen = (Get-Item -LiteralPath $t.File).Length
+            $lc = Get-WorkFile $t ' - source.mkv'
+            if (-not ([IO.File]::Exists($lc) -and (Get-Item -LiteralPath $lc).Length -eq $srcLen)) {
+                $needGB = [Math]::Round($srcLen / 1GB, 1)
+                $workNeed = $needGB + 20; $workWhy = "$needGB GB for its local copy + 20"
+            }
+        }
+        $short = ''; $shortKey = ''
+        if ($sameDrive) {
+            $want = [Math]::Max([double]($MinFreeGB + $needGB), [double]$(if ($isP7) { $workNeed } else { 0 }))
+            if ($free -lt $want) { $shortKey = "$($t.Rel)|dest"; $short = "only $free GB free on $dstRoot ($($t.Rel) needs $want GB: -MinFreeGB $MinFreeGB$(if ($workWhy) { "; $workWhy" }))" }
+        } else {
+            if ($free -lt $MinFreeGB) { $shortKey = "$($t.Rel)|dest"; $short = "only $free GB free on $dstRoot ($($t.Rel) needs -MinFreeGB $MinFreeGB for the encodes)" }
+            elseif ($workFree -lt $workNeed) { $shortKey = "$($t.Rel)|work"; $short = "only $workFree GB free on the work drive $workRoot ($($t.Rel) needs $workWhy)" }
+        }
+        if ($short) {
+            $busy = $running.Count -or @($titleList | Where-Object { $_.State -eq 'prepping' -or $_.State -eq 'ready' -or $_.Finalize -eq 'pending' -or $_.Finalize -eq 'running' }).Count
+            if (-not $busy) {
+                $script:stopDispatch = $true
+                Write-Log "$(($short.Substring(0,1)).ToUpper())$($short.Substring(1)), and nothing left running to free space: not starting any more titles." 'Red'
+            } elseif ($script:spaceWaitLogged -ne $shortKey) {
+                $script:spaceWaitLogged = $shortKey
+                Write-Log "$(($short.Substring(0,1)).ToUpper())$($short.Substring(1)): waiting for titles in progress to finish and free space." 'Yellow'
+            }
             return $null
         }
-        if ($info.Dv -eq 'P7' -and $free -lt $MinFreeDoviGB -and -not [IO.File]::Exists((Join-Path $t.TitleDir "$($t.Base) - p8.1.mkv"))) {
-            Add-Skip $t "Dolby Vision 7 needs $MinFreeDoviGB GB free, have $free GB"; continue
-        }
-        Write-Log ("PREP  {0}  ({1}{2}, {3} GB free)  log: {4}" -f $t.Rel, $info.Codec,
-            $(if ($info.Dv -ne 'None') { ", DV $($info.Dv)" } elseif ($info.Hdr) { ', HDR' } else { '' }), $free, $t.LogPath) 'Cyan'
+        if ($script:spaceWaitLogged) { $script:spaceWaitLogged = ''; Write-Log "Enough space again: starting titles." 'Green' }
+        Write-Log ("PREP  {0}  ({1}{2}, {3} GB free{4})  log: {5}" -f $t.Rel, $info.Codec,
+            $(if ($info.Dv -ne 'None') { ", DV $($info.Dv)" } elseif ($info.Hdr) { ', HDR' } else { '' }), $free,
+            $(if (-not $sameDrive) { ", work drive $workFree GB" } else { '' }), $t.LogPath) 'Cyan'
         return $t
     }
     $null
@@ -1582,6 +2346,207 @@ function Test-MoreWork {
     $false
 }
 
+# ---- whole-batch report: every title under -Source, from what's saved on disk (any run)
+function Read-JsonFile([string]$Path) {
+    if (-not [IO.File]::Exists($Path)) { return $null }
+    try { [IO.File]::ReadAllText($Path) | ConvertFrom-Json } catch { $null }
+}
+
+# Crop (<name>.crop.json) and audio (what Add-BluRayAudio reported, kept in final.json) for the reports.
+function Get-TitleExtras($t, $fd) {
+    $audio = $null
+    if ($fd -and $fd.PSObject.Properties['Audio']) { $audio = $fd.Audio }
+    $dvBase = if ($t.IsDerived) { $t.ParentBase } else { $t.Base }
+    [pscustomobject]@{ Crop = (Read-JsonFile (Join-Path $t.TitleDir "$($t.Base).crop.json")); Audio = $audio
+                       Dovi = (Read-JsonFile (Join-Path $t.TitleDir "$dvBase.dovi.json")); Derived = [bool]$t.IsDerived }
+}
+
+# One line on what happened to a Dolby Vision 7 title (from "<name>.dovi.json"), or ''.
+function Format-DoviNote($ex) {
+    $d = $ex.Dovi
+    if (-not $d) { return '' }
+    switch ([string]$d.Decision) {
+        'convert'           { 'profile 7 converted to 8.1' + $(if ($d.Verdict) { " (inspect: $($d.Verdict))" }) }
+        'convert-overshoot' { [string]$d.Note }
+        'keep-p7'           { if ($ex.Derived) { "1080p SDR copy of a title kept as profile 7 ($($d.Note))" } else { "kept as profile 7 ($($d.Note)); a 1080p SDR copy is made alongside" } }
+        default             { '' }
+    }
+}
+
+# Markdown bullets: video dimensions and crop, audio tracks, subtitles to fix, audio warnings.
+function Format-TitleExtras($ex, [string]$pick) {
+    $dn = Format-DoviNote $ex
+    if ($dn) { "- **Dolby Vision:** $dn" }
+    $c = $ex.Crop
+    if ($c -and $pick -eq 'p7 original') {
+        "- **Video:** source $($c.SourceWidth)x$($c.SourceHeight), kept as is (the profile 7 original, not cropped or encoded)"
+        $c = $null
+    }
+    if ($c) {
+        $cropText = if (($c.Top + $c.Bottom + $c.Left + $c.Right) -gt 0) {
+            "crop top $($c.Top), bottom $($c.Bottom), left $($c.Left), right $($c.Right)"
+        } else { 'no crop' }
+        $line = "- **Video:** source $($c.SourceWidth)x$($c.SourceHeight), encoded $($c.Width)x$($c.Height) ($cropText$(if ($c.PSObject.Properties['Scaled'] -and $c.Scaled) { ', scaled to fit 1080p, SDR' }))"
+        if ($pick -eq 'source') { $line += '; the finished file is the uncropped source' }
+        $line
+    }
+    $a = $ex.Audio
+    if ($a) {
+        $line = "- **Audio:** $(if ($a.Summary) { $a.Summary } else { 'none reported' })"
+        $drops = @($a.Dropped | Where-Object { $_ } | ForEach-Object { "audio $($_.SourceTrack) $($_.Name) ($($_.Reason))" })
+        if ($drops.Count) { $line += "; dropped: $($drops -join ', ')" }
+        $line
+        if ($a.SubtitleShift) { "- **Subtitles to fix:** $($a.SubtitleShift)" }
+        $warn = @($a.Warnings | Where-Object { $_ -and $_ -notlike 'SUBTITLES TO FIX:*' })
+        if ($warn.Count) { "- **Audio warnings:** $($warn -join '; ')" }
+    }
+}
+
+# CSV columns for the same (repeated on each of a title's rows).
+function Get-ExtrasColumns($ex) {
+    $c = $ex.Crop; $a = $ex.Audio
+    [ordered]@{
+        DolbyVision = (Format-DoviNote $ex)
+        SourceWidth = $(if ($c) { $c.SourceWidth }); SourceHeight = $(if ($c) { $c.SourceHeight })
+        EncodedWidth = $(if ($c) { $c.Width }); EncodedHeight = $(if ($c) { $c.Height })
+        CropTop = $(if ($c) { $c.Top }); CropBottom = $(if ($c) { $c.Bottom }); CropLeft = $(if ($c) { $c.Left }); CropRight = $(if ($c) { $c.Right })
+        Audio = $(if ($a) { [string]$a.Summary } else { '' })
+        AudioTracks = $(if ($a) { @($a.Tracks | Where-Object { $_ }).Count })
+        AudioDropped = $(if ($a) { (@($a.Dropped | Where-Object { $_ } | ForEach-Object { "audio $($_.SourceTrack) $($_.Name) ($($_.Reason))" })) -join '; ' } else { '' })
+        AudioSyncMs = $(if ($a) { $a.SyncMs })
+        SubtitleShift = $(if ($a) { [string]$a.SubtitleShift } else { '' })
+        AudioWarnings = $(if ($a) { (@($a.Warnings | Where-Object { $_ -and $_ -notlike 'SUBTITLES TO FIX:*' })) -join '; ' } else { '' })
+    }
+}
+
+# Where a title stands overall. Resolved = nothing more will happen with the current settings.
+function Get-TitleOutcome($t) {
+    $o = [ordered]@{ Title = $t.Rel; Outcome = ''; Detail = ''; Pick = ''; Final = ''; Rows = @(); Resolved = $false; LogPath = $t.LogPath; Extras = $null }
+    $fd = Read-JsonFile $t.FinalJson
+    $o.Extras = Get-TitleExtras $t $fd
+    $rj = Read-JsonFile (Join-Path $t.TitleDir "$($t.Base).results.json")
+    if ($fd -and $fd.State -eq 'done') {
+        $o.Outcome = switch ([string]$fd.Variant) { 'source' { 'Finished with the source' } 'p7 original' { 'Kept as Dolby Vision 7' } default { 'Finished' } }
+        $o.Pick = [string]$fd.Variant; $o.Final = [string]$fd.Final; $o.Rows = @($fd.Variants); $o.Resolved = $true
+    } else {
+        if ($rj) { $o.Rows = @($rj.Variants) }
+        if ($fd) { $o.Outcome = 'Not finished'; $o.Detail = "finishing stopped at: $($fd.State)" }
+        elseif ($t.Resolved) { $o.Outcome = $t.Resolved; $o.Detail = $t.Reason; $o.Resolved = $true }
+        else {
+            switch ($t.State) {
+                'queued'   { $o.Outcome = 'Not started' }
+                'prepping' { $o.Outcome = 'Interrupted' }
+                'ready'    { $o.Outcome = 'Interrupted' }
+                'failed'   { $o.Outcome = 'Failed'; $o.Detail = $t.Reason }
+                'skipped'  { $o.Outcome = 'Skipped'; $o.Detail = $t.Reason }
+                default    { $o.Outcome = 'Not finished'; $o.Detail = $t.Reason }
+            }
+        }
+    }
+    $o.Rows = @($o.Rows | Where-Object { $_ })
+    if ($o.Rows.Count -and -not $SkipVmaf) {
+        [void](Set-Suggestion -Rows $o.Rows -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin)
+        if ($o.Pick) { foreach ($r in $o.Rows) { $r.Suggested = ($r.Name -eq $o.Pick) } }
+        if ($o.Outcome -eq 'No variant passed') { $o.Detail = "original kept; closest: $(Get-ClosestMiss $o.Rows)" }
+    }
+    [pscustomobject]$o
+}
+
+# _encode-batch_all.md / .csv in Dest: every title found under -Source, all runs. Only written
+# when the whole batch is complete (every title finished, or settled: nothing passed, skipped).
+function Write-BatchReport {
+    $outs = @($titleList | ForEach-Object { Get-TitleOutcome $_ })
+    $open = @($outs | Where-Object { -not $_.Resolved })
+    if ($open.Count) {
+        Write-Log ("Whole-batch report not written yet: {0} of {1} title(s) still to do ({2})." -f $open.Count, $outs.Count,
+            ((@($open | Group-Object Outcome | ForEach-Object { "$($_.Count) $($_.Name.ToLower())" })) -join ', '))
+        return
+    }
+    $srcGB = 0.0; $finGB = 0.0; $nSized = 0
+    foreach ($o in $outs) {
+        if ($o.Outcome -notlike 'Finished*') { continue }
+        $ref = @($o.Rows | Where-Object { $_.Pct -gt 0 -and $_.VideoGB -gt 0 } | Select-Object -First 1)
+        if (-not $ref.Count) { continue }
+        $s = $ref[0].VideoGB / $ref[0].Pct * 100
+        $f = if ($o.Pick -eq 'source') { $s } else { @($o.Rows | Where-Object { $_.Name -eq $o.Pick } | ForEach-Object { $_.VideoGB })[0] }
+        if ($null -eq $f) { continue }
+        $srcGB += $s; $finGB += $f; $nSized++
+    }
+    $count = { param($name) @($outs | Where-Object { $_.Outcome -eq $name }).Count }
+    $md = New-Object System.Collections.Generic.List[string]
+    $md.Add('# Encode-Batch: all titles')
+    $md.Add('')
+    $md.Add("- **Source:** ``$srcPath``")
+    $md.Add("- **Dest:** ``$dstRoot``")
+    $md.Add("- **Updated:** $(Get-Date -Format 'yyyy-MM-dd HH:mm') (run $runId)")
+    $md.Add("- **Mode:** $(if ($fixedMode) { 'fixed variants' } else { "ladder search ($(($specs | ForEach-Object { $_.Name }) -join ', '))" })")
+    $md.Add("- **Bar:** mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; target $TargetPct%; top bar mean >= $TopMean, p1 >= $TopP1, min >= $TopMin.")
+    $md.Add(("- **Titles:** {0} total: {1} finished, {2} finished with the source, {3} kept as Dolby Vision 7, {4} nothing passed (original kept), {5} skipped" -f
+        $outs.Count, (& $count 'Finished'), (& $count 'Finished with the source'), (& $count 'Kept as Dolby Vision 7'), (& $count 'No variant passed'), (& $count 'Skipped')))
+    if ($nSized) {
+        $md.Add(("- **Video:** {0} finished title(s): sources {1:N1} GB -> {2:N1} GB ({3:N0}% of the source, {4:N1} GB saved)" -f
+            $nSized, $srcGB, $finGB, (100 * $finGB / [Math]::Max([double]0.001, $srcGB)), ($srcGB - $finGB)))
+    }
+    $toFix = @($outs | Where-Object { $_.Extras.Audio -and $_.Extras.Audio.SubtitleShift } | Sort-Object Title)
+    if ($toFix.Count) {
+        $md.Add('')
+        $md.Add("## Subtitles to fix ($($toFix.Count))")
+        $md.Add('')
+        $md.Add('The audio was shifted to match the encode, so subtitles OCR''d from the source need the same shift.')
+        $md.Add('')
+        foreach ($o in $toFix) { $md.Add("- ``$($o.Title)``: $($o.Extras.Audio.SubtitleShift)") }
+    }
+    $csv = New-Object System.Collections.Generic.List[object]
+    foreach ($o in @($outs | Sort-Object Title)) {
+        $md.Add('')
+        $md.Add("## $($o.Title)")
+        $md.Add('')
+        $line = switch -Wildcard ($o.Outcome) {
+            'Finished'                 { "Finished: $($o.Pick) -> ``$($o.Final)``" }
+            'Finished with the source' { "Finished with the source (no variant passed) -> ``$($o.Final)``" }
+            'Kept as Dolby Vision 7'   { "Kept as Dolby Vision 7 (audio only) -> ``$($o.Final)``" }
+            default                    { "$($o.Outcome)$(if ($o.Detail) { ": $($o.Detail)" })" }
+        }
+        $md.Add("$line. Log: ``$($o.LogPath)``")
+        $extra = @(Format-TitleExtras $o.Extras $o.Pick)
+        if ($extra.Count) { $md.Add(''); foreach ($x in $extra) { $md.Add($x) } }
+        $cols = Get-ExtrasColumns $o.Extras
+        if ($o.Rows.Count) {
+            $md.Add('')
+            Format-VariantTable $o.Rows | ForEach-Object { $md.Add($_) }
+            foreach ($v in $o.Rows) {
+                $row = [ordered]@{
+                    Title = $o.Title; Outcome = $o.Outcome; Pick = $o.Pick; FinalFile = $o.Final; Variant = $v.Name
+                    Picked = [bool]$v.Suggested; Pass = [bool]$v.Pass; Notes = $(if ($v.PSObject.Properties['Why']) { $v.Why } else { '' })
+                    Mean = $v.Mean; P1 = $v.P1; Min = $v.Min; VideoGB = $v.VideoGB; PctOfSource = $v.Pct; Mbps = $v.Mbps; Model = $v.Model
+                }
+                foreach ($k in $cols.Keys) { $row[$k] = $cols[$k] }
+                $csv.Add([pscustomobject]$row)
+            }
+        } else {
+            $row = [ordered]@{
+                Title = $o.Title; Outcome = $o.Outcome; Pick = $o.Pick; FinalFile = $o.Final; Variant = ''; Picked = $false; Pass = $false
+                Notes = $o.Detail; Mean = $null; P1 = $null; Min = $null; VideoGB = $null; PctOfSource = $null; Mbps = $null; Model = ''
+            }
+            foreach ($k in $cols.Keys) { $row[$k] = $cols[$k] }
+            $csv.Add([pscustomobject]$row)
+        }
+    }
+    $mdAll = Join-Path $dstRoot '_encode-batch_all.md'
+    [IO.File]::WriteAllLines($mdAll, $md, $script:Utf8)
+    $csv | Export-Csv -LiteralPath (Join-Path $dstRoot '_encode-batch_all.csv') -NoTypeInformation -Encoding UTF8
+    Write-Log "Whole batch complete: $mdAll (and _encode-batch_all.csv)" 'Cyan'
+}
+
+# Dolby Vision 7 titles kept as profile 7 by an earlier run: bring back their 1080p copies.
+foreach ($t in $titleList.ToArray()) {
+    $dec = Join-Path $t.TitleDir "$($t.Base).dovi.json"
+    if (-not [IO.File]::Exists($dec)) { continue }
+    try { $o = [IO.File]::ReadAllText($dec) | ConvertFrom-Json } catch { continue }
+    if ($o.Decision -eq 'keep-p7') { [void](Add-DerivedTitle $t) }
+}
+
+[IO.File]::WriteAllText($lockPath, (@{ Pid = $PID; Started = (Get-Process -Id $PID).StartTime.ToString('o'); RunId = $runId } | ConvertTo-Json -Compress))
 try {
     while (Test-MoreWork) {
 
@@ -1602,7 +2567,24 @@ try {
             if ($r.Kind -eq 'prep') {
                 Write-Progress -Id 99 -Activity "Preparing $($t.Rel)" -Completed
                 if (-not $res) { $res = [pscustomobject]@{ Status = 'Failed'; Reason = $why } }
+                if ($res.Status -eq 'KeepP7') {
+                    # Kept as Dolby Vision 7: finish the copy as "- 2160p" (audio only) and add the 1080p SDR title.
+                    $d = Add-DerivedTitle $t
+                    Request-FinalizeP7 $t ([string]$res.P7Copy) ([string]$res.Reason)
+                    $t.State = 'done'; $t.Reason = $res.Reason
+                    $doviNotes.Add([pscustomobject]@{ Title = $t.Rel; Note = "kept as profile 7 ($($res.Reason)): finished as $($t.Base) - 2160p.mkv (audio only), plus a 1080p SDR copy" })
+                    $results.Add([pscustomobject]@{ Title = $t.Rel; Status = 'Kept as Dolby Vision 7'; Reason = "$($res.Reason); finishing as $($t.Base) - 2160p.mkv, 1080p SDR copy queued"
+                                                    Suggested = $null; Variants = @(); Seconds = [int]((Get-Date) - $t.Start).TotalSeconds; LogPath = $t.LogPath })
+                    Write-Log "KEEP P7 $($t.Rel): $($res.Reason). Finishing it as '$($t.Base) - 2160p.mkv' (audio only); added $($d.Rel) (1080p SDR copy)" 'Yellow'
+                    continue
+                }
+                if ($res.PSObject.Properties['DoviNote'] -and $res.DoviNote) {
+                    $doviNotes.Add([pscustomobject]@{ Title = $t.Rel; Note = [string]$res.DoviNote })
+                    Write-Log "DOVI  $($t.Rel): $($res.DoviNote)" 'Yellow'
+                }
+                if ($res.Status -eq 'Ready' -and $t.IsDerived -and $res.PSObject.Properties['RefWidth']) { $t.Info.Width = [int]$res.RefWidth; $t.Info.Height = [int]$res.RefHeight }
                 if ($res.Status -ne 'Ready') {
+                    Remove-LocalCopy $t "prep $($res.Status.ToLower())"
                     $t.State = $(if ($res.Status -eq 'Skipped') { 'skipped' } else { 'failed' }); $t.Reason = $res.Reason
                     $results.Add([pscustomobject]@{ Title = $t.Rel; Status = $res.Status; Reason = $res.Reason; Suggested = $null; Variants = @()
                                                     Seconds = [int]((Get-Date) - $t.Start).TotalSeconds; LogPath = $t.LogPath })
@@ -1639,7 +2621,9 @@ try {
                 Write-Progress -Id 21 -Activity 'finish' -Completed
                 if (-not $res) { $res = [pscustomobject]@{ Status = 'Failed'; Error = $why; FreedGB = 0; Deleted = 0; Final = $t.FinalDoc.Final } }
                 $t.Finalize = $res.Status
-                $finished.Add([pscustomobject]@{ Title = $t.Rel; Variant = $t.FinalDoc.Variant; Status = $res.Status; Final = $res.Final; FreedGB = $res.FreedGB; Error = $res.Error })
+                if ($res.Status -eq 'Done') { $zipDirs[$t.TitleDir] = $true }
+                $finished.Add([pscustomobject]@{ Title = $t.Rel; Variant = $t.FinalDoc.Variant; Status = $res.Status; Final = $res.Final; FreedGB = $res.FreedGB; Error = $res.Error
+                                                 Audio = [string]$res.Audio; AudioWarnings = @($res.AudioWarnings | Where-Object { $_ }) })
                 if ($res.Status -eq 'Done') {
                     Write-Log ("FINISHED {0}: {1} -> {2}{3}" -f $t.Rel, $t.FinalDoc.Variant, $res.Final,
                         $(if ($res.Deleted) { ", other variants deleted ($($res.Deleted) file(s), $($res.FreedGB) GB)" } else { '' })) 'Green'
@@ -1670,6 +2654,8 @@ try {
             }
             if ($t.State -eq 'ready' -and (Test-TitleFinished $t)) { Complete-Title $t }
         }
+
+        Invoke-SubtitleBundles
 
         # ---- hand encodes to free encoder slots, oldest title first (in ladder mode a title
         #      waiting on VMAF to choose its next rung has nothing to hand out; the slot moves on)
@@ -1703,7 +2689,7 @@ try {
 
         # ---- finish titles (audio, move up, delete the rest), one at a time, oldest first
         if (-not @($running.Values | Where-Object { $_.Kind -eq 'finalize' }).Count) {
-            $ft = @($titleList | Where-Object { $_.Finalize -eq 'pending' } | Select-Object -First 1)
+            $ft = @($titleList | Where-Object { Test-FinalizeReady $_ } | Select-Object -First 1)
             if ($ft.Count) { Start-Finalize $ft[0] }
         }
 
@@ -1721,6 +2707,25 @@ try {
             if ($t) { Start-Prep $t }
         }
 
+        # A Dolby Vision 7 prep waiting for room to convert, with nothing else running that could
+        # ever free it (checked after handing out work, so a title between encodes isn't missed): give up on that title instead of waiting forever.
+        $pr = @($running.Values | Where-Object { $_.Kind -eq 'prep' })
+        if ($pr.Count -and $running.Count -eq 1 -and -not @($titleList | Where-Object { Test-FinalizeReady $_ }).Count) {
+            $st = $null
+            try { if ([IO.File]::Exists($pr[0].StatusFile)) { $st = [IO.File]::ReadAllText($pr[0].StatusFile) | ConvertFrom-Json } } catch { }
+            if ($st -and $st.Step -like 'waiting for space*') {
+                $t = $pr[0].Title
+                Stop-Job -Job $pr[0].Job -ErrorAction SilentlyContinue; Remove-Job -Job $pr[0].Job -Force -ErrorAction SilentlyContinue
+                $running.Remove($pr[0].Job.Id)
+                Write-Progress -Id 99 -Activity "Preparing $($t.Rel)" -Completed
+                $t.State = 'failed'; $t.Reason = "not enough space on the work drive to convert, and nothing left running to free any ($($st.Step)); the local copy is kept"
+                Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  PREP: Failed - {1}`r`n" -f (Get-Date), $t.Reason)
+                $results.Add([pscustomobject]@{ Title = $t.Rel; Status = 'Failed'; Reason = $t.Reason; Suggested = $null; Variants = @()
+                                                Seconds = [int]((Get-Date) - $t.Start).TotalSeconds; LogPath = $t.LogPath })
+                Write-Log "TITLE $($t.Rel): Failed - $($t.Reason)" 'Red'
+            }
+        }
+
         # ---- progress display: one bar per encoder slot, one for prep
         foreach ($r in $running.Values) {
             $st = $null
@@ -1730,7 +2735,7 @@ try {
             if ($st) {
                 $text = $st.Step
                 if ($st.PSObject.Properties['Pct'] -and $null -ne $st.Pct) {
-                    $pct = [int][Math]::Min(100, [Math]::Max(0, [double]$st.Pct))
+                    $pct = [int][Math]::Min([double]100, [Math]::Max([double]0, [double]$st.Pct))
                     $text += " $($st.Pct)% - $($st.Detail)"
                 }
                 $text += "  [$elapsed]"
@@ -1746,7 +2751,9 @@ try {
         }
         Start-Sleep -Seconds 2
     }
+    Invoke-SubtitleBundles
 } finally {
+    Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
     # Ctrl+C or an error: stop workers and anything they launched on the Windows side.
     foreach ($r in @($running.Values)) {
         try {
@@ -1773,10 +2780,9 @@ try {
     $md.Add("- **Dest:** ``$dstRoot``")
     $md.Add("- **Elapsed:** $($elapsed.ToString('hh\:mm\:ss'))")
     $md.Add("- **Mode:** $(if ($fixedMode) { 'fixed variants' } else { "ladder search ($(($specs | ForEach-Object { $_.Name }) -join ', '))" })")
-    $md.Add("- **Bar:** mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's.")
-    $md.Add("- **Suggested:** the passing variant closest to $TargetPct% of the source, either direction. None = keep the original.")
+    $md.Add("- **Bar:** mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; top bar mean >= $TopMean, p1 >= $TopP1, min >= $TopMin.")
+    $md.Add("- **Suggested:** the passing variant closest to $TargetPct% of the source, either direction; but if any variant under $TargetPct% meets the top bar, the biggest of those. None = keep the original.")
     $md.Add("- **Titles:** $(@($results | Where-Object Status -eq 'Done').Count) done, $(@($results | Where-Object Status -eq 'Partial').Count) partial, $(@($results | Where-Object { $_.Status -in 'Failed', 'Skipped' }).Count) failed/skipped while running, $($skipped.Count) skipped before starting, $($unfinished.Count) interrupted, $notStarted not started")
-    $csv = New-Object System.Collections.Generic.List[object]
     foreach ($res in $results) {
         $md.Add('')
         $md.Add("## $($res.Title)")
@@ -1784,18 +2790,16 @@ try {
         $line = "$($res.Status), $([TimeSpan]::FromSeconds([int]$res.Seconds))"
         if ($res.Reason) { $line += " - $($res.Reason)" }
         $md.Add("$line. Log: ``$($res.LogPath)``")
+        $tt = @($titleList | Where-Object { $_.Rel -eq $res.Title } | Select-Object -First 1)
+        if ($tt.Count) {
+            $fdx = Read-JsonFile $tt[0].FinalJson
+            $extra = @(Format-TitleExtras (Get-TitleExtras $tt[0] $fdx) $(if ($fdx) { [string]$fdx.Variant } else { '' }))
+            if ($extra.Count) { $md.Add(''); foreach ($x in $extra) { $md.Add($x) } }
+        }
         $rows = @($res.Variants)
         if ($rows.Count) {
             $md.Add('')
             Format-VariantTable $rows | ForEach-Object { $md.Add($_) }
-            foreach ($v in $rows) {
-                $csv.Add([pscustomobject]@{
-                    Title = $res.Title; Variant = $v.Name; Status = $v.Status; Suggested = $v.Suggested; Hint = $v.Hint; Pass = $v.Pass
-                    OverCap = $v.OverCap; Dominated = $v.Dominated; Mean = $v.Mean; P1 = $v.P1; Min = $v.Min; VideoGB = $v.VideoGB
-                    PctOfSource = $v.Pct; Mbps = $v.Mbps; Model = $v.Model; AlignmentWarning = $v.Warning
-                    EncodeSeconds = $v.EncodeSec; Error = $v.Error; File = $v.File
-                })
-            }
         }
     }
     if ($finished.Count) {
@@ -1803,9 +2807,18 @@ try {
         $md.Add('## Finished (audio added, moved into place, other variants deleted)')
         $md.Add('')
         foreach ($f in $finished) {
-            if ($f.Status -eq 'Done') { $md.Add("- ``$($f.Title)``: $($f.Variant) -> ``$($f.Final)``$(if ($f.FreedGB) { ", $($f.FreedGB) GB freed" })") }
-            else { $md.Add("- **FAILED** ``$($f.Title)``: $($f.Error)") }
+            if ($f.Status -eq 'Done') {
+                $md.Add("- ``$($f.Title)``: $($f.Variant) -> ``$($f.Final)``$(if ($f.FreedGB) { ", $($f.FreedGB) GB freed" })")
+                if ($f.Audio) { $md.Add("  - audio: $($f.Audio)") }
+            } else { $md.Add("- **FAILED** ``$($f.Title)``: $($f.Error)") }
+            foreach ($w in @($f.AudioWarnings)) { if ($w) { $md.Add("  - **$(if ($w -like 'SUBTITLES TO FIX:*') { $w } else { "audio warning: $w" })**") } }
         }
+    }
+    if ($doviNotes.Count) {
+        $md.Add('')
+        $md.Add('## Dolby Vision 7 decisions this run')
+        $md.Add('')
+        foreach ($n in $doviNotes) { $md.Add("- ``$($n.Title)``: $($n.Note)") }
     }
     $pendingFinish = @($titleList | Where-Object { $_.Finalize -eq 'pending' -or $_.Finalize -eq 'running' })
     if ($pendingFinish.Count) {
@@ -1820,7 +2833,7 @@ try {
     }
     $mdPath = Join-Path $dstRoot "_encode-batch_$runId.md"
     [IO.File]::WriteAllLines($mdPath, $md, $script:Utf8)
-    if ($csv.Count) { $csv | Export-Csv -LiteralPath (Join-Path $dstRoot "_encode-batch_$runId.csv") -NoTypeInformation -Encoding UTF8 }
+    try { Write-BatchReport } catch { Write-Log "Couldn't write the whole-batch report: $($_.Exception.Message)" 'Yellow' }
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     $tmpParent = Split-Path -Parent $tempDir
     if ([IO.Directory]::Exists($tmpParent) -and -not (Get-ChildItem -LiteralPath $tmpParent -Force)) { Remove-Item -LiteralPath $tmpParent -Force -ErrorAction SilentlyContinue }

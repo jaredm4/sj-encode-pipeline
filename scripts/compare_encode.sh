@@ -47,6 +47,33 @@
 #                a real added cost in the default clip-sampling mode, especially over a
 #                slow network mount or on a very large file.)
 #
+# GPU scoring (libvmaf_cuda): used automatically when an ffmpeg with libvmaf_cuda is found
+#                (FFMPEG_CUDA, else FFMPEG); VMAF_CUDA=0 forces the CPU, VMAF_CUDA=1 warns if
+#                it isn't available. The VMAF is then computed on the NVIDIA GPU instead of the
+#                CPU. By default both files are also DECODED on the GPU (NVDEC), and the crop
+#                or scale happens there too, so frames never touch the CPU: a full 43-minute
+#                1080p episode takes ~3 minutes with almost no CPU, vs ~8-9 minutes and 6-7
+#                cores on the CPU. Frame pairing and shift probing are unchanged. Needs an
+#                ffmpeg built with libvmaf_cuda:
+#                  FFMPEG_CUDA  (default /opt/ffmpeg-cuda/bin/ffmpeg; FFMPEG is still used for
+#                               durations, sizes and the CPU path)
+#                  CUDA_FMT     how frames reach the GPU filter, which only takes 8-bit 4:2:0
+#                               or 16-bit 4:4:4:
+#                                 yuv444p16 (default): uploaded as 10-bit 4:2:0 and widened on
+#                                   the GPU; keeps the 10-bit precision the CPU path uses
+#                                   (VMAF only looks at luma, so the 4:4:4 doesn't change it)
+#                                 yuv420p: everything converted to 8-bit on the CPU first
+#                  CUDA_DEVICE  GPU index (default 0)
+#                  CUDA_DECODE  1 (default): decode on the GPU. 0: decode, crop and convert on
+#                               the CPU and upload finished frames (slower, uses the CPU).
+#                               GPU decoding is also skipped automatically for a pair whose
+#                               crop it can't do (odd crop values, unknown codec).
+#                If a GPU step fails it falls back, with a note: GPU decoding -> CPU decoding
+#                with GPU scoring -> all CPU; after 2 failures in a pair the failing mode is
+#                skipped for the rest of it, so a night's batch doesn't stop over it. GPU and CPU scores can differ slightly;
+#                check a few titles both ways before relying on fixed thresholds.
+#                THREADS doesn't apply to the GPU path; SUB (n_subsample) does.
+#
 # VMAF model selection: different models predict different assumed viewing conditions (the
 # default model predicts a 1080p TV at ~3x screen-height distance; vmaf_4k_v0.6.1 predicts a
 # 4K TV at ~1.5x screen-height) and their scores are NOT comparable to each other. Unless
@@ -83,6 +110,11 @@ WORK=${WORK:-./vmaf_compare_$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 4
 MODEL_OVERRIDE=${MODEL:-}
 MODEL_4K_MIN_WIDTH=${MODEL_4K_MIN_WIDTH:-3800}
 SIZE_SCOPE=${SIZE_SCOPE:-video}
+VMAF_CUDA=${VMAF_CUDA:-auto}
+FFMPEG_CUDA=${FFMPEG_CUDA:-/opt/ffmpeg-cuda/bin/ffmpeg}
+CUDA_FMT=${CUDA_FMT:-yuv444p16}
+CUDA_DEVICE=${CUDA_DEVICE:-0}
+CUDA_DECODE=${CUDA_DECODE:-1}
 
 FULL=0
 if [ "${1:-}" = "--full" ]; then FULL=1; shift; fi
@@ -117,6 +149,26 @@ fi
 command -v "$FFMPEG" >/dev/null 2>&1 || { echo "ffmpeg not found: $FFMPEG (set FFMPEG=/path/to/ffmpeg-with-libvmaf, or put one on \$PATH)"; exit 1; }
 "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q libvmaf || echo "WARNING: '$FFMPEG -filters' does not list libvmaf; scoring will likely fail."
 command -v python3 >/dev/null || { echo "python3 is required for the statistics"; exit 1; }
+# GPU scoring: auto (default) uses it whenever an ffmpeg with libvmaf_cuda is found (FFMPEG_CUDA,
+# else FFMPEG itself); 1 = required (warns if missing); 0 = always CPU.
+case "$VMAF_CUDA" in
+  0) ;;
+  1|auto)
+    case "$CUDA_FMT" in yuv444p16|yuv420p) ;; *) echo "CUDA_FMT must be yuv444p16 or yuv420p (got '$CUDA_FMT')"; exit 1 ;; esac
+    cuda_ff=""
+    for cand in "$FFMPEG_CUDA" "$FFMPEG"; do
+      if command -v "$cand" >/dev/null 2>&1 && "$cand" -hide_banner -filters 2>/dev/null | grep -q 'libvmaf_cuda'; then
+        cuda_ff="$cand"; break
+      fi
+    done
+    if [ -n "$cuda_ff" ]; then
+      FFMPEG_CUDA="$cuda_ff"; VMAF_CUDA=1
+    else
+      [ "$VMAF_CUDA" = "1" ] && echo "WARNING: VMAF_CUDA=1 but no ffmpeg with libvmaf_cuda was found ($FFMPEG_CUDA, $FFMPEG); scoring on the CPU instead."
+      VMAF_CUDA=0
+    fi ;;
+  *) echo "VMAF_CUDA must be auto, 1 or 0 (got '$VMAF_CUDA')"; exit 1 ;;
+esac
 
 TS="setpts=N/(${FPS})/TB"
 
@@ -127,6 +179,27 @@ dur() {
 }
 
 size_of() { "$FFMPEG" -hide_banner -i "$1" 2>&1 | grep -m1 'Video:' | grep -oE '[0-9]{3,5}x[0-9]{3,5}' | head -1; }
+vcodec_of() { "$FFMPEG" -hide_banner -i "$1" 2>&1 | grep -m1 'Video:' | sed -E 's/.*Video: ([a-z0-9]+).*/\1/'; }
+
+# gpu_crop_args "W:H[:X:Y]" <frame_w> <frame_h> <file>: NVDEC decoder options that crop the
+# file's frames to W:H at X:Y (centered if X:Y omitted), e.g. "-c:v h264_cuvid -crop 140x140x0x0"
+# (top x bottom x left x right). Prints nothing and fails if it can't (odd values, unknown codec).
+gpu_crop_args() {
+  local spec="${1%,}" fw="$2" fh="$3" f="$4" w h x y t b l r dec
+  IFS=: read -r w h x y <<< "$spec"
+  [ -z "${x:-}" ] && x=$(( (fw - w) / 2 ))
+  [ -z "${y:-}" ] && y=$(( (fh - h) / 2 ))
+  t=$y; b=$(( fh - h - y )); l=$x; r=$(( fw - w - x ))
+  for v in "$t" "$b" "$l" "$r"; do
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    [ $(( v % 2 )) -eq 0 ] || return 1
+  done
+  case "$(vcodec_of "$f")" in
+    h264) dec=h264_cuvid ;; hevc) dec=hevc_cuvid ;; vc1) dec=vc1_cuvid ;;
+    mpeg2video) dec=mpeg2_cuvid ;; av1) dec=av1_cuvid ;; vp9) dec=vp9_cuvid ;; *) return 1 ;;
+  esac
+  echo "-c:v $dec -crop ${t}x${b}x${l}x${r}"
+}
 
 # video_stream_bytes <file>: size in KiB of the file's first video stream only.
 #
@@ -158,18 +231,100 @@ video_stream_bytes() {
     | grep -oE 'video:[0-9]+ ?[kK]i?B' | tail -1 | grep -oE '[0-9]+'
 }
 
+# Where the video starts relative to the file's own start (what ffmpeg's -ss counts from), in
+# seconds. Usually 0; non-zero when another track starts first or a remux shifted the video.
+video_rel_start() {
+  local v f
+  v=$(ffprobe -v error -select_streams v:0 -show_entries stream=start_time -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
+  f=$(ffprobe -v error -show_entries format=start_time -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
+  awk -v v="$v" -v f="$f" 'BEGIN { if (v == "" || v == "N/A") v = 0; if (f == "" || f == "N/A") f = 0; printf "%.6f", v - f }'
+}
+
+# The -ss position for offset <off> in a file whose video starts <vrel> seconds in: half a frame
+# before the frame nearest <off>, counted from that file's first frame. Seeking by plain time
+# picks "the first frame at or after <off>", and when a frame sits within a few milliseconds of
+# <off>, two files whose timestamps differ by a few ms (a remux, rounding) start on different
+# frames, which looks like a one-frame shift at that offset only. Half a frame of margin
+# makes both start on the same frame. <off> 0 stays 0 (the very start).
+seek_pos() {
+  local vrel="$1" off="$2"
+  awk -v r="$vrel" -v o="$off" -v fps="$FPS" 'BEGIN {
+    n = split(fps, p, "/"); f = (n == 2 && p[2] + 0 > 0) ? p[1] / p[2] : p[1] + 0
+    if (o + 0 <= 0 || f <= 0) { print 0; exit }
+    k = int(o * f + 0.5); t = r + (k - 0.5) / f; if (t < 0) t = 0
+    printf "%.6f", t }'
+}
+
 # run_score <enc_trim> <ref_trim> <offset> <length> <subsample> [json_path]
 # Trim prefixes are filter fragments like "trim=start_frame=1," (or empty). Reads ORIG,
 # ENC, DSCALE, RCROP, MODEL, TS, THREADS from the caller's scope (score_pair's locals).
 run_score() {
   local dt="$1" rt="$2" off="$3" len="$4" sub="$5" json="${6:-}"
+  local fails=0 dfails=0
+  [ -s "$WORK/.cuda_fallbacks" ] && fails=$(wc -l < "$WORK/.cuda_fallbacks")
+  [ -s "$WORK/.gpudec_fallbacks" ] && dfails=$(wc -l < "$WORK/.gpudec_fallbacks")
+  # after 2 failures of a mode, the rest of this pair skips it
+  if [ "$VMAF_CUDA" = "1" ] && [ "$GPUDEC" = "1" ] && [ "$dfails" -lt 2 ]; then
+    run_score_gpudec "$@" && return 0
+    echo "NOTE: GPU decoding failed for this step; redoing it with CPU decoding." >&2
+    echo x >> "$WORK/.gpudec_fallbacks"
+    [ -n "$json" ] && rm -f "$json"
+  fi
+  if [ "$VMAF_CUDA" = "1" ] && [ "$fails" -lt 2 ]; then
+    run_score_cuda "$@" && return 0
+    echo "NOTE: GPU scoring (libvmaf_cuda) failed for this step; redoing it on the CPU." >&2
+    echo x >> "$WORK/.cuda_fallbacks"
+    [ -n "$json" ] && rm -f "$json"
+  fi
   local opts="n_subsample=${sub}:n_threads=${THREADS}:model=version=${MODEL}"
   [ -n "$json" ] && opts="${opts}:log_fmt=json:log_path=${json}"
-  "$FFMPEG" -hide_banner -nostats \
-    -ss "$off" -t "$len" -i "$ENC" \
-    -ss "$off" -t "$len" -i "$ORIG" -an -sn \
+  "$FFMPEG" -hide_banner -nostats -nostdin \
+    -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
+    -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
     -lavfi "[0:v:0]${dt}${DSCALE}${TS},format=yuv420p10le[d];[1:v:0]${rt}${RCROP}${TS},format=yuv420p10le[r];[d][r]libvmaf=${opts}" \
     -f null -
+}
+
+# Same comparison with the VMAF computed on the GPU. Everything up to the final pixel format
+# runs on the CPU exactly as in run_score; then both streams are uploaded to one CUDA device
+# (shared by both inputs, as libvmaf_cuda expects) and converted there if needed.
+run_score_cuda() {
+  local dt="$1" rt="$2" off="$3" len="$4" sub="$5" json="${6:-}"
+  local opts="n_subsample=${sub}:model=version=${MODEL}"
+  [ -n "$json" ] && opts="${opts}:log_fmt=json:log_path=${json}"
+  local up
+  if [ "$CUDA_FMT" = "yuv420p" ]; then
+    up="format=yuv420p,hwupload"
+  else
+    up="format=p010le,hwupload,scale_cuda=format=yuv444p16"
+  fi
+  "$FFMPEG_CUDA" -hide_banner -nostats -nostdin \
+    -init_hw_device "cuda=vmafgpu:${CUDA_DEVICE}" -filter_hw_device vmafgpu \
+    -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
+    -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
+    -lavfi "[0:v:0]${dt}${DSCALE}${TS},${up}[d];[1:v:0]${rt}${RCROP}${TS},${up}[r];[d][r]libvmaf_cuda=${opts}" \
+    -f null -
+  local rc=$?
+  [ $rc -eq 0 ] && [ -n "$json" ] && [ ! -s "$json" ] && rc=1
+  return $rc
+}
+
+# Everything on the GPU: NVDEC decodes both files (cropping in the decoder if needed), the
+# encode is scaled there if needed, frame pairing (trim/setpts) only touches timestamps, and
+# scale_cuda converts both to CUDA_FMT for libvmaf_cuda. Uses DGPU / RGPU (decoder options)
+# and DGPU_SCALE from score_pair.
+run_score_gpudec() {
+  local dt="$1" rt="$2" off="$3" len="$4" sub="$5" json="${6:-}"
+  local opts="n_subsample=${sub}:model=version=${MODEL}"
+  [ -n "$json" ] && opts="${opts}:log_fmt=json:log_path=${json}"
+  "$FFMPEG_CUDA" -hide_banner -nostats -nostdin \
+    "${DGPU[@]}" -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
+    "${RGPU[@]}" -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
+    -lavfi "[0:v:0]${dt}${DGPU_SCALE}${TS},scale_cuda=format=${CUDA_FMT}[d];[1:v:0]${rt}${TS},scale_cuda=format=${CUDA_FMT}[r];[d][r]libvmaf_cuda=${opts}" \
+    -f null -
+  local rc=$?
+  [ $rc -eq 0 ] && [ -n "$json" ] && [ ! -s "$json" ] && rc=1
+  return $rc
 }
 
 quick() {  # prints mean VMAF or nothing
@@ -240,12 +395,13 @@ summary_row() {
 # set) on both success and failure. Returns 0 on success, 1 if nothing could be scored.
 score_pair() {
   local ORIG="$1" ENC="$2"
-  local DO DE DIFF SO SE OW OH EW EH DSCALE RCROP MODEL
+  local DO DE DIFF SO SE OW OH EW EH DSCALE RCROP MODEL GPUDEC DGPU_SCALE GPUDEC_WHY ga
+  local DGPU=() RGPU=()
   local P10 P50 P90 S10 SC10 S50 SC50 S90 SC90 CHOSEN DT RT off
-  local JSONS PYOUT PLABEL PMEAN PP1 PMIN so se
+  local JSONS PYOUT PLABEL PMEAN PP1 PMIN so se ENC_VREL ORIG_VREL
 
   mkdir -p "$WORK"
-  rm -f "$WORK"/clip_*.json "$WORK/errors.log"
+  rm -f "$WORK"/clip_*.json "$WORK/errors.log" "$WORK/.cuda_fallbacks" "$WORK/.gpudec_fallbacks"
 
   DO=$(dur "$ORIG"); DE=$(dur "$ENC")
   if [ -z "$DO" ] || [ -z "$DE" ] || [ "$DO" -le 0 ] || [ "$DE" -le 0 ]; then
@@ -254,6 +410,7 @@ score_pair() {
     return 1
   fi
   DIFF=$(( DO > DE ? DO - DE : DE - DO ))
+  ENC_VREL=$(video_rel_start "$ENC"); ORIG_VREL=$(video_rel_start "$ORIG")
   echo "Original: $ORIG (${DO}s)"
   echo "Encode:   $ENC (${DE}s)"
   if [ "$DIFF" -gt 2 ]; then
@@ -316,6 +473,37 @@ score_pair() {
   if [ -n "${REF_CROP:-}" ]; then
     DSCALE=""; RCROP="crop=${REF_CROP},"
     echo "REF_CROP=${REF_CROP}: cropping the original at exactly that position."
+    local rcw rch
+    IFS=: read -r rcw rch _ <<< "$REF_CROP"
+    if [ -n "$SE" ] && [ "${rcw}x${rch}" != "$SE" ]; then
+      echo "ERROR: REF_CROP crops the original to ${rcw}x${rch}, but the encode is ${SE}. Use the crop"
+      echo "       this encode was made with (Width:Height:Left:Top, e.g. from its .crop.json)."
+      summary_row "$ORIG" "$MODEL" "FAILED" "-" "-"
+      return 1
+    fi
+  fi
+
+  # ---- GPU decoding plan: the same crop / scale, done by NVDEC and scale_cuda ----
+  GPUDEC=0; DGPU_SCALE=""; GPUDEC_WHY=""
+  if [ "$VMAF_CUDA" = "1" ] && [ "$CUDA_DECODE" = "1" ]; then
+    GPUDEC=1
+    DGPU=(-hwaccel cuda -hwaccel_output_format cuda); RGPU=(-hwaccel cuda -hwaccel_output_format cuda)
+    case "$DSCALE" in
+      scale=*) DGPU_SCALE="scale_cuda=w=${OW}:h=${OH}:interp_algo=bicubic," ;;
+      crop=*)  if ga=$(gpu_crop_args "${DSCALE#crop=}" "$EW" "$EH" "$ENC"); then DGPU+=($ga)
+               else GPUDEC=0; GPUDEC_WHY="the encode's crop (${DSCALE%,}) can't be done in the GPU decoder"; fi ;;
+    esac
+    case "$RCROP" in
+      crop=*)  if ga=$(gpu_crop_args "${RCROP#crop=}" "$OW" "$OH" "$ORIG"); then RGPU+=($ga)
+               else GPUDEC=0; GPUDEC_WHY="the original's crop (${RCROP%,}) can't be done in the GPU decoder"; fi ;;
+    esac
+  fi
+  if [ "$VMAF_CUDA" = "1" ] && [ "$GPUDEC" = "1" ]; then
+    echo "VMAF engine: libvmaf_cuda on GPU ${CUDA_DEVICE}, decoding on the GPU (frames as ${CUDA_FMT}, n_subsample=${SUB}) via ${FFMPEG_CUDA}"
+  elif [ "$VMAF_CUDA" = "1" ]; then
+    echo "VMAF engine: libvmaf_cuda on GPU ${CUDA_DEVICE}, decoding on the CPU$([ -n "$GPUDEC_WHY" ] && echo " because ${GPUDEC_WHY}") (frames as ${CUDA_FMT}, n_subsample=${SUB}) via ${FFMPEG_CUDA}"
+  else
+    echo "VMAF engine: libvmaf on the CPU (${THREADS} threads, n_subsample=${SUB})"
   fi
 
   local OFFS=()
@@ -396,6 +584,12 @@ EOF
 )
   echo "$PYOUT"
   echo "(model: ${MODEL} -- scores from different models are not directly comparable to each other)"
+  if [ -s "$WORK/.gpudec_fallbacks" ]; then
+    echo "NOTE: GPU decoding failed for $(wc -l < "$WORK/.gpudec_fallbacks") step(s), which were redone with CPU decoding (see the ffmpeg errors in $WORK/errors.log)."
+  fi
+  if [ -s "$WORK/.cuda_fallbacks" ]; then
+    echo "NOTE: GPU scoring failed for $(wc -l < "$WORK/.cuda_fallbacks") step(s), which were redone on the CPU (see the ffmpeg errors in $WORK/errors.log)."
+  fi
   read -r PLABEL PMEAN PP1 PMIN <<< "$(echo "$PYOUT" | grep -E '^[[:space:]]*pooled')"
 
   echo
