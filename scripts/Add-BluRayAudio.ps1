@@ -62,8 +62,11 @@
        Every compared track is listed in the summary with its result. The cutoffs and
        clip settings are at the top of the script, for tuning.
     5. Output track order: default track, then commentary (flagged as commentary),
-       then every master (main one first). Everything else is dropped. PCM masters
-       become FLAC (still lossless). Chapters come from the source MKV.
+       then every master (main one first). Everything else is dropped. PCM, FLAC and
+       ALAC masters (channel-based, no Atmos/DTS:X objects) are stored as Opus to save
+       space: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1 ($OpusKbps at the top).
+       TrueHD and DTS-HD MA masters are always copied unchanged. Chapters come from the
+       source MKV.
        Metadata comes from the file name, using Matroska's tag scheme: bracketed parts
        like " [tmdbid-1234]" are removed and trailing ".tag" parts become " [tag]".
          Episodes: "Show Name (2024) S01E04 Episode Title" -> title "Episode Title", show
@@ -205,6 +208,10 @@ $NarrationMaxQuieter  = 10    # ...if its quieter share stays below this (nothin
 $SameMixMaxPercent    = 3     # louder and quieter shares both below this: same mix
 $CommentaryCopyMaxPercent = 10  # lossless track vs a kept commentary, both below this: a copy of it
 $CoreMinKbps          = 448   # minimum bitrate for a TrueHD's AC-3 core
+# Opus bitrates (kbps) for channel-based lossless masters (PCM, FLAC, ALAC), which have no
+# object audio to preserve. Xiph's top recommendations x1.5 for headroom (as 128 -> 192
+# for stereo). libopus allows at most 256 kbps per channel.
+$OpusKbps = @{ 1 = 96; 2 = 192; 6 = 384; 8 = 672 }
 $CheckClipCount       = 5     # comparison clips per title, spread over 15-75% of the runtime
 $CheckClipSeconds     = 60    # longest clip length
 
@@ -255,6 +262,9 @@ function Get-FriendlyName([string]$CodecName, [string]$CodecProfile) {
         '^ac3$'    { return 'Dolby Digital' }
         '^eac3$'   { return 'Dolby Digital Plus' }
         '^flac$'   { return 'FLAC' }
+        '^alac$'   { return 'ALAC' }
+        '^mlp$'    { return 'Meridian Lossless Packing' }
+        '^opus$'   { return 'Opus' }
         '^aac$'    { return 'AAC' }
         '^pcm_'    { return 'PCM' }
     }
@@ -368,6 +378,12 @@ function Get-TrackDesc($Track) {
     if ($Track.BitRate -gt 0) { $desc += ", $([math]::Round($Track.BitRate / 1000)) kbps" }
     if ($Track.Title) { $desc += ", '$($Track.Title)'" }
     return $desc
+}
+
+# Opus bitrate for a channel count: the table above, else 64 kbps per channel.
+function Get-OpusKbps([int]$Channels) {
+    if ($OpusKbps.ContainsKey($Channels)) { return $OpusKbps[$Channels] }
+    return [Math]::Min(256 * $Channels, 64 * [Math]::Max(1, $Channels))
 }
 
 function New-Result([string]$Status, [string]$Message) {
@@ -932,9 +948,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $outputs.Add($track)
     }
     foreach ($m in $keep) {
-        if ($m.Codec -like 'pcm_*') {
-            $outputs.Add((New-OutputTrack 'encode' $m.Pos 'flac' 0 0 "FLAC $(Get-ChannelLabel $m.Channels)" `
-                "audio $($m.Pos): PCM converted to FLAC (lossless)" "flac $($m.Channels)"))
+        if ($m.Codec -match '^(pcm_.*|flac|alac)$') {
+            # Channel-based lossless (no Atmos/DTS:X objects to keep for a future format):
+            # stored as high-bitrate Opus to save space.
+            $ok = Get-OpusKbps $m.Channels
+            $outputs.Add((New-OutputTrack 'encode' $m.Pos 'libopus' $ok 0 "Opus $(Get-ChannelLabel $m.Channels)" `
+                "audio $($m.Pos): $($m.Name) encoded to Opus at $ok kbps" "opus $($m.Channels)"))
         } else {
             $note = "audio $($m.Pos): copied"
             if (-not $m.Lossless) { $note = "audio $($m.Pos): copied (original lossy track; the default track is a converted copy)" }
