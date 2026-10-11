@@ -1019,20 +1019,31 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 
     # ------------------------------------------------ build the commands
     $tempDir = [IO.Path]::GetTempPath()
+    # All new tracks come from ONE ffmpeg run with one output per track, so the source
+    # (often on the NAS) is read once, however many tracks are encoded.
     $encodeCmds = [Collections.Generic.List[object]]::new()
+    $enc = [Collections.Generic.List[string]]::new()
+    # -copyts keeps the source track's start time, so a track that starts late stays in sync.
+    $enc.AddRange([string[]]@('-hide_banner', '-v', 'warning', '-stats', '-nostdin', '-copyts', '-i', $SourceFile))
     foreach ($o in $outputs) {
         if ($o.From -ne 'encode') { continue }
         $o.TempFile = Join-Path $tempDir ('abr-' + [guid]::NewGuid().ToString('N') + '.mka')
-        # -copyts keeps the source track's start time, so a track that starts late stays in sync.
-        $enc = [Collections.Generic.List[string]]::new()
-        $enc.AddRange([string[]]@('-hide_banner', '-v', 'warning', '-stats', '-nostdin', '-copyts',
-            '-i', $SourceFile, '-map', "0:a:$($o.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
+        $enc.AddRange([string[]]@('-map', "0:a:$($o.SrcPos)", '-map_metadata', '-1', '-map_chapters', '-1',
             '-c:a', $o.Codec))
         if ($o.Kbps -gt 0) { $enc.AddRange([string[]]@('-b:a', "$($o.Kbps)k")) }
         if ($o.Ac -gt 0) { $enc.AddRange([string[]]@('-ac', "$($o.Ac)")) }
+        if ($o.Codec -eq 'libopus') {
+            # Opus surround only accepts the standard layouts, but Blu-ray audio is often
+            # labelled "5.1(side)". channelmap relabels the same channels in the same order
+            # (no remixing), and -mapping_family 1 selects Opus's surround mode.
+            $srcCh = $audio[$o.SrcPos].Channels
+            if ($srcCh -eq 6) { $enc.AddRange([string[]]@('-af', 'channelmap=channel_layout=5.1')) }
+            elseif ($srcCh -eq 8) { $enc.AddRange([string[]]@('-af', 'channelmap=channel_layout=7.1')) }
+            if ($srcCh -gt 2) { $enc.AddRange([string[]]@('-mapping_family', '1')) }
+        }
         $enc.AddRange([string[]]@('-f', 'matroska', '-y', $o.TempFile))
-        $encodeCmds.Add($enc.ToArray())
     }
+    if (@($outputs | Where-Object { $_.From -eq 'encode' }).Count -gt 0) { $encodeCmds.Add($enc.ToArray()) }
 
     # mkvmerge inputs: file 0 = encoded video, file 1 = source MKV (copied audio + chapters),
     # files 2+ = the temp encodes. --track-order puts everything in the planned order.
