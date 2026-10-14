@@ -10,10 +10,15 @@
 
       Dest\<same sub-folders>\
           <name>.mkv                   the finished encode, with audio (ladder mode, see below)
-          <name>.mks                   subtitle backup from Add-BluRayAudio, until the folder is done
+          <name>.en.srt                its subtitles (Convert-Subtitles): main, and if found
+          <name>.en.forced.default.srt   forced (always marked default) and
+          <name>.en.Commentary.srt       commentary ("<name>.en.Commentary 2.srt", ...)
+          <name>.mks                   every source subtitle track, unchanged (backup), until the folder is done
           <folder> - subtitles.zip     all of the folder's subtitle backups, once every title in it is done
+          _subtitles review\<name>\    every English track's .srt, when the subtitles need your review
           <name>.encode.log            everything that happened to this title, every run
           <name>.audio.log             Add-BluRayAudio's own log (every detail of the audio step)
+          <name>.subtitles.log         Convert-Subtitles' own log (tracks, OCR, which track is which)
           <name>.crop.json             CropDetect's result (delete it to redo the crop)
           <name>.results.json          machine-readable variant results
           <name>.final.json            what was kept, and the finishing progress
@@ -31,9 +36,12 @@
           <name> - p8.1.mkv            converted Dolby Vision 7 copy, until the title is finished
           <name> - 1080p ref.mkv       near-lossless 1080p SDR reference for a 1080p copy, until it's finished
 
-      Dest\_encode-batch_<timestamp>.log / .md          this run's log and summary (what it touched)
-      Dest\_encode-batch_all.md / .csv                  every title under -Source, from all runs; only
-                                                       written once the whole batch is complete
+      Dest\_encode-batch_<timestamp>.log                the whole run's log (every folder)
+      <each folder with titles>\                         (a season, a movie and its editions)
+          _encode-batch_<timestamp>.log                this run's log lines for that folder
+                                                       (only folders where something happened)
+          _encode-batch_all.md / .csv                  every title in that folder, from all runs; written
+                                                       once every title in the folder is settled
 
     Two modes:
       Ladder (default): -Ladder is a list of rungs, weakest/smallest first (cqp28 aq8 ... cqp20
@@ -69,15 +77,16 @@
         In fixed mode, a pick under -TargetPct gets the note "try a lower CQP / more AQ".
 
     Finishing a title (ladder mode, when a variant is suggested), one title at a time:
-      1. Add-BluRayAudio -Source <source MKV> -Dest <suggested variant> -Replace adds the audio
-         (and writes its subtitle backup, <name>.mks). It runs with -Plumbing: its details go
-         to <name>.audio.log, and what it reports back (the audio tracks and their roles, the
-         dropped tracks and why, any sync shift, the subtitle backup, warnings) goes into
-         final.json, the title's .encode.log and the reports. Warnings include "SUBTITLES TO
-         FIX" when the audio had to be shifted (OCR'd subtitles need the same shift).
-      2. The suggested MKV moves up to Dest\<same sub-folders>\<name>.mkv, and the subtitle backup
-         to <name>.mks next to it.
-      3. This title's other variants (and their VMAF files) are deleted. Variant folders left
+      1. Add-BluRayAudio -Source <source MKV> -Dest <suggested variant> -Replace adds the audio.
+         It runs with -Plumbing: its details go to <name>.audio.log, and what it reports back
+         (the audio tracks and their roles, the dropped tracks and why, any sync shift, warnings)
+         goes into final.json, the title's .encode.log and the reports.
+      2. Convert-Subtitles -Source <source MKV> -Dest <its folder> -Basename <final name> -OffsetMs <the audio's sync shift>
+         backs up every subtitle track to <name>.mks and makes the .srt files (see "Subtitles").
+         Its details go to <name>.subtitles.log; what it reports goes into final.json and the
+         reports. If it fails, the title is still finished (listed under "SUBTITLES TO REVIEW").
+      3. The suggested MKV moves up to Dest\<same sub-folders>\<name>.mkv.
+      4. This title's other variants (and their VMAF files) are deleted. Variant folders left
          empty are removed once every title in the folder is done.
       When every title in a folder (e.g. a season) is done, its <name>.mks files are bundled into
       "<folder> - subtitles.zip" there (stored, not compressed; added to it if it exists), so
@@ -89,8 +98,21 @@
       to finish those titles with their source instead (the local copy, or a fresh copy of the
       source, goes through the same steps, and the failed encodes are deleted). For Dolby
       Vision 7 titles the converted "<name> - p8.1.mkv" is used. A Dolby Vision 7 title's
-      p8.1 copy is deleted once it's finished. -NoAudio / -KeepVariants skip steps 1 / 3.
-      Fixed mode (-Variants) never does any of this.
+      p8.1 copy is deleted once it's finished. -NoAudio / -NoSubtitles / -KeepVariants skip
+      steps 1 / 2 / 4. Fixed mode (-Variants) never does any of this.
+
+    Subtitles (Convert-Subtitles, from the same local copy the audio is read from): each English
+    subtitle track is OCR'd by Subtitle Edit's command line (seconv, PaddleOCR, your fix and
+    replace rules), then sorted out: Default / Forced flags are trusted when set; otherwise a
+    much shorter track is the forced one, tracks with the same text (e.g. SDH) are duplicates
+    (the earliest kept), and of the tracks with different text the main one is the one that
+    holds the forced lines, else the earliest (commentary is usually longer). The others are
+    commentary. Every cue is shifted by the audio's sync shift, so they match the encode. When
+    it can't tell, the best guess is written anyway, every track's .srt goes to
+    "_subtitles review\<name>\", and the title is listed under "SUBTITLES TO REVIEW" at the top
+    of the folder's _encode-batch_all.md (and in the run log). Each finished file gets its own
+    subtitles, shifted by its own audio shift (a Dolby Vision 7 title and its 1080p copy are
+    both OCR'd from their shared source).
 
     Work is a queue, not one thread per title:
       - Prep (one title at a time, no encoder slot used): probe with ffprobe (and mediainfo when
@@ -134,7 +156,7 @@
         peak: converted to 8.1 anyway; the highlights above the base layer's peak are clipped.
         Logged ("DOVI ..."), and noted in the reports.
       - Anything else (Complex FEL beyond that, NO L1 METADATA): kept as profile 7. The untouched
-        copy gets the audio (and subtitle backup) only and becomes "<name> - 2160p.mkv"; a second
+        copy gets the audio (and subtitles) only and becomes "<name> - 2160p.mkv"; a second
         title "<name> - 1080p" is added: a near-lossless 1080p SDR reference is made from the
         profile 7 video (cropped, tone-mapped, scaled to fit 1920x1080, in -WorkDir) and searched
         and finished like any title, ending as "<name> - 1080p.mkv". Logged ("KEEP P7 ..."), and
@@ -239,8 +261,17 @@ param(
     [switch]$NoAudio,
     [switch]$KeepVariants,
 
+    # ...then .srt subtitles with Convert-Subtitles (OCR of the English tracks with seconv and
+    # PaddleOCR, shifted like the audio; see "Subtitles"). -NoSubtitles skips it. -SeConv and
+    # -SubtitleRules are passed on to it ('' = its defaults: $HOME\Documents\SeConv-Windows-x64\seconv.exe
+    # and $HOME\Documents\SE_Replace_Rules.template).
+    [string]$ConvertSubtitles = (Join-Path $PSScriptRoot 'Convert-Subtitles.ps1'),
+    [switch]$NoSubtitles,
+    [string]$SeConv = '',
+    [string]$SubtitleRules = '',
+
     # Ladder mode: a title where no variant passes is finished with its SOURCE instead (copied
-    # into place, then audio, subtitle backup, move up, failed encodes deleted), rather than left
+    # into place, then audio, subtitles, move up, failed encodes deleted), rather than left
     # for review. Off by default: review the failures first, then re-run with this.
     [switch]$UseSourceFallback,
 
@@ -276,6 +307,17 @@ param(
 $ErrorActionPreference = 'Stop'
 $started = Get-Date
 $runId = $started.ToString('yyyyMMdd_HHmmss')
+
+# Programs started from here (ffprobe, wsl, NVEncC, ...) run in PowerShell's current folder; if that
+# folder no longer exists (e.g. deleted after an earlier run) Windows refuses with "The directory
+# name is invalid". Work from the temp folder in that case (your location is restored at the end).
+$script:PushedLocation = $false
+$cwdNow = ''; try { $cwdNow = (Get-Location).ProviderPath } catch { }
+if (-not $cwdNow -or -not [IO.Directory]::Exists($cwdNow)) {
+    Push-Location -LiteralPath ([IO.Path]::GetTempPath())
+    $script:PushedLocation = $true
+    Write-Host "Note: the current folder '$cwdNow' doesn't exist any more; working from $([IO.Path]::GetTempPath()) instead." -ForegroundColor Yellow
+}
 
 # =====================================================================================
 # Helpers shared by the orchestrator and the worker jobs (jobs are separate processes,
@@ -404,8 +446,14 @@ $Helpers = {
         $id = [guid]::NewGuid().ToString('N')
         $outFile = Join-Path $TempDir "$id.out"
         $errFile = Join-Path $TempDir "$id.err"
-        $p = Start-Process -FilePath $Exe -ArgumentList $argStr -NoNewWindow -PassThru `
-            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        # Input is an empty file: a program that inherited this background job's input could wait
+        # on it forever (seconv, under Convert-Subtitles, did).
+        $inFile = Join-Path $TempDir "$id.in"
+        [IO.File]::WriteAllText($inFile, '')
+        # Started in the temp folder: Start-Process otherwise uses PowerShell's current folder, and
+        # fails with "The directory name is invalid" if that folder no longer exists.
+        $p = Start-Process -FilePath $Exe -ArgumentList $argStr -NoNewWindow -PassThru -WorkingDirectory $TempDir `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile -RedirectStandardInput $inFile
         $null = $p.Handle   # keeps ExitCode available after exit (Windows PowerShell quirk)
         $st = @{} + $StatusBase; $st.Pid = $p.Id; $st.Exe = [IO.Path]::GetFileNameWithoutExtension($Exe)
         Set-Status $st
@@ -463,7 +511,7 @@ $Helpers = {
         & $drain $false
         & $drain $true
         foreach ($s in $streams) { if ($s.Reader) { $s.Reader.Dispose() } }
-        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outFile, $errFile, $inFile -Force -ErrorAction SilentlyContinue
         if (-not $Quiet) { Write-Log "  exit code $($p.ExitCode)" }
         [pscustomobject]@{ ExitCode = $p.ExitCode; Lines = $lines.ToArray() }
     }
@@ -514,6 +562,38 @@ eb_ensure_visible() {
     }
 
     # ffprobe (+ mediainfo when available) summary of the first video stream.
+    # Frames shown before a file's first keyframe (from its first 300 packets): a source cut
+    # mid-sequence (e.g. an episode taken out of one long stream on the disc) starts with frames
+    # that need the previous scene to decode. Decoders, and so the encoder, throw them away, so
+    # the encode starts that much later in the source's picture. Returns Frames and Seconds.
+    function Get-LeadingFrames {
+        param([string]$Path)
+        $res = [pscustomobject]@{ Frames = 0; Seconds = 0.0 }
+        try {
+            $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            $rate = "$(& ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 $Path 2>$null)".Trim()
+            $rows = @(& ffprobe -v error -select_streams v:0 -read_intervals '%+#300' -show_entries packet=pts_time,flags -of csv=p=0 $Path 2>$null)
+            $ErrorActionPreference = $eap
+            $fd = 1001.0 / 24000
+            if ($rate -match '^(\d+)/(\d+)$' -and [double]$Matches[1] -gt 0) { $fd = [double]$Matches[2] / [double]$Matches[1] }
+            $inv = [Globalization.CultureInfo]::InvariantCulture
+            $pts = New-Object System.Collections.Generic.List[double]
+            $k = -1; $kp = 0.0
+            foreach ($r in $rows) {
+                $p = "$r".Split(',')
+                $t = 0.0
+                if ($p.Count -lt 2 -or -not [double]::TryParse($p[0], [Globalization.NumberStyles]::Float, $inv, [ref]$t)) { continue }
+                $pts.Add($t)
+                if ($k -lt 0 -and $p[1].Contains('K')) { $k = $pts.Count - 1; $kp = $t }
+            }
+            if ($k -gt 0) {
+                $n = @($pts | Where-Object { $_ -lt $kp - $fd / 4 }).Count
+                $res.Frames = $n; $res.Seconds = [Math]::Round($n * $fd, 3)
+            }
+        } catch { }
+        $res
+    }
+
     function Get-SourceInfo {
         param([string]$Path)
         $ErrorActionPreference = 'Continue'
@@ -643,7 +723,7 @@ eb_ensure_visible() {
 
     function Read-VmafResult {
         param([string[]]$Lines)
-        $r = [ordered]@{ Mean = $null; P1 = $null; Min = $null; VideoGB = $null; SourceGB = $null; Pct = $null; Mbps = $null; Model = ''; Warning = $false }
+        $r = [ordered]@{ Mean = $null; P1 = $null; Min = $null; VideoGB = $null; SourceGB = $null; Pct = $null; Mbps = $null; Model = ''; Warning = $false; StartFrame = $null }
         foreach ($l in $Lines) {
             if ($l -match '^\s*pooled\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)') {
                 $r.Mean = [double]$Matches[1]; $r.P1 = [double]$Matches[2]; $r.Min = [double]$Matches[3]
@@ -653,7 +733,9 @@ eb_ensure_visible() {
                 if ($r.SourceGB -gt 0) { $r.Pct = [Math]::Round($r.VideoGB / $r.SourceGB * 100, 1) }
             } elseif ($l -match '^VMAF model: (\S+)') {
                 $r.Model = $Matches[1]
-            } elseif ($l -match 'WARNING: (alignment differs|no shift|durations differ)') {
+            } elseif ($l -match "^Start: the encode's first frame is the original's frame (-?\d+)") {
+                $r.StartFrame = [int]$Matches[1]
+            } elseif ($l -match 'WARNING: (alignment differs|no shift|durations differ|the best shift .* search limit)') {
                 $r.Warning = $true
             }
         }
@@ -952,6 +1034,10 @@ $PrepBody = {
         Write-Log "Encode-Batch run $($Cfg.RunId): $($Cfg.SourceFile)"
         Write-Log ("Source: {0} {1}x{2} {3} fps, {4}, HDR={5}, Dolby Vision={6}" -f $Cfg.Info.Codec, $Cfg.Info.Width, $Cfg.Info.Height, $Cfg.Info.Fps, [TimeSpan]::FromSeconds([int]$Cfg.Info.Duration), $Cfg.Info.Hdr, $Cfg.Info.Dv)
         Write-Log "  ($($Cfg.Info.DvDetail))"
+        $lead = Get-LeadingFrames $Cfg.SourceFile
+        if ($lead.Frames -gt 0) {
+            Write-Log ("  Starts mid-sequence: {0} frame(s) ({1} s) before its first keyframe can't be decoded, so the encodes start that much later in the picture. Expected; the audio step puts the picture back in place (video delayed), and VMAF lines up from the first decodable frame." -f $lead.Frames, $lead.Seconds)
+        }
         if ($Cfg.Info.Hdr) { Write-Log ("  HDR: {0}  master-display {1}  max-cll {2}  HDR10+ {3}" -f (@($Cfg.Info.ColorArgs) -join ' '), $(if ($Cfg.Info.MasterDisplay) { $Cfg.Info.MasterDisplay } else { 'none' }), $(if ($Cfg.Info.MaxCll) { $Cfg.Info.MaxCll } else { 'none' }), $Cfg.Info.Hdr10Plus) }
 
         if ($Cfg.PSObject.Properties['Derived'] -and $Cfg.Derived) { return (Invoke-DerivedPrep) }
@@ -1188,6 +1274,7 @@ $VariantCommon = {
         Name = $v.Name; Status = 'Failed'; Error = ''; File = $final; EncodeSec = $null
         Mean = $null; P1 = $null; Min = $null; VideoGB = $null; Pct = $null; Mbps = $null
         Model = ''; Warning = $false; Pass = $false; OverCap = $false; Dominated = $false; Suggested = $false; Hint = ''
+        StartFrame = $null
     }
 }
 
@@ -1276,7 +1363,7 @@ $VmafBody = {
             if ($r.ExitCode -ne 0) { $row.Error = "compare_encode exit $($r.ExitCode)" }
         }
         $vm = Read-VmafResult $lines
-        foreach ($k in 'Mean', 'P1', 'Min', 'VideoGB', 'Pct', 'Mbps', 'Model', 'Warning') { $row.$k = $vm.$k }
+        foreach ($k in 'Mean', 'P1', 'Min', 'VideoGB', 'Pct', 'Mbps', 'Model', 'Warning', 'StartFrame') { $row | Add-Member -NotePropertyName $k -NotePropertyValue $vm.$k -Force }
         if ($null -eq $row.Mean) {
             if (-not $row.Error) { $row.Error = 'no VMAF score in output' }
             Write-Log "VMAF FAILED: $($row.Error)"
@@ -1301,10 +1388,18 @@ $FinalizeBody = {
     $script:LogPrefix = '[finish] '
     $status = @{ Step = 'finishing'; Variant = $Cfg.Doc.Variant; Index = 0; Count = 0 }
     $doc = $Cfg.Doc
-    $res = [ordered]@{ Status = 'Failed'; Error = ''; Final = $doc.Final; FreedGB = 0; Deleted = 0; Audio = ''; AudioWarnings = @() }
+    $res = [ordered]@{ Status = 'Failed'; Error = ''; Final = $doc.Final; FreedGB = 0; Deleted = 0; Audio = ''; AudioWarnings = @(); Subtitles = ''; SubtitlesReview = $false }
     function Save-Doc([string]$state) {
         $doc.State = $state
         [IO.File]::WriteAllText($Cfg.FinalJson, ($doc | ConvertTo-Json -Depth 6), $script:Utf8)
+    }
+    # Audio and subtitles come from a local copy when there is one (the source's local copy, or a
+    # Dolby Vision title's converted 8.1 / untouched 7 copy, which keep every audio and subtitle
+    # track); the NAS source otherwise.
+    function Get-ReadSource {
+        if ($doc.LocalCopy -and [IO.File]::Exists($doc.LocalCopy)) { return $doc.LocalCopy }
+        if ($doc.PSObject.Properties['AudioSource'] -and $doc.AudioSource -and [IO.File]::Exists($doc.AudioSource)) { return $doc.AudioSource }
+        return $doc.Source
     }
     function Invoke-Finalize {
       try {
@@ -1340,18 +1435,22 @@ $FinalizeBody = {
         if (-not $Cfg.NoAudio -and -not $doc.AudioDone) {
             if (-not [IO.File]::Exists($winner)) { $res.Error = "suggested encode not found: $winner"; Write-Log "FINISH FAILED: $($res.Error)"; return }
             $status.Step = 'adding audio (Add-BluRayAudio)'; Set-Status $status
-            # Audio and subtitles come from a local copy when there is one (the source's local copy, or a
-            # Dolby Vision title's converted 8.1 copy, which keeps every audio and subtitle track);
-            # the NAS source otherwise.
-            $audioSrc = $doc.Source
-            if ($doc.LocalCopy -and [IO.File]::Exists($doc.LocalCopy)) { $audioSrc = $doc.LocalCopy }
-            elseif ($doc.PSObject.Properties['AudioSource'] -and $doc.AudioSource -and [IO.File]::Exists($doc.AudioSource)) { $audioSrc = $doc.AudioSource }
+            $audioSrc = Get-ReadSource
+            # Where the encode starts in the source, as compare_encode measured it (when the VMAF
+            # reference is the audio source: not for a 1080p copy, scored against its reference).
+            $startArgs = @()
+            if (-not ($doc.PSObject.Properties['FromSource'] -and $doc.FromSource) -and -not $Cfg.IsDerived) {
+                $wrow = @($doc.Variants | Where-Object { $_ -and $_.Name -eq $doc.Variant } | Select-Object -First 1)
+                if ($wrow.Count -and $wrow[0].PSObject.Properties['StartFrame'] -and $null -ne $wrow[0].StartFrame -and [int]$wrow[0].StartFrame -ge 0) {
+                    $startArgs = @('-SourceStartFrames', "$([int]$wrow[0].StartFrame)")
+                }
+            }
             # -Plumbing: its details go to <name>.audio.log, and it reports back one line of JSON
-            # (tracks, what was dropped, sync shift, subtitle backup, warnings), kept in final.json.
+            # (tracks, what was dropped, sync shift, warnings), kept in final.json.
             $audioLog = Join-Path $titleDir "$base.audio.log"
             $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Cfg.AddAudio, '-Source', $audioSrc, '-Dest', $winner, '-Replace',
-                   '-LogPath', $audioLog, '-Plumbing')
-            Write-Log "> Add-BluRayAudio -Source `"$audioSrc`" -Dest `"$winner`" -Replace -LogPath `"$audioLog`" -Plumbing"
+                   '-LogPath', $audioLog, '-Plumbing') + $startArgs
+            Write-Log "> Add-BluRayAudio -Source `"$audioSrc`" -Dest `"$winner`" -Replace -LogPath `"$audioLog`" -Plumbing $($startArgs -join ' ')"
             $r = Invoke-Logged -Exe $Cfg.Exe -ArgList $a -TempDir $tmp -StatusBase $status -ProgressPattern '^\x00$' -Quiet
             $info = $null
             foreach ($l in $r.Lines) {
@@ -1362,7 +1461,6 @@ $FinalizeBody = {
             if ($r.ExitCode -ne 0) {
                 $why = "exit $($r.ExitCode)"
                 if ($info -and $info.Status -eq 'Failed') { $why = $info.Message }
-                elseif ($info -and $info.Subtitles -and $info.Subtitles.Error) { $why = "subtitle backup: $($info.Subtitles.Error)" }
                 $res.Error = "Add-BluRayAudio failed: $why (see $audioLog)"
                 Write-Log "FINISH FAILED: $($res.Error); nothing moved or deleted"
                 if ($info) { Save-Doc $doc.State }
@@ -1373,8 +1471,10 @@ $FinalizeBody = {
             if ($info) {
                 Write-Log "Audio ($($info.Status)): $($info.Summary)"
                 foreach ($d in @($info.Dropped)) { if ($d) { Write-Log "  dropped: audio $($d.SourceTrack) $($d.Name)$(if ($d.Title) { " '$($d.Title)'" }) - $($d.Reason)" } }
-                if ($info.Subtitles -and $info.Subtitles.File) { Write-Log "  subtitle backup: $($info.Subtitles.File), $($info.Subtitles.Tracks) track(s)" }
-                foreach ($w in @($info.Warnings)) { if ($w) { Write-Log "  WARNING: $w" } }
+                foreach ($w in @($info.Warnings)) { if ($w -and $w -notlike 'SUBTITLES TO FIX:*') { Write-Log "  WARNING: $w" } }
+                if ($info.PSObject.Properties['VideoDelayMs'] -and $info.VideoDelayMs) { Write-Log "  the encode's picture was $($info.VideoDelayMs) ms early ($($info.DroppedFrames) undecodable frame(s) at the source's start); video delayed to match, audio and subtitles untouched" }
+                elseif ($info.PSObject.Properties['AudioShiftMs'] -and $info.AudioShiftMs) { Write-Log "  audio delayed $($info.AudioShiftMs) ms to match the encode (the subtitles get the same shift)" }
+                elseif (-not $info.PSObject.Properties['AudioShiftMs'] -and $info.SyncMs) { Write-Log "  audio shifted $($info.SyncMs) ms to match the encode (the subtitles get the same shift)" }
             } else {
                 Write-Log "Audio added: $n track(s) (no details reported; see $audioLog)"
             }
@@ -1385,7 +1485,57 @@ $FinalizeBody = {
             $res.Audio = [string]$doc.Audio.Summary
             $res.AudioWarnings = @($doc.Audio.Warnings | Where-Object { $_ })
         }
-        # Move up to the mirrored folder (with the subtitle backup).
+        # Subtitles: .srt files next to where the video goes, shifted like the audio (Convert-Subtitles).
+        # Every finished file gets its own (a Dolby Vision 7 title and its 1080p copy are each
+        # OCR'd from their shared source, each shifted by its own audio shift).
+        if (-not $Cfg.NoSubtitles -and -not ($doc.PSObject.Properties['SubsDone'] -and $doc.SubsDone)) {
+            $status.Step = 'subtitles (Convert-Subtitles)'; Set-Status $status
+            $offset = 0
+            # The shift the AUDIO got (subtitles follow the audio). A video delay needs none.
+            if ($doc.PSObject.Properties['Audio'] -and $doc.Audio) {
+                if ($doc.Audio.PSObject.Properties['SubtitleShiftMs']) { $offset = [int]$doc.Audio.SubtitleShiftMs }
+                elseif ($doc.Audio.PSObject.Properties['SyncMs'] -and $doc.Audio.SyncMs) { $offset = [int]$doc.Audio.SyncMs }
+            }
+            $subLog = Join-Path $titleDir "$base.subtitles.log"
+            $subSrc = Get-ReadSource
+            $subDir = [IO.Path]::GetDirectoryName($doc.Final)
+            $subBase = [IO.Path]::GetFileNameWithoutExtension($doc.Final)
+            $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Cfg.ConvertSubs, '-Source', $subSrc, '-Dest', $subDir, '-Basename', $subBase,
+                   '-OffsetMs', "$offset", '-LogPath', $subLog, '-Plumbing', '-WorkDir', $tmp)
+            if ($Cfg.SeConv) { $a += @('-SeConv', $Cfg.SeConv) }
+            if ($Cfg.SubRules) { $a += @('-ReplaceRules', $Cfg.SubRules) }
+            Write-Log "> Convert-Subtitles -Source `"$subSrc`" -Dest `"$subDir`" -Basename `"$subBase`" -OffsetMs $offset -LogPath `"$subLog`" -Plumbing"
+            $r = Invoke-Logged -Exe $Cfg.Exe -ArgList $a -TempDir $tmp -StatusBase $status -ProgressPattern '^\x00$' -Quiet
+            $sub = $null
+            foreach ($l in $r.Lines) {
+                if ($l.TrimStart().StartsWith('{')) { try { $sub = $l | ConvertFrom-Json } catch { Write-LogRaw "    $l" } }
+                else { Write-LogRaw "    $l" }
+            }
+            if ($r.ExitCode -ne 0 -or -not $sub -or $sub.Status -eq 'Failed') {
+                # The finish goes on (the video and audio are fine); the title is listed under
+                # "Subtitles to review". The .mks backup (if it got that far) or the source can be
+                # run through Convert-Subtitles by hand.
+                $why = $(if ($sub -and $sub.Message) { $sub.Message } else { "exit $($r.ExitCode)" })
+                if (-not $sub) { $sub = [pscustomobject]@{ Status = 'Failed'; Message = $why; OffsetMs = $offset; Outputs = @(); Tracks = @(); Review = $true; ReviewReason = ''; ReviewDir = ''; Warnings = @(); BackupMks = '' } }
+                $sub.Status = 'Failed'; $sub.Review = $true
+                $sub.ReviewReason = "Convert-Subtitles failed: $why (see $([IO.Path]::GetFileName($subLog)))"
+                Write-Log "SUBTITLES FAILED: $why (see $subLog); finishing without them"
+            }
+            $doc | Add-Member -NotePropertyName Subtitles -NotePropertyValue $sub -Force
+            $outs = @($sub.Outputs | Where-Object { $_ } | ForEach-Object { "$($_.Role) ($(if ($_.Track -ge 0) { "track $($_.Track), " })$($_.Cues) cues)" })
+            Write-Log ("Subtitles ({0}): {1}{2}" -f $sub.Status, $(if ($outs) { $outs -join ', ' } else { $sub.Message }),
+                $(if ($offset) { ", shifted $offset ms" }))
+            foreach ($st in @($sub.Tracks)) { if ($st -and $st.Role -notin 'main', 'forced', 'commentary') { Write-Log "  track $($st.Id)$(if ($st.Name) { " '$($st.Name)'" }) $($st.Language): $($st.Role) - $($st.Reason)" } }
+            foreach ($w in @($sub.Warnings)) { if ($w) { Write-Log "  WARNING: $w" } }
+            if ($sub.Review) { Write-Log "  SUBTITLES TO REVIEW: $($sub.ReviewReason)$(if ($sub.ReviewDir) { " (every track: $($sub.ReviewDir))" })" }
+            $doc | Add-Member -NotePropertyName SubsDone -NotePropertyValue $true -Force
+            Save-Doc 'subtitles added'
+        }
+        if ($doc.PSObject.Properties['Subtitles'] -and $doc.Subtitles) {
+            $res.Subtitles = [string]$doc.Subtitles.Status
+            $res.SubtitlesReview = [bool]$doc.Subtitles.Review
+        }
+        # Move up to the mirrored folder.
         $status.Step = 'moving into place'; Set-Status $status
         if ([IO.File]::Exists($winner)) {
             if ([IO.File]::Exists($doc.Final)) { $res.Error = "$($doc.Final) already exists; not overwriting it"; Write-Log "FINISH FAILED: $($res.Error)"; return }
@@ -1399,9 +1549,6 @@ $FinalizeBody = {
         } elseif (-not [IO.File]::Exists($doc.Final)) {
             $res.Error = "neither $winner nor $($doc.Final) exists"; Write-Log "FINISH FAILED: $($res.Error)"; return
         }
-        $subName = [IO.Path]::GetFileNameWithoutExtension($winner) + '.mks'   # Add-BluRayAudio's subtitle backup
-        $subs = Join-Path $winnerDir $subName
-        if ([IO.File]::Exists($subs)) { Move-Item -LiteralPath $subs -Destination (Join-Path $titleDir $subName) -Force -ErrorAction Stop }
         Save-Doc 'moved'
         if ([IO.Path]::GetFileName($winnerDir) -eq '_2160p' -and [IO.Directory]::Exists($winnerDir) -and -not @([IO.Directory]::GetFileSystemEntries($winnerDir)).Count) {
             Remove-Item -LiteralPath $winnerDir -Force -ErrorAction SilentlyContinue
@@ -1578,9 +1725,31 @@ if (-not $fixedMode -and -not $NoAudio) {
     if ($parseErrors) { throw ("{0} has a syntax error at line {1}: {2}" -f $AddBluRayAudio, $parseErrors[0].Extent.StartLineNumber, $parseErrors[0].Message) }
     if (-not (Get-Command mkvmerge -ErrorAction SilentlyContinue)) { throw 'mkvmerge not on PATH (Add-BluRayAudio needs it): add "C:\Program Files\MKVToolNix" to PATH, or use -NoAudio.' }
 }
+if (-not $finishing) { $NoSubtitles = [switch]$true }
+if ($finishing -and -not $NoSubtitles) {
+    $ConvertSubtitles = Resolve-UserPath $ConvertSubtitles
+    if (-not [IO.File]::Exists($ConvertSubtitles)) { throw "Convert-Subtitles.ps1 not found: $ConvertSubtitles (pass -ConvertSubtitles, or -NoSubtitles)." }
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($ConvertSubtitles, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors) { throw ("{0} has a syntax error at line {1}: {2}" -f $ConvertSubtitles, $parseErrors[0].Extent.StartLineNumber, $parseErrors[0].Message) }
+    $seconvExe = $(if ($SeConv) { Resolve-UserPath $SeConv } else { Join-Path $HOME 'Documents\SeConv-Windows-x64\seconv.exe' })
+    if (-not [IO.File]::Exists($seconvExe)) { throw "seconv.exe not found: $seconvExe (Subtitle Edit's command line; pass -SeConv, or -NoSubtitles)." }
+    if ($SeConv) { $SeConv = $seconvExe }
+    if ($SubtitleRules) {
+        $SubtitleRules = Resolve-UserPath $SubtitleRules
+        if (-not [IO.File]::Exists($SubtitleRules)) { throw "-SubtitleRules not found: $SubtitleRules" }
+    } elseif (-not [IO.File]::Exists((Join-Path $HOME 'Documents\SE_Replace_Rules.template'))) {
+        Write-Log "No $(Join-Path $HOME 'Documents\SE_Replace_Rules.template'): subtitles are converted without multiple replace rules (pass -SubtitleRules)" 'Yellow'
+    }
+    $mkvx = Get-Command mkvextract -ErrorAction SilentlyContinue
+    if (-not $mkvx -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvextract.exe'))) { throw 'mkvextract not found (Convert-Subtitles needs MKVToolNix): add "C:\Program Files\MKVToolNix" to PATH, or use -NoSubtitles.' }
+    if (-not (Get-Command mkvmerge -ErrorAction SilentlyContinue) -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvmerge.exe'))) { throw 'mkvmerge not found (Convert-Subtitles needs MKVToolNix): add "C:\Program Files\MKVToolNix" to PATH, or use -NoSubtitles.' }
+    if (-not (Get-Command paddleocr -ErrorAction SilentlyContinue)) { Write-Log 'paddleocr is not on PATH: seconv''s OCR of Blu-ray subtitles will probably fail (the titles are then listed under SUBTITLES TO REVIEW; or use -NoSubtitles)' 'Yellow' }
+}
 if (-not $fixedMode) {
     Write-Log ("Finishing: {0}" -f $(if (-not $finishing) { 'off (-NoAudio -KeepVariants)' } else {
-        (@($(if (-not $NoAudio) { "audio with $AddBluRayAudio" }), 'move the pick up to the mirrored folder', $(if (-not $KeepVariants) { 'delete the other variants' })) | Where-Object { $_ }) -join ', ' }))
+        (@($(if (-not $NoAudio) { "audio with $AddBluRayAudio" }), $(if (-not $NoSubtitles) { "subtitles with $ConvertSubtitles" }),
+           'move the pick up to the mirrored folder', $(if (-not $KeepVariants) { 'delete the other variants' })) | Where-Object { $_ }) -join ', ' }))
 }
 
 $wsl = @{ Distro = $WslDistro; MountRoot = $WslMountRoot; CompareEncodeCmd = $CompareEncodeCmd; DoviConvertCmd = $DoviConvertCmd; RemountCmd = $RemountCmd }
@@ -1712,6 +1881,7 @@ function New-Row($spec, [string]$file) {
         Name = $spec.Name; Status = 'Failed'; Error = ''; File = $file; EncodeSec = $null
         Mean = $null; P1 = $null; Min = $null; VideoGB = $null; Pct = $null; Mbps = $null
         Model = ''; Warning = $false; Pass = $false; OverCap = $false; Dominated = $false; Suggested = $false; Hint = ''
+        StartFrame = $null
     }
 }
 
@@ -1727,7 +1897,7 @@ function Get-FinishedRow($t, $spec) {
     if (-not [IO.File]::Exists($vf)) { return $null }
     $vm = Read-VmafResult ([IO.File]::ReadAllLines($vf))
     if ($null -eq $vm.Mean) { return $null }
-    foreach ($k in 'Mean', 'P1', 'Min', 'VideoGB', 'Pct', 'Mbps', 'Model', 'Warning') { $row.$k = $vm.$k }
+    foreach ($k in 'Mean', 'P1', 'Min', 'VideoGB', 'Pct', 'Mbps', 'Model', 'Warning', 'StartFrame') { $row | Add-Member -NotePropertyName $k -NotePropertyValue $vm.$k -Force }
     $row.Status = 'Done'
     $row
 }
@@ -2185,6 +2355,7 @@ function Start-Finalize($t) {
         Doc = $t.FinalDoc; FinalJson = $t.FinalJson
         VariantDirs = @(Get-VariantDirs $t) + @($(if ($t.FinalDoc.PSObject.Properties['FromSource'] -and $t.FinalDoc.FromSource) { Split-Path -Parent $t.FinalDoc.Winner }))
         AddAudio = $AddBluRayAudio; Exe = (Get-Process -Id $PID).Path; NoAudio = [bool]$NoAudio; KeepVariants = [bool]$KeepVariants
+        IsDerived = [bool]$t.IsDerived; ConvertSubs = $ConvertSubtitles; NoSubtitles = [bool]$NoSubtitles; SeConv = $SeConv; SubRules = $SubtitleRules
     }
     $job = Start-Job -ScriptBlock $FinalizeWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 8 -Compress)
     $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'finalize'; Title = $t; Task = $null; Slot = -1; Start = Get-Date; StatusFile = $statusFile; Label = 'FINISH' }
@@ -2354,10 +2525,11 @@ function Read-JsonFile([string]$Path) {
 
 # Crop (<name>.crop.json) and audio (what Add-BluRayAudio reported, kept in final.json) for the reports.
 function Get-TitleExtras($t, $fd) {
-    $audio = $null
+    $audio = $null; $subs = $null
     if ($fd -and $fd.PSObject.Properties['Audio']) { $audio = $fd.Audio }
+    if ($fd -and $fd.PSObject.Properties['Subtitles']) { $subs = $fd.Subtitles }
     $dvBase = if ($t.IsDerived) { $t.ParentBase } else { $t.Base }
-    [pscustomobject]@{ Crop = (Read-JsonFile (Join-Path $t.TitleDir "$($t.Base).crop.json")); Audio = $audio
+    [pscustomobject]@{ Crop = (Read-JsonFile (Join-Path $t.TitleDir "$($t.Base).crop.json")); Audio = $audio; Subtitles = $subs
                        Dovi = (Read-JsonFile (Join-Path $t.TitleDir "$dvBase.dovi.json")); Derived = [bool]$t.IsDerived }
 }
 
@@ -2373,7 +2545,7 @@ function Format-DoviNote($ex) {
     }
 }
 
-# Markdown bullets: video dimensions and crop, audio tracks, subtitles to fix, audio warnings.
+# Markdown bullets: video dimensions and crop, audio tracks, audio warnings, subtitles.
 function Format-TitleExtras($ex, [string]$pick) {
     $dn = Format-DoviNote $ex
     if ($dn) { "- **Dolby Vision:** $dn" }
@@ -2396,10 +2568,27 @@ function Format-TitleExtras($ex, [string]$pick) {
         $drops = @($a.Dropped | Where-Object { $_ } | ForEach-Object { "audio $($_.SourceTrack) $($_.Name) ($($_.Reason))" })
         if ($drops.Count) { $line += "; dropped: $($drops -join ', ')" }
         $line
-        if ($a.SubtitleShift) { "- **Subtitles to fix:** $($a.SubtitleShift)" }
         $warn = @($a.Warnings | Where-Object { $_ -and $_ -notlike 'SUBTITLES TO FIX:*' })
         if ($warn.Count) { "- **Audio warnings:** $($warn -join '; ')" }
     }
+    $st = Format-SubtitleNote $ex.Subtitles
+    if ($st) { "- **Subtitles:** $st" }
+}
+
+# One line on a title's subtitles (from final.json's Subtitles), or ''.
+function Format-SubtitleNote($s) {
+    if (-not $s) { return '' }
+    $files = @($s.Outputs | Where-Object { $_ } | ForEach-Object { "``$($_.File)`` ($($_.Role)$(if ($_.Track -ge 0) { ", track $($_.Track)" }), $($_.Cues) cues)" })
+    $text = switch ([string]$s.Status) {
+        'None'   { "none ($($s.Message))" }
+        'Failed' { "FAILED: $($s.Message)" }
+        default  { $files -join ', ' }
+    }
+    $dups = @($s.Tracks | Where-Object { $_ -and $_.Role -in 'duplicate', 'unknown', 'failed' } | ForEach-Object { "track $($_.Id) $($_.Role) ($($_.Reason))" })
+    if ($dups.Count) { $text += "; not used: $($dups -join ', ')" }
+    if ($s.OffsetMs) { $text += "; shifted $($s.OffsetMs) ms to match the audio" }
+    if ($s.Review) { $text += "; **TO REVIEW** (see the top of this report)" }
+    $text
 }
 
 # CSV columns for the same (repeated on each of a title's rows).
@@ -2414,7 +2603,10 @@ function Get-ExtrasColumns($ex) {
         AudioTracks = $(if ($a) { @($a.Tracks | Where-Object { $_ }).Count })
         AudioDropped = $(if ($a) { (@($a.Dropped | Where-Object { $_ } | ForEach-Object { "audio $($_.SourceTrack) $($_.Name) ($($_.Reason))" })) -join '; ' } else { '' })
         AudioSyncMs = $(if ($a) { $a.SyncMs })
-        SubtitleShift = $(if ($a) { [string]$a.SubtitleShift } else { '' })
+        Subtitles = $(if ($ex.Subtitles) { [string]$ex.Subtitles.Status } else { '' })
+        SubtitleFiles = $(if ($ex.Subtitles) { (@($ex.Subtitles.Outputs | Where-Object { $_ } | ForEach-Object { $_.File })) -join '; ' } else { '' })
+        SubtitleShiftMs = $(if ($ex.Subtitles) { $ex.Subtitles.OffsetMs })
+        SubtitleReview = $(if ($ex.Subtitles -and $ex.Subtitles.Review) { [string]$ex.Subtitles.ReviewReason } else { '' })
         AudioWarnings = $(if ($a) { (@($a.Warnings | Where-Object { $_ -and $_ -notlike 'SUBTITLES TO FIX:*' })) -join '; ' } else { '' })
     }
 }
@@ -2454,14 +2646,18 @@ function Get-TitleOutcome($t) {
 
 # _encode-batch_all.md / .csv in Dest: every title found under -Source, all runs. Only written
 # when the whole batch is complete (every title finished, or settled: nothing passed, skipped).
-function Write-BatchReport {
-    $outs = @($titleList | ForEach-Object { Get-TitleOutcome $_ })
+function Write-BatchReport([string]$Dir, $Titles, [bool]$Touched) {
+    $outs = @($Titles | ForEach-Object { Get-TitleOutcome $_ })
     $open = @($outs | Where-Object { -not $_.Resolved })
+    $mdAll = Join-Path $Dir '_encode-batch_all.md'
     if ($open.Count) {
-        Write-Log ("Whole-batch report not written yet: {0} of {1} title(s) still to do ({2})." -f $open.Count, $outs.Count,
-            ((@($open | Group-Object Outcome | ForEach-Object { "$($_.Count) $($_.Name.ToLower())" })) -join ', '))
+        if ($Touched) {
+            Write-Log ("Folder report for {0} not written yet: {1} of {2} title(s) still to do ({3})." -f $Dir, $open.Count, $outs.Count,
+                ((@($open | Group-Object Outcome | ForEach-Object { "$($_.Count) $($_.Name.ToLower())" })) -join ', '))
+        }
         return
     }
+    if (-not $Touched -and [IO.File]::Exists($mdAll)) { return }   # nothing new in this folder
     $srcGB = 0.0; $finGB = 0.0; $nSized = 0
     foreach ($o in $outs) {
         if ($o.Outcome -notlike 'Finished*') { continue }
@@ -2474,10 +2670,10 @@ function Write-BatchReport {
     }
     $count = { param($name) @($outs | Where-Object { $_.Outcome -eq $name }).Count }
     $md = New-Object System.Collections.Generic.List[string]
-    $md.Add('# Encode-Batch: all titles')
+    $md.Add('# Encode-Batch: all titles in this folder')
     $md.Add('')
-    $md.Add("- **Source:** ``$srcPath``")
-    $md.Add("- **Dest:** ``$dstRoot``")
+    $md.Add("- **Source:** ``$(Split-Path -Parent ([string]@($Titles)[0].File))``")
+    $md.Add("- **Dest:** ``$Dir``")
     $md.Add("- **Updated:** $(Get-Date -Format 'yyyy-MM-dd HH:mm') (run $runId)")
     $md.Add("- **Mode:** $(if ($fixedMode) { 'fixed variants' } else { "ladder search ($(($specs | ForEach-Object { $_.Name }) -join ', '))" })")
     $md.Add("- **Bar:** mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; target $TargetPct%; top bar mean >= $TopMean, p1 >= $TopP1, min >= $TopMin.")
@@ -2487,14 +2683,30 @@ function Write-BatchReport {
         $md.Add(("- **Video:** {0} finished title(s): sources {1:N1} GB -> {2:N1} GB ({3:N0}% of the source, {4:N1} GB saved)" -f
             $nSized, $srcGB, $finGB, (100 * $finGB / [Math]::Max([double]0.001, $srcGB)), ($srcGB - $finGB)))
     }
-    $toFix = @($outs | Where-Object { $_.Extras.Audio -and $_.Extras.Audio.SubtitleShift } | Sort-Object Title)
-    if ($toFix.Count) {
+    $withSubs = @($outs | Where-Object { $_.Extras.Subtitles })
+    if ($withSubs.Count) {
+        $md.Add(("- **Subtitles:** {0} title(s): {1} done, {2} to review, {3} without English subtitles" -f $withSubs.Count,
+            @($withSubs | Where-Object { $_.Extras.Subtitles.Status -eq 'Done' }).Count, @($withSubs | Where-Object { $_.Extras.Subtitles.Review }).Count,
+            @($withSubs | Where-Object { $_.Extras.Subtitles.Status -eq 'None' }).Count))
+    }
+    $toReview = @($withSubs | Where-Object { $_.Extras.Subtitles.Review } | Sort-Object Title)
+    if ($toReview.Count) {
         $md.Add('')
-        $md.Add("## Subtitles to fix ($($toFix.Count))")
+        $md.Add("## SUBTITLES TO REVIEW ($($toReview.Count))")
         $md.Add('')
-        $md.Add('The audio was shifted to match the encode, so subtitles OCR''d from the source need the same shift.')
+        $md.Add('> **Action needed.** These titles'' subtitle tracks couldn''t be told apart with confidence (or failed). The best guess')
+        $md.Add('> is in place next to the video. Every English track''s .srt (shifted like the finished file) is in the review folder,')
+        $md.Add('> named with its track number and guessed role: copy the right ones over `<name>.en.srt`, `<name>.en.forced.default.srt`')
+        $md.Add('> or `<name>.en.Commentary.srt` (delete any that shouldn''t be there), then delete the review folder.')
+        $md.Add('> A Dolby Vision 7 title and its 1080p copy are OCR''d from the same source, so they usually both need the same fix.')
         $md.Add('')
-        foreach ($o in $toFix) { $md.Add("- ``$($o.Title)``: $($o.Extras.Audio.SubtitleShift)") }
+        foreach ($o in $toReview) {
+            $sx = $o.Extras.Subtitles
+            $md.Add("- ``$($o.Title)``: $($sx.ReviewReason)")
+            $guess = @($sx.Outputs | Where-Object { $_ } | ForEach-Object { "$($_.Role) = track $($_.Track)" })
+            if ($guess.Count) { $md.Add("  - best guess: $($guess -join ', ')") }
+            if ($sx.ReviewDir) { $md.Add("  - every track: ``$($sx.ReviewDir)``") }
+        }
     }
     $csv = New-Object System.Collections.Generic.List[object]
     foreach ($o in @($outs | Sort-Object Title)) {
@@ -2532,10 +2744,47 @@ function Write-BatchReport {
             $csv.Add([pscustomobject]$row)
         }
     }
-    $mdAll = Join-Path $dstRoot '_encode-batch_all.md'
     [IO.File]::WriteAllLines($mdAll, $md, $script:Utf8)
-    $csv | Export-Csv -LiteralPath (Join-Path $dstRoot '_encode-batch_all.csv') -NoTypeInformation -Encoding UTF8
-    Write-Log "Whole batch complete: $mdAll (and _encode-batch_all.csv)" 'Cyan'
+    $csv | Export-Csv -LiteralPath (Join-Path $Dir '_encode-batch_all.csv') -NoTypeInformation -Encoding UTF8
+    Write-Log "Folder complete: $mdAll (and _encode-batch_all.csv)" 'Cyan'
+}
+
+# Report groups: titles by destination folder (a season, a movie with its editions; a 1080p copy
+# sits with its parent). Touched = something happened to one of them this run (not just "already
+# finished" or "not started"), so this run's log lines are written there.
+function Get-ReportGroups {
+    foreach ($g in @($titleList | Group-Object TitleDir)) {
+        $ts = @($g.Group)
+        $touched = @($ts | Where-Object {
+            -not ($_.State -eq 'queued' -or ($_.State -eq 'skipped' -and $_.Reason -match '^(finished:|ladder search already finished|all variants already finished)'))
+        }).Count -gt 0
+        [pscustomobject]@{ Dir = [string]$g.Name; Titles = $ts; Touched = $touched; Rels = @($ts | ForEach-Object { $_.Rel }) }
+    }
+}
+
+# This run's lines for one folder, from the full run log in Dest: the start-up lines, the lines
+# about its titles or its folder, and general lines that name no title at all.
+function Write-FolderRunLog($grp, $allRels, $allDirs) {
+    $full = Join-Path $dstRoot "_encode-batch_$runId.log"
+    $dst = Join-Path $grp.Dir "_encode-batch_$runId.log"
+    if ($dst -eq $full -or -not [IO.File]::Exists($full)) { return }
+    $lines = [IO.File]::ReadAllLines($full)
+    $out = New-Object System.Collections.Generic.List[string]
+    # Other folders, by path (not Dest itself: every path is under it)
+    $otherDirs = @($allDirs | Where-Object { $_ -ne $grp.Dir -and $_ -ne $dstRoot } | ForEach-Object { [regex]::Escape($_) + '([\\/:]|$)' })
+    $myDir = [regex]::Escape($grp.Dir) + '([\\/:]|$)'
+    foreach ($l in $lines) {
+        $mine = ($grp.Dir -ne $dstRoot) -and ($l -match $myDir)
+        if (-not $mine) { foreach ($r in $grp.Rels) { if ($l.Contains($r)) { $mine = $true; break } } }
+        if (-not $mine) {
+            $other = $false
+            foreach ($r in $allRels) { if ($l.Contains($r)) { $other = $true; break } }
+            if (-not $other) { foreach ($d in $otherDirs) { if ($l -match $d) { $other = $true; break } } }
+            if ($other) { continue }
+        }
+        $out.Add($l)
+    }
+    [IO.File]::WriteAllLines($dst, $out, $script:Utf8)
 }
 
 # Dolby Vision 7 titles kept as profile 7 by an earlier run: bring back their 1080p copies.
@@ -2623,10 +2872,14 @@ try {
                 $t.Finalize = $res.Status
                 if ($res.Status -eq 'Done') { $zipDirs[$t.TitleDir] = $true }
                 $finished.Add([pscustomobject]@{ Title = $t.Rel; Variant = $t.FinalDoc.Variant; Status = $res.Status; Final = $res.Final; FreedGB = $res.FreedGB; Error = $res.Error
-                                                 Audio = [string]$res.Audio; AudioWarnings = @($res.AudioWarnings | Where-Object { $_ }) })
+                                                 Audio = [string]$res.Audio; AudioWarnings = @($res.AudioWarnings | Where-Object { $_ })
+                                                 SubtitlesReview = [bool]($res.PSObject.Properties['SubtitlesReview'] -and $res.SubtitlesReview) })
                 if ($res.Status -eq 'Done') {
                     Write-Log ("FINISHED {0}: {1} -> {2}{3}" -f $t.Rel, $t.FinalDoc.Variant, $res.Final,
                         $(if ($res.Deleted) { ", other variants deleted ($($res.Deleted) file(s), $($res.FreedGB) GB)" } else { '' })) 'Green'
+                    if ($res.PSObject.Properties['SubtitlesReview'] -and $res.SubtitlesReview) {
+                        Write-Log ("SUBTITLES TO REVIEW {0}: subtitles {1}; see the folder's _encode-batch_all.md" -f $t.Rel, $(if ($res.Subtitles -eq 'Failed') { 'failed' } else { 'unsure (best guess written)' })) 'Yellow'
+                    }
                 } else {
                     Write-Log ("FINISH FAILED {0}: {1} (variants kept; see {2})" -f $t.Rel, $res.Error, $t.LogPath) 'Red'
                 }
@@ -2772,70 +3025,23 @@ try {
     $unfinished = @($titleList | Where-Object { $_.State -in 'ready', 'prepping' })
 
     # ---------------------------------------------------------------- summary
+    # Each folder's complete report once every title in it is settled, and this run's log lines
+    # for each folder that had something happen. The full run log stays in Dest.
     $elapsed = (Get-Date) - $started
-    $md = New-Object System.Collections.Generic.List[string]
-    $md.Add("# Encode-Batch $runId")
-    $md.Add('')
-    $md.Add("- **Source:** ``$srcPath``")
-    $md.Add("- **Dest:** ``$dstRoot``")
-    $md.Add("- **Elapsed:** $($elapsed.ToString('hh\:mm\:ss'))")
-    $md.Add("- **Mode:** $(if ($fixedMode) { 'fixed variants' } else { "ladder search ($(($specs | ForEach-Object { $_.Name }) -join ', '))" })")
-    $md.Add("- **Bar:** mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; top bar mean >= $TopMean, p1 >= $TopP1, min >= $TopMin.")
-    $md.Add("- **Suggested:** the passing variant closest to $TargetPct% of the source, either direction; but if any variant under $TargetPct% meets the top bar, the biggest of those. None = keep the original.")
-    $md.Add("- **Titles:** $(@($results | Where-Object Status -eq 'Done').Count) done, $(@($results | Where-Object Status -eq 'Partial').Count) partial, $(@($results | Where-Object { $_.Status -in 'Failed', 'Skipped' }).Count) failed/skipped while running, $($skipped.Count) skipped before starting, $($unfinished.Count) interrupted, $notStarted not started")
-    foreach ($res in $results) {
-        $md.Add('')
-        $md.Add("## $($res.Title)")
-        $md.Add('')
-        $line = "$($res.Status), $([TimeSpan]::FromSeconds([int]$res.Seconds))"
-        if ($res.Reason) { $line += " - $($res.Reason)" }
-        $md.Add("$line. Log: ``$($res.LogPath)``")
-        $tt = @($titleList | Where-Object { $_.Rel -eq $res.Title } | Select-Object -First 1)
-        if ($tt.Count) {
-            $fdx = Read-JsonFile $tt[0].FinalJson
-            $extra = @(Format-TitleExtras (Get-TitleExtras $tt[0] $fdx) $(if ($fdx) { [string]$fdx.Variant } else { '' }))
-            if ($extra.Count) { $md.Add(''); foreach ($x in $extra) { $md.Add($x) } }
-        }
-        $rows = @($res.Variants)
-        if ($rows.Count) {
-            $md.Add('')
-            Format-VariantTable $rows | ForEach-Object { $md.Add($_) }
-        }
+    $groups = @(Get-ReportGroups)
+    $allRels = @($titleList | ForEach-Object { $_.Rel })
+    foreach ($grp in $groups) {
+        try { Write-BatchReport $grp.Dir $grp.Titles $grp.Touched } catch { Write-Log "Couldn't write the folder report for $($grp.Dir): $($_.Exception.Message)" 'Yellow' }
     }
-    if ($finished.Count) {
-        $md.Add('')
-        $md.Add('## Finished (audio added, moved into place, other variants deleted)')
-        $md.Add('')
-        foreach ($f in $finished) {
-            if ($f.Status -eq 'Done') {
-                $md.Add("- ``$($f.Title)``: $($f.Variant) -> ``$($f.Final)``$(if ($f.FreedGB) { ", $($f.FreedGB) GB freed" })")
-                if ($f.Audio) { $md.Add("  - audio: $($f.Audio)") }
-            } else { $md.Add("- **FAILED** ``$($f.Title)``: $($f.Error)") }
-            foreach ($w in @($f.AudioWarnings)) { if ($w) { $md.Add("  - **$(if ($w -like 'SUBTITLES TO FIX:*') { $w } else { "audio warning: $w" })**") } }
-        }
-    }
-    if ($doviNotes.Count) {
-        $md.Add('')
-        $md.Add('## Dolby Vision 7 decisions this run')
-        $md.Add('')
-        foreach ($n in $doviNotes) { $md.Add("- ``$($n.Title)``: $($n.Note)") }
-    }
-    $pendingFinish = @($titleList | Where-Object { $_.Finalize -eq 'pending' -or $_.Finalize -eq 'running' })
-    if ($pendingFinish.Count) {
-        $md.Add('')
-        $md.Add("$($pendingFinish.Count) title(s) still to finish; the next run does that first.")
-    }
-    if ($skipped.Count) {
-        $md.Add('')
-        $md.Add('## Skipped before starting')
-        $md.Add('')
-        foreach ($s in $skipped) { $md.Add("- ``$($s.Title)``: $($s.Reason)") }
-    }
-    $mdPath = Join-Path $dstRoot "_encode-batch_$runId.md"
-    [IO.File]::WriteAllLines($mdPath, $md, $script:Utf8)
-    try { Write-BatchReport } catch { Write-Log "Couldn't write the whole-batch report: $($_.Exception.Message)" 'Yellow' }
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     $tmpParent = Split-Path -Parent $tempDir
     if ([IO.Directory]::Exists($tmpParent) -and -not (Get-ChildItem -LiteralPath $tmpParent -Force)) { Remove-Item -LiteralPath $tmpParent -Force -ErrorAction SilentlyContinue }
-    Write-Log "Finished in $($elapsed.ToString('hh\:mm\:ss')). Summary: $mdPath" 'Cyan'
+    $touchedDirs = @($groups | Where-Object { $_.Touched } | ForEach-Object { $_.Dir })
+    $subReview = @($finished | Where-Object { $_.SubtitlesReview })
+    if ($subReview.Count) { Write-Log ("SUBTITLES TO REVIEW ({0}): {1} (listed at the top of each folder's _encode-batch_all.md)" -f $subReview.Count, (($subReview | ForEach-Object { $_.Title }) -join '; ')) 'Yellow' }
+    Write-Log ("Finished in {0}. Folder logs: {1}" -f $elapsed.ToString('hh\:mm\:ss'), $(if ($touchedDirs.Count) { $touchedDirs -join '; ' } else { 'none (nothing happened)' })) 'Cyan'
+    foreach ($grp in @($groups | Where-Object { $_.Touched })) {
+        try { Write-FolderRunLog $grp $allRels @($groups | ForEach-Object { $_.Dir }) } catch { Write-Log "Couldn't write the run log for $($grp.Dir): $($_.Exception.Message)" 'Yellow' }
+    }
+    if ($script:PushedLocation) { Pop-Location -ErrorAction SilentlyContinue }
 }

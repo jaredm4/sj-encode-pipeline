@@ -87,7 +87,7 @@
 #
 # Uses frame-order timestamps (setpts=N/fps/TB) and checks alignment INDEPENDENTLY at each
 # clip (not just once globally), since drift can start partway through a file even when the
-# beginning is aligned. Each clip is scored with whichever of shift -2..+2 frames scores best
+# beginning is aligned. Each clip is scored with whichever shift (-2..+2 frames, further if the best is at an edge) scores best
 # on a quick 20s pre-check, so a localized one-frame drift doesn't silently corrupt that clip's
 # score the way it would with a single global alignment check.
 # Set CROP=W:H (e.g. CROP=1920:804) to center-crop BOTH files to the picture area, so
@@ -240,17 +240,42 @@ video_rel_start() {
   awk -v v="$v" -v f="$f" 'BEGIN { if (v == "" || v == "N/A") v = 0; if (f == "" || f == "N/A") f = 0; printf "%.6f", v - f }'
 }
 
+# Frames missing from the start of the encode, when the original starts mid-sequence (e.g. an
+# episode cut out of one long stream on the disc): its first frames need the previous scene to
+# decode, so decoders and the encoder throw them away, and the encode's first frame is a later
+# one of the original's. Found from the evidence: the original shows N frames before its first
+# keyframe, and the encode has fewer frames than the original; the smaller of the two is the
+# number dropped at the start. Prints "<frames> <seconds>"; "0 0" when none.
+lead_offset() {
+  local orig="$1" enc="$2" rate so se lead
+  rate=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$orig" 2>/dev/null | head -1)
+  lead=$(ffprobe -v error -select_streams v:0 -read_intervals "%+#300" -show_entries packet=pts_time,flags -of csv=p=0 "$orig" 2>/dev/null \
+    | awk -F, -v rate="$rate" 'BEGIN { split(rate, r, "/"); fd = (r[2] ? r[2] : 1) / r[1] }
+        $1 == "N/A" { next }
+        { n++; pts[n] = $1 + 0; if (!k && index($2, "K")) { k = n; kp = $1 + 0 } }
+        END { c = 0; if (k) for (i = 1; i <= n; i++) if (pts[i] < kp - fd / 4) c++; print c }')
+  if [ -z "$lead" ] || [ "$lead" -le 0 ]; then echo "0 0"; return; fi
+  so=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$orig" 2>/dev/null | head -1)
+  se=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$enc" 2>/dev/null | head -1)
+  awk -v so="$so" -v se="$se" -v lead="$lead" -v rate="$rate" 'BEGIN {
+    split(rate, r, "/"); fd = (r[2] ? r[2] : 1) / r[1]
+    d = so - se; if (so == "" || se == "" || d <= 0) { print "0 0"; exit }
+    if (d > lead) d = lead
+    printf "%d %.6f", d, d * fd }'
+}
+
 # The -ss position for offset <off> in a file whose video starts <vrel> seconds in: half a frame
 # before the frame nearest <off>, counted from that file's first frame. Seeking by plain time
 # picks "the first frame at or after <off>", and when a frame sits within a few milliseconds of
 # <off>, two files whose timestamps differ by a few ms (a remux, rounding) start on different
 # frames, which looks like a one-frame shift at that offset only. Half a frame of margin
-# makes both start on the same frame. <off> 0 stays 0 (the very start).
+# makes both start on the same frame. <off> 0 is the first frame (0 when the video starts at 0).
 seek_pos() {
   local vrel="$1" off="$2"
   awk -v r="$vrel" -v o="$off" -v fps="$FPS" 'BEGIN {
     n = split(fps, p, "/"); f = (n == 2 && p[2] + 0 > 0) ? p[1] / p[2] : p[1] + 0
-    if (o + 0 <= 0 || f <= 0) { print 0; exit }
+    if (o + 0 < 0) o = 0
+    if (f <= 0) { print (o + 0 > 0 ? o : 0); exit }
     k = int(o * f + 0.5); t = r + (k - 0.5) / f; if (t < 0) t = 0
     printf "%.6f", t }'
 }
@@ -332,11 +357,11 @@ quick() {  # prints mean VMAF or nothing
 }
 
 # ---- Alignment probing (shared by per-clip mode and --full mode) ----
-# Tries shift -2..+2 frames on a quick 20s window at a given offset and reports which
+# Tries shift -2..+2 frames (and further past an edge while it improves) on a quick 20s window at a given offset and reports which
 # scores best. Prints "<best_shift> <best_score>" on stdout; diagnostics go to stderr.
 probe_shift() {
   local off="$1"
-  local best_shift=0 best_score=-1 s score
+  local best_shift=0 best_score=-1 s score dir lim
   local results=""
   for s in 0 1 2 -1 -2; do
     if [ "$s" -ge 0 ]; then dt="trim=start_frame=$s,setpts=PTS-STARTPTS,"; rt=""
@@ -346,37 +371,40 @@ probe_shift() {
     results="${results}${s}:${score} "
     awk -v sc="$score" -v best="$best_score" 'BEGIN{exit !(sc>best)}' && { best_score=$score; best_shift=$s; }
   done
+  # Best at an edge: keep going that way while it improves (up to SHIFT_MAX frames), so an
+  # offset a little bigger than expected is found instead of scored wrong.
+  if [ "$best_shift" = 2 ] || [ "$best_shift" = -2 ]; then
+    dir=$(( best_shift > 0 ? 1 : -1 )); s=$best_shift; lim=${SHIFT_MAX:-30}
+    while [ $(( s * dir )) -lt "$lim" ]; do
+      s=$(( s + dir ))
+      if [ "$s" -ge 0 ]; then dt="trim=start_frame=$s,setpts=PTS-STARTPTS,"; rt=""
+      else                    dt=""; rt="trim=start_frame=$(( -s )),setpts=PTS-STARTPTS,"; fi
+      score=$(quick "$dt" "$rt" "$off")
+      [ -z "$score" ] && score=0
+      results="${results}${s}:${score} "
+      awk -v sc="$score" -v best="$best_score" 'BEGIN{exit !(sc>best)}' || break
+      best_score=$score; best_shift=$s
+    done
+    if [ $(( best_shift * dir )) -ge "$lim" ]; then
+      echo "  WARNING: the best shift at ${off}s is at the search limit (${best_shift}); the real offset may be bigger." >&2
+    fi
+  fi
   echo "  shift scores @ ${off}s: ${results}-> best shift ${best_shift} (score ${best_score})" >&2
   echo "$best_shift $best_score"
 }
 
-# Given a frame-shift integer, echoes "<enc_trim> <ref_trim>" filter-chain fragments
-# (either may be empty) that compensate for it.
+# Given a frame-shift integer, echoes "<enc_trim>|<ref_trim>" filter-chain fragments (either
+# may be empty) that compensate for it. Read back with: IFS='|' read -r DT RT. (A space as the
+# separator loses an empty first field, which put a negative shift's trim on the wrong file.)
 trim_for_shift() {
   local shift="$1"
   if [ "$shift" -gt 0 ]; then
-    echo "trim=start_frame=$shift,setpts=PTS-STARTPTS," ""
+    echo "trim=start_frame=$shift,setpts=PTS-STARTPTS,|"
   elif [ "$shift" -lt 0 ]; then
-    echo "" "trim=start_frame=$(( -shift )),setpts=PTS-STARTPTS,"
+    echo "|trim=start_frame=$(( -shift )),setpts=PTS-STARTPTS,"
   else
-    echo "" ""
+    echo "|"
   fi
-}
-
-# ---- Per-clip alignment check + score ----
-# For each offset, find the best shift with probe_shift() and echo the corresponding
-# "<enc_trim> <ref_trim>" pair. Drift beyond +/-2 frames at a given offset is flagged as
-# unresolved rather than guessed at.
-align_and_score() {
-  local off="$1"
-  local best_shift best_score
-  read -r best_shift best_score <<< "$(probe_shift "$off")"
-  if awk -v b="$best_score" 'BEGIN{exit !(b<50)}'; then
-    echo "  WARNING: no shift in -2..+2 scored above 50 at ${off}s; drift here exceeds what this" >&2
-    echo "           script compensates for, or there is a genuine content difference. Treat this" >&2
-    echo "           clip's score as unreliable." >&2
-  fi
-  trim_for_shift "$best_shift"
 }
 
 # summary_row <orig_file> <model> <mean> <p1> <min>  -- appended to SUMMARY_ROWS_FILE if
@@ -398,7 +426,7 @@ score_pair() {
   local DO DE DIFF SO SE OW OH EW EH DSCALE RCROP MODEL GPUDEC DGPU_SCALE GPUDEC_WHY ga
   local DGPU=() RGPU=()
   local P10 P50 P90 S10 SC10 S50 SC50 S90 SC90 CHOSEN DT RT off
-  local JSONS PYOUT PLABEL PMEAN PP1 PMIN so se ENC_VREL ORIG_VREL
+  local JSONS PYOUT PLABEL PMEAN PP1 PMIN so se ENC_VREL ORIG_VREL LEADN LEADS
 
   mkdir -p "$WORK"
   rm -f "$WORK"/clip_*.json "$WORK/errors.log" "$WORK/.cuda_fallbacks" "$WORK/.gpudec_fallbacks"
@@ -413,6 +441,12 @@ score_pair() {
   ENC_VREL=$(video_rel_start "$ENC"); ORIG_VREL=$(video_rel_start "$ORIG")
   echo "Original: $ORIG (${DO}s)"
   echo "Encode:   $ENC (${DE}s)"
+  read -r LEADN LEADS <<< "$(lead_offset "$ORIG" "$ENC")"
+  if [ "${LEADN:-0}" -gt 0 ]; then
+    ORIG_VREL=$(awk -v a="$ORIG_VREL" -v b="$LEADS" 'BEGIN { printf "%.6f", a + b }')
+    printf "The original starts mid-sequence: its first %d frame(s) (%.3f s) can't be decoded and aren't in the\n" "$LEADN" "$LEADS"
+    echo "  encode, so the encode is lined up with the original from the frame after them."
+  fi
   if [ "$DIFF" -gt 2 ]; then
     echo "WARNING: durations differ by ${DIFF}s. Frame-order pairing will drift and scores will be"
     echo "         unreliable (trimmed, different cut, or different frame rate?)."
@@ -530,6 +564,8 @@ score_pair() {
     if [ "$S10" = "$S50" ] && [ "$S50" = "$S90" ]; then
       echo "  -> consistent shift (${S10}) at all three points; applying it across the whole file."
       CHOSEN=$S10
+      # Where the encode starts in the original, for syncing its audio (Encode-Batch reads this).
+      echo "Start: the encode's first frame is the original's frame $(( ${LEADN:-0} - CHOSEN )) (measured)"
     else
       echo "  WARNING: alignment differs across the file (10%=${S10}, 50%=${S50}, 90%=${S90})."
       echo "           This means drift starts somewhere between these points, or one of them is a"
@@ -538,18 +574,30 @@ score_pair() {
       echo "           sample offsets between these three points to find where it actually changes."
       CHOSEN=$S50
     fi
-    read -r DT RT <<< "$(trim_for_shift "$CHOSEN")"
+    IFS='|' read -r DT RT <<< "$(trim_for_shift "$CHOSEN")"
 
     echo -n "Scoring the entire file (${DO}s) ... "
     run_score "$DT" "$RT" 0 "$DO" "$SUB" "$WORK/clip_0.json" 2>>"$WORK/errors.log"
     if [ -s "$WORK/clip_0.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
   else
+    local SHIFTS=() SH SC
     for off in "${OFFS[@]}"; do
-      read -r DT RT <<< "$(align_and_score "$off")"
+      read -r SH SC <<< "$(probe_shift "$off")"
+      if awk -v b="$SC" 'BEGIN{exit !(b<50)}'; then
+        echo "  WARNING: no shift tried scored above 50 at ${off}s; drift here exceeds what this"
+        echo "           script compensates for, or there is a genuine content difference. Treat this"
+        echo "           clip's score as unreliable."
+      fi
+      SHIFTS+=("$SH")
+      IFS='|' read -r DT RT <<< "$(trim_for_shift "$SH")"
       echo -n "Scoring ${CLIP}s @ ${off}s ... "
       run_score "$DT" "$RT" "$off" "$CLIP" "$SUB" "$WORK/clip_${off}.json" 2>>"$WORK/errors.log"
       if [ -s "$WORK/clip_${off}.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
     done
+    # Every clip agrees on the shift: that's where the encode starts in the original.
+    if [ ${#SHIFTS[@]} -ge 2 ] && [ "$(printf '%s\n' "${SHIFTS[@]}" | sort -u | wc -l)" -eq 1 ]; then
+      echo "Start: the encode's first frame is the original's frame $(( ${LEADN:-0} - SHIFTS[0] )) (measured)"
+    fi
   fi
 
   shopt -s nullglob

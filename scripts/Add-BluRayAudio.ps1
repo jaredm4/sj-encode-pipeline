@@ -80,9 +80,12 @@
        If the encoded MKV's audio already matches this plan, the title is skipped.
     Sync: if the encoder moved the video's start time (e.g. the source video starts at
        0.5 s and the encode at 0), or dropped the source's first frames (sources that start
-       mid-sequence, found by comparing frame counts), every audio track is shifted by the
-       same amount with mkvmerge --sync, so it stays in sync with the picture. After muxing, each audio
-       track's start relative to the video must match the source's within 50 ms.
+       mid-sequence, found by comparing frame counts), the picture is put back where it was
+       in the source: when it would start too early, the VIDEO track is delayed by that much
+       (mkvmerge --sync), so the audio and any subtitles keep the source's timing and nothing
+       is cut; when it would start too late, every audio track is delayed instead (and .srt
+       subtitles need the same delay). After muxing, each audio track's start relative to the
+       video must match the source's within 50 ms.
     Duplicate commentary: a lossless track (not the main track) that is the same audio
        as a kept commentary (compared directly, both directions under 10%) is dropped;
        the lossy commentary is kept.
@@ -102,13 +105,10 @@
     gives it a quick check (opens, has audio, same length, Dolby Vision kept) and swaps
     it in, with no source analysis or comparisons. -Force redoes it from scratch.
 
-    Subtitle backup: if the source MKV has subtitle tracks (e.g. PGS), they are all
-    copied, unchanged, into one Matroska subtitle file next to the encoded file, as a
-    backup for when the source MKVs are deleted. It follows the same flow as the
-    remux: "<name>.remux.mks" for review without -Replace, then "<name>.mks" (moved
-    into place by -Replace, or written directly with -Replace). Verified by its track
-    count; existing backups are skipped. This runs for every title, even when the
-    audio needs no changes.
+    Subtitles are not touched (the remux has no subtitle tracks): Convert-Subtitles.ps1 makes
+    .srt files, and backs up the source's subtitle tracks. When the audio had to be
+    shifted to match the encode, the summary lists the same shift for the subtitles
+    (Convert-Subtitles -OffsetMs).
     New audio is encoded to temporary files in your local temp folder, which are
     deleted afterwards.
 
@@ -165,11 +165,12 @@
     run if there is one (after a quick check, without redoing any analysis); otherwise
     the remux is created first.
     Default: off (writes "<name>.remux.mkv" next to the original).
-.PARAMETER SkipSubtitles
-    Don't back up subtitles at all (no .mks files are made, moved or checked),
-    e.g. when re-running only to fix audio on titles whose backups already exist
-    elsewhere. Audio work is unchanged.
-    Default: off (subtitles are backed up).
+.PARAMETER SourceStartFrames
+    Single mode only: the encode's first frame is this frame of the source (0 = the first),
+    measured elsewhere (Encode-Batch passes compare_encode's alignment). Used for the sync
+    instead of the frame-count difference, which can't tell frames missing at the start from
+    ones missing elsewhere.
+    Default: -1 (work it out from the frame counts).
 .PARAMETER LogPath
     Where to write the log: everything shown on screen, then the summary. An existing
     log is added to, not replaced (a rerun of the same title keeps the earlier run).
@@ -186,19 +187,20 @@
                     SourceTrack and SourceName (the source track it came from)
       Dropped       source tracks not kept: SourceTrack, Name, Channels, Kbps, Title,
                     Reason, and the comparison's Louder/Quieter/Median shares if compared
-      SyncMs        audio shift (0 = none); DroppedFrames: video frames the encoder dropped
+      SyncMs        how far the encode's picture is from the source's (negative = early);
+                    DroppedFrames: video frames the encoder dropped at the start
+      VideoDelayMs  how much the video track was delayed to fix it (0 = none)
+      AudioShiftMs  how much the audio tracks were delayed instead (0 = none)
+      SubtitleShiftMs  the shift .srt subtitles from the source need: AudioShiftMs
       SubtitleShift what to do with OCR'd subtitles when the audio was shifted, or ""
       NoLossless    true if the source had no lossless track
-      Subtitles     the backup: File, Tracks, Message, Error
       Warnings      every warning, "SUBTITLES TO FIX: ..." first when there is a shift
       LogPath       where the log went
-    Exit code: 0, or 1 if anything failed (also reported as Status Failed or
-    Subtitles.Error).
+    Exit code: 0, or 1 if anything failed (also reported as Status Failed).
     Default: off.
 .PARAMETER Force
     Redo remuxes even if a .remux.mkv exists (overwriting it, also with -Replace), even
-    if the encoded MKV's audio already matches the plan, and redo subtitle backups
-    even if they exist.
+    if the encoded MKV's audio already matches the plan.
     Default: off.
 .PARAMETER WhatIf
     Built-in PowerShell switch. Show the matching, the comparisons and every plan,
@@ -225,7 +227,7 @@ param(
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
     [switch]$Replace,
-    [switch]$SkipSubtitles,
+    [int]$SourceStartFrames = -1,
     [string]$LogPath = '',
     [switch]$Plumbing,
     [switch]$Force
@@ -610,66 +612,6 @@ function Get-TagsXml($TitleInfo) {
     return $parts -join "`n"
 }
 
-# Backup of all of a source MKV's subtitle tracks (e.g. PGS), unchanged, in one Matroska
-# subtitle file next to the encoded file. Same flow as the audio remux:
-#   "<name>.remux.mks.partial" while writing,
-#   "<name>.remux.mks" once verified (for review, without -Replace),
-#   "<name>.mks" final (with -Replace).
-function Export-SubtitleBackup([string]$SourceFile, [string]$DestFile) {
-    $dir = [IO.Path]::GetDirectoryName($DestFile)
-    $base = [IO.Path]::GetFileNameWithoutExtension($DestFile)
-    $finalSubs = Join-Path $dir ($base + '.mks')
-    $reviewSubs = Join-Path $dir ($base + '.remux.mks')
-    $partialSubs = $reviewSubs + '.partial'
-
-    $haveFinal = Test-Path -LiteralPath $finalSubs
-    $haveReview = Test-Path -LiteralPath $reviewSubs
-    # A final backup and no review copy waiting: nothing to do (-Force redoes it).
-    if ($haveFinal -and -not $haveReview -and -not $Force) { return '' }
-    # A review copy waiting but no -Replace: leave it for review (-Force redoes it).
-    if ($haveReview -and -not $Replace -and -not $Force) { return '' }
-    $srcSubCount = @(Get-MkvTracks $SourceFile | Where-Object { $_.type -eq 'subtitles' }).Count
-    if ($srcSubCount -eq 0) { return '' }
-
-    # A verified review copy from an earlier run, with -Replace: move it into place. It
-    # replaces an older final backup, if there is one (the review copy is newer).
-    if ($haveReview -and -not $Force) {
-        if (-not $Replace) { return '' }
-        $gotCount = @(Get-MkvTracks $reviewSubs | Where-Object { $_.type -eq 'subtitles' }).Count
-        if ($gotCount -ne $srcSubCount) {
-            throw "$([IO.Path]::GetFileName($reviewSubs)) has $gotCount subtitle track(s), the source has $srcSubCount. Use -Force to redo it."
-        }
-        if (-not $script:Cmdlet.ShouldProcess($finalSubs, 'Move the reviewed subtitle backup into place')) {
-            return "reviewed backup would be moved to $([IO.Path]::GetFileName($finalSubs))"
-        }
-        Move-Item -LiteralPath $reviewSubs -Destination $finalSubs -Force
-        $how = 'moved to'
-        if ($haveFinal) { $how = 'replaced the older' }
-        return "reviewed backup $how $([IO.Path]::GetFileName($finalSubs))"
-    }
-
-    $target = $reviewSubs
-    if ($Replace) { $target = $finalSubs }
-    if (-not $script:Cmdlet.ShouldProcess($target, "Back up $srcSubCount subtitle track(s)")) {
-        return "would back up $srcSubCount subtitle track(s) to $([IO.Path]::GetFileName($target))"
-    }
-    $subArgs = @('--quiet', '--output', $partialSubs, '--no-video', '--no-audio', '--no-chapters', '--no-attachments', '--no-global-tags', $SourceFile)
-    if ($Plumbing) { Invoke-ToolLogged $script:mkvmerge $subArgs } else { & $script:mkvmerge @subArgs }
-    if ($LASTEXITCODE -ge 2) {
-        Remove-Item -LiteralPath $partialSubs -Force -ErrorAction SilentlyContinue
-        throw "mkvmerge failed backing up subtitles (exit code $LASTEXITCODE)"
-    }
-    $gotCount = @(Get-MkvTracks $partialSubs | Where-Object { $_.type -eq 'subtitles' }).Count
-    if ($gotCount -ne $srcSubCount) {
-        throw "Subtitle backup has $gotCount track(s), the source has $srcSubCount. Left for inspection: $partialSubs"
-    }
-    Move-Item -LiteralPath $partialSubs -Destination $target -Force
-    if ($Replace -and (Test-Path -LiteralPath $reviewSubs)) {
-        Remove-Item -LiteralPath $reviewSubs -Force   # stale review copy, superseded by this one
-    }
-    return "backed up $srcSubCount subtitle track(s) to $([IO.Path]::GetFileName($target))"
-}
-
 # ================================================================ one pair
 
 function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
@@ -769,15 +711,33 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
                 $droppedSecs = $droppedFrames * $frameSecs
             }
         }
+        # Measured by the caller (Encode-Batch, from compare_encode's alignment): which source
+        # frame the encode starts at. More exact than the frame count, which can't tell frames
+        # missing at the start from ones missing elsewhere (e.g. the last couple).
+        if ($SourceStartFrames -ge 0) {
+            if ($srcFrames -gt 0 -and $destFrames -gt 0 -and $droppedFrames -ne $SourceStartFrames) {
+                Write-Host ("Sync: the encode starts at the source's frame {0} (measured); it has {1} fewer frames in all, so {2} are missing elsewhere (usually the end)" -f
+                    $SourceStartFrames, ($srcFrames - $destFrames), ($srcFrames - $destFrames - $SourceStartFrames)) -ForegroundColor Yellow
+            }
+            $droppedFrames = $SourceStartFrames
+            $droppedSecs = $droppedFrames * $frameSecs
+        }
     }
     # Where the encode's first frame was in the source's timeline.
     $srcVideoRef = $srcVideoStart + $droppedSecs
     $syncMs = [int][Math]::Round(($destVideoStart - $srcVideoRef) * 1000)
     if ([Math]::Abs($syncMs) -lt 10) { $syncMs = 0 }
+    # Picture too early (the usual case: the encoder dropped undecodable leading frames and
+    # started the rest at 0): delay the video, so audio and subtitles keep the source's timing.
+    # Picture too late: delay the audio (a negative delay would cut the start of the video).
+    $videoDelayMs = 0; $audioShiftMs = 0
+    if ($syncMs -lt 0) { $videoDelayMs = -$syncMs } elseif ($syncMs -gt 0) { $audioShiftMs = $syncMs }
     $script:PlanSyncMs = $syncMs
+    $script:PlanVideoDelayMs = $videoDelayMs
+    $script:PlanAudioShiftMs = $audioShiftMs
     $script:PlanDroppedFrames = $droppedFrames
-    if ($syncMs -ne 0) {
-        $script:SubShiftNote = "shift its .srt subtitles by $syncMs ms (encode is missing $droppedFrames frame(s); video start $([Math]::Round($srcVideoStart, 3))s -> $([Math]::Round($destVideoStart, 3))s)"
+    if ($audioShiftMs -ne 0) {
+        $script:SubShiftNote = "shift its .srt subtitles by $audioShiftMs ms (Convert-Subtitles -OffsetMs $audioShiftMs; video start $([Math]::Round($srcVideoStart, 3))s -> $([Math]::Round($destVideoStart, 3))s)"
     }
 
     if ($srcVideo.Count -gt 0 -and (Test-DolbyVision $srcVideo[0]) -and -not $destHasDv) {
@@ -1201,7 +1161,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $tagsFile = Join-Path $tempDir ('abr-' + [guid]::NewGuid().ToString('N') + '.xml')
     $mk.AddRange([string[]]@('--output', $partialFile, '--title', $videoTitle, '--global-tags', $tagsFile))
     $mk.AddRange([string[]]@('--video-tracks', "$vid", '--no-audio', '--no-subtitles', '--no-chapters',
-        '--no-global-tags', '--no-attachments', '--track-name', "${vid}:$videoTitle", $DestFile))
+        '--no-global-tags', '--no-attachments', '--track-name', "${vid}:$videoTitle"))
+    if ($videoDelayMs -ne 0) { $mk.AddRange([string[]]@('--sync', "${vid}:$videoDelayMs")) }
+    $mk.Add($DestFile)
 
     $srcIds = @($outputs | Where-Object { $_.From -eq 'source' } | ForEach-Object { $audio[$_.SrcPos].MkvId })
     $mk.AddRange([string[]]@('--no-video', '--no-subtitles', '--no-global-tags', '--no-attachments'))
@@ -1217,7 +1179,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $mk.AddRange([string[]]@('--language', "${tid}:$AudioLanguage", '--track-name', "${tid}:$($o.Title)",
             '--default-track-flag', "${tid}:$(if ($o.IsDefault) { 'yes' } else { 'no' })"))
         if ($o.IsCommentary) { $mk.AddRange([string[]]@('--commentary-flag', "${tid}:yes")) }
-        if ($syncMs -ne 0) { $mk.AddRange([string[]]@('--sync', "${tid}:$syncMs")) }
+        if ($audioShiftMs -ne 0) { $mk.AddRange([string[]]@('--sync', "${tid}:$audioShiftMs")) }
         $trackOpts[$i] = "1:$tid"
     }
     $mk.Add($SourceFile)
@@ -1226,7 +1188,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         if ($o.From -ne 'encode') { continue }
         $mk.AddRange([string[]]@('--no-chapters', '--no-global-tags', '--language', "0:$AudioLanguage",
             '--track-name', "0:$($o.Title)", '--default-track-flag', "0:$(if ($o.IsDefault) { 'yes' } else { 'no' })"))
-        if ($syncMs -ne 0) { $mk.AddRange([string[]]@('--sync', "0:$syncMs")) }
+        if ($audioShiftMs -ne 0) { $mk.AddRange([string[]]@('--sync', "0:$audioShiftMs")) }
         $mk.Add($o.TempFile)
         $trackOpts[$i] = "${fileNo}:0"
         $fileNo++
@@ -1240,9 +1202,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         Write-Host ("Sync: the encode is missing the source's first {0} video frame(s) ({1:N3}s), dropped by the encoder" -f
             $droppedFrames, $droppedSecs) -ForegroundColor Yellow
     }
-    if ($syncMs -ne 0) {
-        Write-Host ("Sync: encode's first frame is at {0:N3}s in the source's timeline and {1:N3}s in the encode; shifting all audio by {2} ms" -f
-            $srcVideoRef, $destVideoStart, $syncMs) -ForegroundColor Yellow
+    if ($videoDelayMs -ne 0) {
+        Write-Host ("Sync: encode's first frame is at {0:N3}s in the source's timeline and {1:N3}s in the encode; delaying the video by {2} ms (audio and subtitles keep the source's timing)" -f
+            $srcVideoRef, $destVideoStart, $videoDelayMs) -ForegroundColor Yellow
+    } elseif ($audioShiftMs -ne 0) {
+        Write-Host ("Sync: encode's first frame is at {0:N3}s in the source's timeline and {1:N3}s in the encode; delaying all audio by {2} ms" -f
+            $srcVideoRef, $destVideoStart, $audioShiftMs) -ForegroundColor Yellow
     } else {
         Write-Host ("Sync: video starts at {0:N3}s in both; no shift needed" -f $destVideoStart)
     }
@@ -1277,7 +1242,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     if ($destIsMp4) { $what += ' (MP4 migrated to MKV)' }
 
     if (-not $script:Cmdlet.ShouldProcess($DestFile, $action)) {
-        if ($syncMs -ne 0) { $what += " (audio shifted $syncMs ms; $droppedFrames dropped frame(s))" }
+        if ($videoDelayMs -ne 0) { $what += " (video delayed $videoDelayMs ms; $droppedFrames dropped frame(s))" }
+        elseif ($audioShiftMs -ne 0) { $what += " (audio delayed $audioShiftMs ms)" }
         return New-Result 'Planned' "${what}: $trackLabel; $titleDesc"
     }
 
@@ -1408,7 +1374,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         }
     }
 
-    if ($syncMs -ne 0) { $what += " (audio shifted $syncMs ms; $droppedFrames dropped frame(s))" }
+    if ($videoDelayMs -ne 0) { $what += " (video delayed $videoDelayMs ms; $droppedFrames dropped frame(s))" }
+    elseif ($audioShiftMs -ne 0) { $what += " (audio delayed $audioShiftMs ms)" }
     $msg = "${what}: $trackLabel; $titleDesc"
     if ($notes.Count -gt 0) { $msg += "; NOTE: $($notes -join '; ')" }
     return New-Result 'Done' $msg
@@ -1484,8 +1451,10 @@ function Write-PlumbingResult([string]$Status, [string]$Message, [string]$Output
     $result = [ordered]@{
         Status = $Status; Message = $Message; Output = $Output
         Summary = (Get-AudioSummary $tracks); Tracks = $tracks; Dropped = @($script:PlanDropped)
-        SyncMs = $script:PlanSyncMs; DroppedFrames = $script:PlanDroppedFrames; SubtitleShift = [string]$script:SubShiftNote
-        NoLossless = [bool]$script:FlagNoLossless; Subtitles = $script:SubInfo
+        SyncMs = $script:PlanSyncMs; DroppedFrames = $script:PlanDroppedFrames
+        VideoDelayMs = $script:PlanVideoDelayMs; AudioShiftMs = $script:PlanAudioShiftMs; SubtitleShiftMs = $script:PlanAudioShiftMs
+        SubtitleShift = [string]$script:SubShiftNote
+        NoLossless = [bool]$script:FlagNoLossless
         Warnings = @($warn); LogPath = $logPath
     }
     [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 6 -Compress))
@@ -1494,10 +1463,11 @@ function Write-PlumbingResult([string]$Status, [string]$Message, [string]$Output
 $script:PlanTracks = @()
 $script:PlanDropped = @()
 $script:PlanSyncMs = 0
+$script:PlanVideoDelayMs = 0
+$script:PlanAudioShiftMs = 0
 $script:PlanDroppedFrames = 0
 $script:SubShiftNote = ''
 $script:FlagNoLossless = $false
-$script:SubInfo = [ordered]@{ File = ''; Tracks = 0; Message = ''; Error = '' }
 
 # Anything that stops the script outside the per-title handling (a missing tool, bad
 # arguments): still save the log and, with -Plumbing, report it as Failed.
@@ -1535,7 +1505,6 @@ $unmatched        = [Collections.Generic.List[string]]::new()
 $noLosslessTitles = [Collections.Generic.List[string]]::new()
 $stereoChecks     = [Collections.Generic.List[string]]::new()
 $lengthChecks     = [Collections.Generic.List[string]]::new()
-$subBackups       = [Collections.Generic.List[string]]::new()
 $subShifts        = [Collections.Generic.List[string]]::new()
 
 
@@ -1576,6 +1545,7 @@ if (-not $batch) {
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
 } else {
     if ($SourceTrack -ge 0) { throw '-SourceTrack only works with single files.' }
+    if ($SourceStartFrames -ge 0) { throw '-SourceStartFrames only works with single files.' }
     if ($script:PassMode -ne 'Auto') {
         throw '-PassthruCommentaries only works with single files. Folders always keep detected commentary automatically.'
     }
@@ -1633,6 +1603,8 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
         $script:PlanTracks = @()
         $script:PlanDropped = @()
         $script:PlanSyncMs = 0
+        $script:PlanVideoDelayMs = 0
+        $script:PlanAudioShiftMs = 0
         $script:PlanDroppedFrames = 0
         $r = Invoke-AudioRebuild $p.Source $p.Video
         $lastResult = $r
@@ -1649,27 +1621,6 @@ for ($n = 0; $n -lt $pairs.Count; $n++) {
         $failed.Add("$name`n      $($_.Exception.Message)")
         $lastResult = New-Result 'Failed' $_.Exception.Message
         Write-Warning $_.Exception.Message
-    }
-    if (-not $SkipSubtitles) { try {
-        $subMsg = Export-SubtitleBackup $p.Source $p.Video
-        $script:SubInfo.Message = $subMsg
-        if ($subMsg) { $subBackups.Add("$name  ($subMsg)"); Write-Host "Subtitles: $subMsg" }
-    } catch {
-        $failed.Add("$name (subtitle backup)`n      $($_.Exception.Message)")
-        $script:SubInfo.Error = $_.Exception.Message
-        Write-Warning $_.Exception.Message
-    } }
-    if ($Plumbing -and -not $SkipSubtitles) {
-        # The backup that's there now (made by this run or an earlier one) and its track count.
-        $vDir = [IO.Path]::GetDirectoryName($p.Video)
-        $vBase = [IO.Path]::GetFileNameWithoutExtension($p.Video)
-        foreach ($cand in @(($vBase + '.mks'), ($vBase + '.remux.mks'))) {
-            $full = Join-Path $vDir $cand
-            if (-not (Test-Path -LiteralPath $full)) { continue }
-            $script:SubInfo.File = $cand
-            try { $script:SubInfo.Tracks = @(Get-MkvTracks $full | Where-Object { $_.type -eq 'subtitles' }).Count } catch { }
-            break
-        }
     }
 }
 
@@ -1698,7 +1649,6 @@ Add-Section 'MKVs without a mirrored encoded file (in otherwise matched folders)
 Add-Section 'No lossless audio in the source (best lossy track used)' $noLosslessTitles
 Add-Section 'Track comparison (lossy tracks vs the main track)' $stereoChecks
 Add-Section 'Audio and video lengths differ in the source by more than 2 s (check playback)' $lengthChecks
-Add-Section 'Subtitle backups' $subBackups
 Add-Section 'Skipped' $skipped
 Add-Section 'Planned (dry run)' $planned
 Add-Section 'Done' $done
