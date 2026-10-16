@@ -391,7 +391,7 @@ quick() {  # prints mean VMAF or nothing
 # scores best. Prints "<best_shift> <best_score>" on stdout; diagnostics go to stderr.
 probe_shift() {
   local off="$1"
-  local best_shift=0 best_score=-1 s score dir lim
+  local best_shift=0 best_score=-1 s score dir lim second=-1
   local results=""
   for s in 0 1 2 -1 -2; do
     if [ "$s" -ge 0 ]; then dt="trim=start_frame=$s,setpts=PTS-STARTPTS,"; rt=""
@@ -399,7 +399,8 @@ probe_shift() {
     score=$(quick "$dt" "$rt" "$off")
     [ -z "$score" ] && score=0
     results="${results}${s}:${score} "
-    awk -v sc="$score" -v best="$best_score" 'BEGIN{exit !(sc>best)}' && { best_score=$score; best_shift=$s; }
+    if awk -v sc="$score" -v best="$best_score" 'BEGIN{exit !(sc>best)}'; then second=$best_score; best_score=$score; best_shift=$s
+    elif awk -v sc="$score" -v b="$second" 'BEGIN{exit !(sc>b)}'; then second=$score; fi
   done
   # Best at an edge: keep going that way while it improves (up to SHIFT_MAX frames), so an
   # offset a little bigger than expected is found instead of scored wrong.
@@ -413,14 +414,14 @@ probe_shift() {
       [ -z "$score" ] && score=0
       results="${results}${s}:${score} "
       awk -v sc="$score" -v best="$best_score" 'BEGIN{exit !(sc>best)}' || break
-      best_score=$score; best_shift=$s
+      second=$best_score; best_score=$score; best_shift=$s
     done
     if [ $(( best_shift * dir )) -ge "$lim" ]; then
       echo "  WARNING: the best shift at ${off}s is at the search limit (${best_shift}); the real offset may be bigger." >&2
     fi
   fi
   echo "  shift scores @ ${off}s: ${results}-> best shift ${best_shift} (score ${best_score})" >&2
-  echo "$best_shift $best_score"
+  echo "$best_shift $best_score $second"
 }
 
 # Given a frame-shift integer, echoes "<enc_trim>|<ref_trim>" filter-chain fragments (either
@@ -597,9 +598,9 @@ score_pair() {
   if [ "$FULL" -eq 1 ]; then
     P10=$(( DO * 10 / 100 )); P50=$(( DO / 2 )); P90=$(( DO * 90 / 100 ))
     echo "Full-file mode: checking alignment at 10% (${P10}s), 50% (${P50}s), and 90% (${P90}s) ..."
-    read -r S10 SC10 <<< "$(probe_shift "$P10")"
-    read -r S50 SC50 <<< "$(probe_shift "$P50")"
-    read -r S90 SC90 <<< "$(probe_shift "$P90")"
+    read -r S10 SC10 _ <<< "$(probe_shift "$P10")"
+    read -r S50 SC50 _ <<< "$(probe_shift "$P50")"
+    read -r S90 SC90 _ <<< "$(probe_shift "$P90")"
     echo "  10%: shift ${S10} (score ${SC10})   50%: shift ${S50} (score ${SC50})   90%: shift ${S90} (score ${SC90})"
 
     if [ "$S10" = "$S50" ] && [ "$S50" = "$S90" ]; then
@@ -607,6 +608,19 @@ score_pair() {
       CHOSEN=$S10
       # Where the encode starts in the original, for syncing its audio (Encode-Batch reads this).
       echo "Start: the encode's first frame is the original's frame $(( ${LEADN:-0} - CHOSEN )) (measured)"
+      # The whole-file score decodes from the very first frame, without seeking. A few sources
+      # (VC-1 especially) come out one frame different that way than after a seek, so check the
+      # shift at the start too and score with it, when the start can tell shifts apart (a clear
+      # winner; a static or dark opening can't).
+      read -r S0 SC0 SC0b <<< "$(probe_shift 0)"
+      if [ "$S0" != "$CHOSEN" ]; then
+        if awk -v a="$SC0" -v b="$SC0b" 'BEGIN { exit !(a >= 70 && a - b >= 10) }'; then
+          echo "  -> from the very start it lines up at shift ${S0} (score ${SC0}); decoding from the start differs from seeking in this file, so the whole file is scored with ${S0}."
+          CHOSEN=$S0
+        else
+          echo "  -> the start suggests shift ${S0}, but too weakly to tell (score ${SC0}, next best ${SC0b}); keeping ${CHOSEN}."
+        fi
+      fi
     else
       echo "  WARNING: alignment differs across the file (10%=${S10}, 50%=${S50}, 90%=${S90})."
       echo "           This means drift starts somewhere between these points, or one of them is a"
@@ -623,7 +637,7 @@ score_pair() {
   else
     local SHIFTS=() SH SC
     for off in "${OFFS[@]}"; do
-      read -r SH SC <<< "$(probe_shift "$off")"
+      read -r SH SC _ <<< "$(probe_shift "$off")"
       if awk -v b="$SC" 'BEGIN{exit !(b<50)}'; then
         echo "  WARNING: no shift tried scored above 50 at ${off}s; drift here exceeds what this"
         echo "           script compensates for, or there is a genuine content difference. Treat this"
