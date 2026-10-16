@@ -6,7 +6,9 @@
     PowerShell 5.1.
 
 .DESCRIPTION
-    For each .mkv found (recursively) under -Source, mirrored into -Dest:
+    For each .mkv found (recursively) under -Source, mirrored into -Dest. A source folder holding
+    a file named DONE (no extension; you add it once you've signed the folder off) is skipped:
+    its MKVs aren't looked at (sub-folders are judged on their own; see -CompleteMarker).
 
       Dest\<same sub-folders>\
           <name>.mkv                   the finished encode, with audio (ladder mode, see below)
@@ -61,6 +63,9 @@
                      otherwise finished.
           none pass: passes the bar but over -MaxPct -> try smaller; fails the bar -> try bigger.
         A rung is never repeated, so the search always ends, at worst at an end of the ladder.
+      - Margins: a step is skipped when it's very likely pointless: to a weaker rung from a passer
+        that clears the bar by less than -SkipMarginPct (it would fail), or to a stronger rung from
+        one within -SkipSizePct points of -MaxPct (it would be over the cap). Logged as KNOWN.
       - Folder memory: when the next step is a rung right next to the folder's pick, and the title
         that set the pick already tried it (and lost), it's skipped if this title's result at the
         pick is about the same (-SimilarPct, -SimilarVmaf). E.g. E01: cqp22 17%, cqp20 25% -> picks
@@ -116,15 +121,17 @@
 
     Work is a queue, not one thread per title:
       - Prep (one title at a time, no encoder slot used): probe with ffprobe (and mediainfo when
-        installed); skip VC-1 (-SkipVC1) and Dolby Vision other than 7 / 8.1. For profile 7:
+        installed); skip Dolby Vision other than 7 / 8.1 (and VC-1 with -SkipVC1 $true). For profile 7:
         see "Dolby Vision 7" below. Then CropDetect -Plumbing for the Suggested crop.
       - Encodes (up to -Threads at once, GPU): each free slot takes the next encode of the oldest
         title that has one ready, so an earlier title's next rung always goes first. A title waiting on VMAF to choose its next rung doesn't hold a
         slot; the slot moves on to another title. Up to -Threads + 2 searches from scratch are in
         progress at once; titles starting from their folder's pick aren't limited and are prepped
         one ahead, as is one title per folder that's waiting for its folder's pick.
-      - VMAF (up to -VmafThreads at once, CPU): each finished encode is scored with
-        compare_encode --full (exact crop) while the encoder slot moves on.
+      - VMAF (up to -VmafThreads at once, on the GPU: its video decoders and CUDA, through WSL):
+        each finished encode is scored with compare_encode --full (exact crop) while the encoder
+        slot moves on. The encodes decode on the CPU (-Decoder avsw), leaving the GPU's decoders
+        to the scoring.
 
     Two variants of one title share its .encode.log; every line is prefixed with the variant name.
 
@@ -188,7 +195,7 @@
         -Variants @{Cqp=22;Aq=4}, @{Cqp=24;Aq=8}, @{Cqp=26;Aq=8}
 
 .EXAMPLE
-    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest D:\Encodes -SkipVC1:$false
+    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest D:\Encodes -SkipVC1 $true
 #>
 [CmdletBinding()]
 param(
@@ -211,11 +218,14 @@ param(
     # Encoder slots: how many variants (of any titles) encode at once.
     [ValidateRange(1, 2)][int]$Threads = 2,
 
-    # VMAF slots: how many compare_encode runs (CPU, in WSL) at once, alongside the encodes.
-    [ValidateRange(1, 4)][int]$VmafThreads = 2,
+    # VMAF slots: how many compare_encode runs (in WSL) at once, alongside the encodes. Each one
+    # decodes the source and the encode at the same time on the GPU's video decoders, which one
+    # run already keeps busy, so a second run mostly just shares them.
+    [ValidateRange(1, 4)][int]$VmafThreads = 1,
 
-    # Skip VC-1 sources (encodes from them don't currently pass VMAF alignment). -SkipVC1:$false to include.
-    [bool]$SkipVC1 = $true,
+    # Skip VC-1 sources. Off by default now that compare_encode scores them reliably (it decodes
+    # VC-1 on the CPU). -SkipVC1 $true to leave them out.
+    [bool]$SkipVC1 = $false,
 
     [int]$MinFreeGB = 200,
     [int]$MinFreeDoviGB = 400,
@@ -254,9 +264,25 @@ param(
     [double]$SimilarPct = 3,
     [double]$SimilarVmaf = 1,
 
+    # Don't try a rung that would very likely be pointless:
+    #   SkipMarginPct: a passing rung's mean, p1 or min clears its bar by less than this % (e.g.
+    #     1: a 93.5 mean bar needs 94.44), so the next weaker rung would very likely fail. Per 2
+    #     CQP between the rungs (half for a rung 1 CQP away; rungs differing only in AQ are tried).
+    #     1 is below the smallest 2-CQP drop seen so far (mean -1.4%, p1 -2.8%, min -4.2%), so it
+    #     only skips rungs that even a small drop would fail.
+    #   SkipSizePct: a rung is already within this many points of -MaxPct (e.g. 5 with a 70% cap:
+    #     65% or more), so the next stronger rung would very likely be over the cap.
+    # The skip is logged ("KNOWN ... skipped ..."). 0 turns either off.
+    [double]$SkipMarginPct = 1,
+    [double]$SkipSizePct = 5,
+
     # Ladder mode, once a title has a suggested variant: add the Blu-ray audio to it with
     # Add-BluRayAudio (-Replace), move it up to the mirrored folder (Dest\...\<name>.mkv), and
     # delete this title's other variants. -NoAudio skips the audio, -KeepVariants the deleting.
+    # A SOURCE folder holding a file with this name is finished and signed off: its MKVs are
+    # skipped entirely. Only that folder; sub-folders are judged on their own. '' turns it off.
+    [string]$CompleteMarker = 'DONE',
+
     [string]$AddBluRayAudio = (Join-Path $PSScriptRoot 'Add-BluRayAudio.ps1'),
     [switch]$NoAudio,
     [switch]$KeepVariants,
@@ -282,6 +308,11 @@ param(
 
     [string]$NVEncC = (Join-Path $env:APPDATA 'NVEnc\NVEncC64.exe'),
     [string]$CropDetect = (Join-Path $PSScriptRoot 'CropDetect.ps1'),
+    # Which of CropDetect's crops to encode with: Strict (default) = solid black bars only, on
+    # every side that has them; Suggested = also soft (darkened) edges, only beside black bars;
+    # Full = also all soft edges. All three are saved in <name>.crop.json, so switching needs no
+    # rescan. A crop.json you edited by hand is always used as is.
+    [ValidateSet('Strict', 'Suggested', 'Full')][string]$CropMode = 'Strict',
     # How NVEncC decodes the source. avsw (default) = on the CPU, leaving the GPU's video decoder
     # to compare_encode, which decodes two streams per score on it; avhw = on the GPU's decoder.
     [ValidateSet('avhw', 'avsw')][string]$Decoder = 'avsw',
@@ -562,6 +593,32 @@ eb_ensure_visible() {
     }
 
     # ffprobe (+ mediainfo when available) summary of the first video stream.
+    # The crop to use from a crop.json (CropDetect -Plumbing): its top level is the crop in use,
+    # Mode says which kind it is, and Crops holds all three (Strict: black bars only; Suggested:
+    # plus soft edges beside black bars; Full: plus all soft edges). A different -CropMode
+    # switches to that one and rewrites the file. A top level that matches none of them was
+    # edited by hand and is always kept, as is a crop.json from an older CropDetect (no Crops).
+    function Select-CropMode {
+        param($Crop, [string]$Mode, [string]$Path)
+        if (-not $Crop -or -not $Crop.PSObject.Properties['Crops'] -or -not $Crop.Crops) { return $Crop }
+        $want = $Crop.Crops.PSObject.Properties[$Mode]
+        if (-not $want) { return $Crop }
+        $want = $want.Value
+        $keys = 'Width', 'Height', 'Left', 'Top', 'Right', 'Bottom'
+        $same = { param($a, $b) -not @($keys | Where-Object { [int]$a.$_ -ne [int]$b.$_ }).Count }
+        $cur = [string]$Crop.Mode
+        $curBox = $(if ($cur -and $Crop.Crops.PSObject.Properties[$cur]) { $Crop.Crops.$cur } else { $null })
+        if ($curBox -and -not (& $same $Crop $curBox)) {
+            Write-Log "Crop: $([IO.Path]::GetFileName($Path)) was edited by hand; using it as is (-CropMode $Mode not applied)"
+            return $Crop
+        }
+        if ($cur -eq $Mode) { return $Crop }
+        foreach ($k in $keys) { $Crop.$k = [int]$want.$k }
+        $Crop | Add-Member -NotePropertyName Mode -NotePropertyValue $Mode -Force
+        try { [IO.File]::WriteAllText($Path, ($Crop | ConvertTo-Json -Compress -Depth 4), $script:Utf8) } catch { }
+        $Crop
+    }
+
     # Frames shown before a file's first keyframe (from its first 300 packets): a source cut
     # mid-sequence (e.g. an episode taken out of one long stream on the disc) starts with frames
     # that need the previous scene to decode. Decoders, and so the encoder, throw them away, so
@@ -854,6 +911,50 @@ eb_ensure_visible() {
         -2
     }
 
+    # Whether the next rung is very likely pointless, judged from its neighbour's result:
+    #   - stepping to a weaker rung from a passer whose mean, p1 or min clears the bar by less than
+    #     $QualityPct % (e.g. 1: a 93.5 mean bar needs 94.44): the weaker one would fail.
+    #     Scaled by how far apart the two rungs' CQPs are, per 2 CQP (so 1% for a rung 1 CQP away,
+    #     0 for rungs that only differ in AQ); unscaled when a rung has no CQP.
+    #   - stepping to a stronger (bigger) rung from one within $SizePct points of the size cap
+    #     (e.g. 5 with a 70% cap: 65% or more): the stronger one would be over the cap.
+    # Returns the reason to skip, or ''. $Cqps: each rung's CQP (NaN if none).
+    function Get-MarginSkipReason {
+        param([hashtable]$Tried, [int]$Rung, [string[]]$Names, [double[]]$Cqps, [double]$MinMean, [double]$MinP1, [double]$MinMin,
+            [double]$MaxPct, [double]$QualityPct = 1, [double]$SizePct = 5)
+        $doneKeys = @($Tried.Keys | Where-Object { $null -ne $Tried[$_] } | ForEach-Object { [int]$_ })
+        $upper = @($doneKeys | Where-Object { $_ -gt $Rung } | Sort-Object | Select-Object -First 1)
+        $lower = @($doneKeys | Where-Object { $_ -lt $Rung } | Sort-Object -Descending | Select-Object -First 1)
+        if ($QualityPct -gt 0 -and $upper.Count) {
+            $u = $Tried[$upper[0]]
+            if ((Get-VariantClass $u $MinMean $MinP1 $MinMin $MaxPct) -eq 'pass') {
+                $need = $QualityPct
+                if ($Cqps -and $Rung -lt $Cqps.Count -and $upper[0] -lt $Cqps.Count -and -not [double]::IsNaN($Cqps[$Rung]) -and -not [double]::IsNaN($Cqps[$upper[0]])) {
+                    $need = $QualityPct * [Math]::Abs($Cqps[$Rung] - $Cqps[$upper[0]]) / 2
+                }
+                if ($need -gt 0) {
+                    foreach ($m in @(@('Mean', $MinMean, 'mean'), @('P1', $MinP1, 'p1'), @('Min', $MinMin, 'min'))) {
+                        $bar = [double]$m[1]
+                        if ($bar -le 0) { continue }
+                        $have = ([double]$u.($m[0]) / $bar - 1) * 100
+                        if ($have -lt $need) {
+                            return ("skipped {0}: {1}'s {2} {3:0.00} clears the {4} bar by only {5:0.0}% (under {6:0.#}%), so {0} would very likely fail" -f
+                                $Names[$Rung], $Names[$upper[0]], $m[2], [double]$u.($m[0]), $bar, $have, $need)
+                        }
+                    }
+                }
+            }
+        }
+        if ($SizePct -gt 0 -and $lower.Count) {
+            $l = $Tried[$lower[0]]
+            if ($null -ne $l.Pct -and $l.Pct -ge $MaxPct - $SizePct -and $l.Pct -lt $MaxPct -and (Get-VariantClass $l $MinMean $MinP1 $MinMin $MaxPct) -ne 'error') {
+                return ("skipped {0}: {1} is already {2:0.#}% of the source (within {3:0.#} points of the {4:0.#}% cap), so {0} would very likely be over it" -f
+                    $Names[$Rung], $Names[$lower[0]], $l.Pct, $SizePct, $MaxPct)
+            }
+        }
+        ''
+    }
+
     # Whether rung $Rung can be skipped for a title because its folder's reference title already
     # answered it. $Ref = @{ Name; Pick (rung it chose); Rows (rung -> row it encoded) }.
     # Only for a neighbour of the reference's pick: the reference tried both and chose its pick, so
@@ -988,6 +1089,7 @@ $PrepBody = {
             }
         }
         if (-not $crop) { return (Done 'Failed' 'no crop for the 1080p copy (CropDetect failed, or no profile 7 video left to read).') }
+        $crop = Select-CropMode $crop $Cfg.CropMode $parentCrop
         # Fit the cropped picture in 1920x1080, even dimensions.
         $cw = [int]$crop.Width; $ch = [int]$crop.Height
         $scale = [Math]::Min([double]1, [Math]::Min(1920.0 / $cw, 1080.0 / $ch))
@@ -1239,7 +1341,9 @@ $PrepBody = {
             }
         }
         if (-not $crop) { return (Done 'Failed' 'CropDetect did not return a crop.') }
-        Write-Log ("Crop: {0}x{1} (L{2} T{3} R{4} B{5}) from {6}x{7}" -f $crop.Width, $crop.Height, $crop.Left, $crop.Top, $crop.Right, $crop.Bottom, $crop.SourceWidth, $crop.SourceHeight)
+        $crop = Select-CropMode $crop $Cfg.CropMode $cropFile
+        Write-Log ("Crop: {0}x{1} (L{2} T{3} R{4} B{5}) from {6}x{7}, {8}" -f $crop.Width, $crop.Height, $crop.Left, $crop.Top, $crop.Right, $crop.Bottom, $crop.SourceWidth, $crop.SourceHeight,
+            $(if ($crop.PSObject.Properties['Mode'] -and $crop.Mode) { "$($crop.Mode) crop" } else { 'crop from an older CropDetect (delete the crop.json to redo it)' }))
         $ready = Done 'Ready' '' $workSrc $isDv81 $crop $localCopy
         if ($Cfg.Info.Dv -eq 'P7' -and $doviNote) { $ready | Add-Member -NotePropertyName DoviNote -NotePropertyValue $doviNote }
         return $ready
@@ -1338,7 +1442,7 @@ $EncodeBody = {
     'EB_RESULT:' + ($row | ConvertTo-Json -Depth 4 -Compress)
 }
 
-# VMAF slot (CPU): compare_encode --full in WSL on a finished encode.
+# VMAF slot: compare_encode --full in WSL (GPU decode and libvmaf_cuda) on a finished encode.
 $VmafBody = {
     function Invoke-Vmaf {
       try {
@@ -1670,7 +1774,7 @@ function ConvertTo-VariantSpec($v) {
     $name = $name.Trim()
     if (-not $v.ContainsKey('Cqp') -and -not ($v.ContainsKey('Extra') -and $v.Extra)) { throw "Variant needs Cqp (or a rate control in Extra): $(($v.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')" }
     if (-not $name -or $name.IndexOfAny($invalid) -ge 0) { throw "Variant name '$name' isn't a valid folder name; set Name." }
-    @{ Name = $name; Args = $argList }
+    @{ Name = $name; Args = $argList; Cqp = $(if ($v.ContainsKey('Cqp')) { [double]$v.Cqp } else { [double]::NaN }) }
 }
 $fixedMode = $null -ne $Variants -and $Variants.Count -gt 0
 $specs = @()
@@ -1695,7 +1799,7 @@ $ri = 0
 foreach ($s in $specs) { Write-Log ("{0} '{1}': {2}" -f $(if ($fixedMode) { 'Variant' } else { "Rung $ri" }), $s.Name, ($s.Args -join ' ')); $ri++ }
 Write-Log "Bar: mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; top bar (under $TargetPct%, good enough): mean >= $TopMean, p1 >= $TopP1, min >= $TopMin"
 
-Write-Log ("Slots: {0} encode (GPU){1}" -f $Threads, $(if ($SkipVmaf) { ', VMAF off' } else { ", $VmafThreads VMAF (CPU)" }))
+Write-Log ("Slots: {0} encode (GPU){1}" -f $Threads, $(if ($SkipVmaf) { ', VMAF off' } else { ", $VmafThreads VMAF (GPU)" }))
 
 foreach ($tool in 'ffprobe', 'ffmpeg') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool not found on PATH (needed for probing and CropDetect)." }
@@ -1746,6 +1850,7 @@ if ($finishing -and -not $NoSubtitles) {
     if (-not (Get-Command mkvmerge -ErrorAction SilentlyContinue) -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvmerge.exe'))) { throw 'mkvmerge not found (Convert-Subtitles needs MKVToolNix): add "C:\Program Files\MKVToolNix" to PATH, or use -NoSubtitles.' }
     if (-not (Get-Command paddleocr -ErrorAction SilentlyContinue)) { Write-Log 'paddleocr is not on PATH: seconv''s OCR of Blu-ray subtitles will probably fail (the titles are then listed under SUBTITLES TO REVIEW; or use -NoSubtitles)' 'Yellow' }
 }
+Write-Log "Crop: $CropMode ($(switch ($CropMode) { 'Strict' { 'solid black bars only' } 'Suggested' { 'black bars, plus soft edges beside them' } 'Full' { 'black bars and all soft edges' } }); a hand-edited <name>.crop.json is used as is)"
 if (-not $fixedMode) {
     Write-Log ("Finishing: {0}" -f $(if (-not $finishing) { 'off (-NoAudio -KeepVariants)' } else {
         (@($(if (-not $NoAudio) { "audio with $AddBluRayAudio" }), $(if (-not $NoSubtitles) { "subtitles with $ConvertSubtitles" }),
@@ -1813,7 +1918,28 @@ if ([IO.File]::Exists($srcPath)) {
     } | Sort-Object FullName)
 }
 Write-Log "Found $($files.Count) .mkv file(s)." 'Cyan'
-if (-not $files.Count) { return }
+# Folders you've signed off: a "<CompleteMarker>" (DONE) file in a source folder skips every
+# MKV directly in that folder. Sub-folders are judged on their own.
+if ($CompleteMarker) {
+    $keep = New-Object System.Collections.Generic.List[object]
+    foreach ($g in @($files | Group-Object DirectoryName)) {
+        $relDir = $g.Name.Substring([Math]::Min($srcRoot.Length, $g.Name.Length)).TrimStart('\', '/')
+        $marker = Join-Path $g.Name $CompleteMarker
+        if (-not [IO.File]::Exists($marker)) { $marker = '' }
+        if ($marker) { Write-Log ("DONE  {0}: {1} found, its {2} .mkv file(s) skipped" -f $(if ($relDir) { $relDir } else { '.' }), $marker, $g.Count) 'DarkGray' }
+        else { foreach ($f in $g.Group) { $keep.Add($f) } }
+    }
+    if ($keep.Count -ne $files.Count) {
+        $files = @($keep.ToArray())
+        Write-Log "$($files.Count) .mkv file(s) left to look at." 'Cyan'
+    }
+}
+if (-not $files.Count) {
+    Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    $tmpParent = Split-Path -Parent $tempDir
+    if ([IO.Directory]::Exists($tmpParent) -and -not @([IO.Directory]::GetFileSystemEntries($tmpParent)).Count) { Remove-Item -LiteralPath $tmpParent -Force -ErrorAction SilentlyContinue }
+    return
+}
 
 $titleList = New-Object System.Collections.Generic.List[object]
 foreach ($f in $files) {
@@ -1847,6 +1973,7 @@ $prepStatusFile = Join-Path $tempDir 'prep.json'
 $folderSeed = @{}                    # source folder -> rung index the last finished title there picked
 $folderRef = @{}                     # source folder -> @{ Name; Pick; Rows } (see Set-FolderMemory)
 $specNames = @($specs | ForEach-Object { $_.Name })
+$specCqps = [double[]]@($specs | ForEach-Object { if ($_.ContainsKey('Cqp')) { [double]$_.Cqp } else { [double]::NaN } })
 
 # A title kept as Dolby Vision 7 gets a 1080p SDR copy: its own title "<name> - 1080p", right after
 # it in the list, made from the profile 7 video (the local copy, else the finished 2160p file, else
@@ -2007,7 +2134,13 @@ function Get-LadderStepFor([hashtable]$Tried, $Start, [string]$Folder, [string]$
     $ref = if ($folderRef.ContainsKey($Folder) -and $folderRef[$Folder].Name -ne $Self) { $folderRef[$Folder] } else { $null }
     while ($true) {
         $i = Get-LadderNext -Tried $Tried -Count $specs.Count -Start $Start -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -Skip $Skipped -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin
-        if ($i -lt 0 -or -not $ref) { return $i }
+        if ($i -lt 0) { return $i }
+        # (not for start rungs, which are tried before any result is in)
+        if (@($Tried.Keys | Where-Object { $null -ne $Tried[$_] }).Count) {
+            $why = Get-MarginSkipReason -Tried $Tried -Rung $i -Names $specNames -Cqps $specCqps -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -QualityPct $SkipMarginPct -SizePct $SkipSizePct
+            if ($why) { $Skipped[$i] = $why; continue }
+        }
+        if (-not $ref) { return $i }
         $why = Get-KnownRungReason -Ref $ref -Tried $Tried -Rung $i -Names $specNames -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -SimilarPct $SimilarPct -SimilarVmaf $SimilarVmaf
         if (-not $why) { return $i }
         $Skipped[$i] = $why
@@ -2330,7 +2463,7 @@ function Start-Prep($t) {
         Helpers = $Helpers.ToString(); EnvPath = $env:PATH; RunId = $runId
         SourceFile = $t.File; BaseName = $t.Base; TitleDir = $t.TitleDir; LogPath = $t.LogPath
         StatusFile = $prepStatusFile; TempDir = $tempDir; Info = $t.Info; Wsl = $wsl
-        CropDetect = $CropDetect; MinFreeDoviGB = $MinFreeDoviGB; LocalCopy = [bool]$LocalCopy; WorkDir = $t.WorkDir; DoviOvershootNits = $DoviOvershootNits
+        CropDetect = $CropDetect; CropMode = $CropMode; MinFreeDoviGB = $MinFreeDoviGB; LocalCopy = [bool]$LocalCopy; WorkDir = $t.WorkDir; DoviOvershootNits = $DoviOvershootNits
         NVEncC = $NVEncC; Derived = [bool]$t.IsDerived; ParentBase = $t.ParentBase; CropHw = [bool]($t.IsDerived -and $t.CropHw); RefSources = @($t.RefSources); SourcePeak = $t.SourcePeak
     }
     $job = Start-Job -ScriptBlock $PrepWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 6 -Compress)
@@ -2558,6 +2691,7 @@ function Format-TitleExtras($ex, [string]$pick) {
         $cropText = if (($c.Top + $c.Bottom + $c.Left + $c.Right) -gt 0) {
             "crop top $($c.Top), bottom $($c.Bottom), left $($c.Left), right $($c.Right)"
         } else { 'no crop' }
+        if ($c.PSObject.Properties['Mode'] -and $c.Mode) { $cropText += ", $($c.Mode.ToLower()) crop" }
         $line = "- **Video:** source $($c.SourceWidth)x$($c.SourceHeight), encoded $($c.Width)x$($c.Height) ($cropText$(if ($c.PSObject.Properties['Scaled'] -and $c.Scaled) { ', scaled to fit 1080p, SDR' }))"
         if ($pick -eq 'source') { $line += '; the finished file is the uncropped source' }
         $line

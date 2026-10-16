@@ -7,7 +7,8 @@
 
 .DESCRIPTION
     Strict crop: ffmpeg cropdetect at every sample point; the union of all samples is the
-    largest area that ever contains picture.
+    largest area that ever contains picture. A side with less than -MinBarPixels (10) of solid
+    black isn't cropped: thin stray lines are left, only real bars are removed.
 
     Soft edges: in the same decode, every frame is reduced to a per-column and per-row
     luma profile. A pixel line at the edge of the strict crop counts as "soft edge" if it is
@@ -26,9 +27,13 @@
 .EXAMPLE
     CropDetect -Source ".\movie.mkv" -Plumbing
     Machine-readable mode for scripts: writes one compressed JSON line per source to the
-    output stream with the Suggested crop, e.g.
+    output stream with the Suggested crop at the top level, and all three crops (Strict:
+    black bars only; Suggested: plus soft edges beside black bars; Full: plus all soft edges)
+    under Crops, e.g.
     {"File":"D:\\movie.mkv","SourceWidth":3840,"SourceHeight":2160,"Width":3840,"Height":1632,
-     "Left":0,"Top":264,"Right":0,"Bottom":264,"Samples":"20/20","EdgeDark":"L9% R9% T0% B1%"}
+     "Left":0,"Top":264,"Right":0,"Bottom":264,"Mode":"Suggested",
+     "Crops":{"Strict":{"Width":3840,"Height":1632,...},"Suggested":{...},"Full":{...}},
+     "Samples":"20/20","EdgeDark":"L9% R9% T0% B1%"}
     Status text still goes to the host/information stream (callers can redirect it with 6>),
     progress bars are suppressed, and nothing is written for a file that can't be analysed.
     Cannot be combined with -Dest.
@@ -62,6 +67,11 @@ param(
 
     # Frames whose reference strip is dimmer than this (8-bit luma, 0-255) are ignored for the soft check.
     [ValidateRange(0, 255)][int]$BrightMin = 48,
+
+    # Strict crop: a side needs at least this many pixels of solid black to be cropped; thinner
+    # (stray lines left on the disc, not a letterbox) is left alone. Soft/Suggested crops still
+    # trim them. 0 or 1 = crop any solid black.
+    [ValidateRange(0, 200)][int]$MinBarPixels = 10,
 
     # Samples that must show picture at an edge before it counts for the strict crop (1 = pure union).
     [ValidateRange(1, 10)][int]$MinSupport = 1,
@@ -328,7 +338,8 @@ function Get-ContentBoxes {
     # 4:2:0 chroma covers 2x2 pixel blocks, so every crop amount (L/T/R/B) must be even. That keeps
     # chroma aligned and, for even source sizes, also makes the width/height even.
     #   Soft (suggested): each side rounded UP   - removes the soft edge fully, may lose 1 line of picture.
-    #   Strict:           each side rounded DOWN - keeps all picture, may leave 1 line of black.
+    #   Strict:           each side rounded DOWN - keeps all picture, may leave 1 line of black;
+    #                     a side with fewer than MinBarPixels of black isn't cropped at all.
     $soft = New-Box -Info $Info `
         -L (ConvertTo-Even ($strict.Left + $eL.Count) -Up) -R (ConvertTo-Even ($strict.Right + $eR.Count) -Up) `
         -T (ConvertTo-Even ($strict.Top + $eT.Count) -Up)  -B (ConvertTo-Even ($strict.Bottom + $eB.Count) -Up)
@@ -340,9 +351,12 @@ function Get-ContentBoxes {
         -T $(if ($strict.Top    -gt 0) { $soft.Top    } else { 0 }) `
         -B $(if ($strict.Bottom -gt 0) { $soft.Bottom } else { 0 })
 
+    # Strict also ignores thin bars: a side with fewer than MinBarPixels of solid black is left
+    # alone (1-2 stray lines on a disc aren't a letterbox). Soft/Suggested still trim them.
+    $bar = { param([int]$v) if ($v -lt $MinBarPixels) { 0 } else { ConvertTo-Even $v } }
     $strict = New-Box -Info $Info `
-        -L (ConvertTo-Even $strict.Left) -R (ConvertTo-Even $strict.Right) `
-        -T (ConvertTo-Even $strict.Top)  -B (ConvertTo-Even $strict.Bottom)
+        -L (& $bar $strict.Left) -R (& $bar $strict.Right) `
+        -T (& $bar $strict.Top)  -B (& $bar $strict.Bottom)
 
     $fmt = { param($e) if ($null -eq $e.OuterPct) { '-' } else { "$($e.OuterPct)%" } }
     [pscustomobject]@{
@@ -378,12 +392,17 @@ foreach ($src in $sources) {
         if (-not $boxes) { Write-Host '  [UNKNOWN] could not detect (all samples black?)' -ForegroundColor Yellow; continue }
         $so = $boxes.Soft; $st = $boxes.Strict; $sg = $boxes.Barred
         if ($Plumbing) {
+            # Top level: the Suggested crop (as before). Crops: all three, so a caller can pick one
+            # without another scan.
+            $pick = { param($b) [ordered]@{ Width = $b.Width; Height = $b.Height; Left = $b.Left; Top = $b.Top; Right = $b.Right; Bottom = $b.Bottom } }
             [pscustomobject]@{
                 File = $src.FullName; SourceWidth = $sInfo.Width; SourceHeight = $sInfo.Height
                 Width = $sg.Width; Height = $sg.Height
                 Left = $sg.Left; Top = $sg.Top; Right = $sg.Right; Bottom = $sg.Bottom
+                Mode = 'Suggested'
+                Crops = [ordered]@{ Strict = (& $pick $st); Suggested = (& $pick $sg); Full = (& $pick $so) }
                 Samples = $boxes.Samples; EdgeDark = $boxes.EdgeDark
-            } | ConvertTo-Json -Compress
+            } | ConvertTo-Json -Compress -Depth 4
             continue
         }
         $line = { param($label, $b, $note, $color)

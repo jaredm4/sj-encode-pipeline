@@ -27,29 +27,38 @@
          shift it gave the audio to match the encode). With no offset the files are exactly
          what seconv wrote. Older "<name>.en*.srt" files from an earlier run are replaced.
 
-    Which track is which (the Default and Forced flags are trusted when they're set; most
-    sources have neither, so the text decides):
-      - One track: the main one (the forced one, if it has the Forced flag).
-      - Forced flag: forced. Default flag without Forced: main.
-      - Much shorter than the longest track (under -SmallPct of its letters): a forced
-        candidate. With several, the one whose lines appear in the main track wins.
-      - Tracks with mostly the same lines (e.g. main and SDH, which match once the
-        hearing-impaired text is removed) are duplicates: the Default one, else the one not
-        named SDH/CC, else the earliest is kept.
-      - Different text: the main one is the one with the Default flag; else the one not named
-        "commentary"; else the one containing the forced track's lines; else the earliest, if
-        the later one is longer (commentary usually has more text than the film). The others
-        are commentary.
-      - Anything left unsure is flagged for review: the best guess is still written, and every
-        track's .srt goes to "_subtitles review\<name>\" in -Dest, labelled with its
-        track number and guessed role, for you to pick from. Encode-Batch lists these at the
-        top of its report.
+    Which track is which. Only the Forced flag is trusted (the Default flag is ignored: discs
+    set it on whichever track they like); otherwise the tracks' sizes and text decide. "Alike"
+    = mostly the same lines and about the same size (e.g. main and SDH/CC once the
+    hearing-impaired text is removed). Commentary is always longer than the main track.
+      Forced flag set: that track is forced. Of the others:
+        1 -> main.  2 alike -> the earlier is main, the other a duplicate (dropped).
+        2 different -> the shorter is main, the longer commentary.  More -> review.
+      No Forced flag:
+        1 track  -> main.
+        2 tracks -> the shorter under 25% of the longer: forced + main. Alike: main +
+                    duplicate. Otherwise: the shorter is main, the longer commentary.
+        3 tracks -> two alike and the third under 50% of them: forced, main (the earlier of
+                    the two), duplicate. All different: forced, main, commentary by size
+                    (the shortest must be under half the middle one). Otherwise review.
+        4 tracks -> exactly two alike (main + duplicate), the other two: the shorter forced,
+                    the longer commentary. Otherwise review.
+        More     -> review.
+      Review: only the tracks that could be named are written, every track's .srt goes to
+      "_subtitles review\<name>\" in -Dest, labelled with its track number and role, and
+      Encode-Batch lists the title at the top of its report.
 
     Needs: mkvmerge and mkvextract (MKVToolNix; on PATH or in "C:\Program Files\MKVToolNix"),
     seconv.exe (Subtitle Edit 5's command line), and PaddleOCR on PATH for seconv.
 
 .PARAMETER Source
-    Required. The source MKV (or a "<name>.mks" backup made earlier).
+    Required. The source MKV (or a "<name>.mks" backup made earlier), or a folder: then every
+    title in it is done, each written next to itself under its own name: its <name>.mks backup
+    if there is one (loose, or inside the folder's "<folder> - subtitles.zip"), else its .mkv
+    (when it has subtitle tracks). Each title's shift comes from Encode-Batch's
+    <name>.final.json next to it, unless -OffsetMs is given. A summary is shown at the end.
+.PARAMETER Recurse
+    With a folder as -Source: sub-folders too.
 .PARAMETER Dest
     The folder the subtitles (and the .mks backup) go in, usually the finished video's.
     Default: -Source's folder.
@@ -68,8 +77,6 @@
     Subtitle Edit multiple replace rules for seconv --multiple-replace.
     Default: "$HOME\Documents\SE_Replace_Rules.template" (skipped, with a warning, if missing).
     Kept out of seconv's folder so upgrading seconv doesn't wipe it.
-.PARAMETER SmallPct
-    A track with fewer letters than this % of the longest track is a forced candidate. Default: 20.
 .PARAMETER TimeoutMin
     A tool (seconv, mkvmerge, mkvextract) still running after this many minutes is stopped:
     that track fails (the title is flagged for review), or the run fails. Default: 30.
@@ -97,6 +104,9 @@
 .EXAMPLE
     .\Convert-Subtitles.ps1 -Source 'D:\work\Movie (2020) - source.mkv' -Dest 'L:\Library\Movies\Movie (2020)' -Basename 'Movie (2020)' -OffsetMs -42
 .EXAMPLE
+    .\Convert-Subtitles.ps1 -Source 'E:\Encodes\Shows' -Recurse
+    Redo every title's subtitles under a show (from the .mks backups, zipped or not).
+.EXAMPLE
     .\Convert-Subtitles.ps1 -Source 'L:\Library\Movies\Movie (2020)\Movie (2020).mks'
     Redo the subtitles from the backup (same folder and name as the .mks).
 #>
@@ -109,10 +119,10 @@ param(
     [switch]$NoBackup,
     [string]$SeConv = (Join-Path $HOME 'Documents\SeConv-Windows-x64\seconv.exe'),
     [string]$ReplaceRules = (Join-Path $HOME 'Documents\SE_Replace_Rules.template'),
-    [ValidateRange(1, 90)][int]$SmallPct = 20,
     [ValidateRange(1, 1440)][int]$TimeoutMin = 30,
     [string]$WorkDir = '',
     [string]$LogPath = '',
+    [switch]$Recurse,
     [switch]$Plumbing
 )
 
@@ -122,9 +132,9 @@ $script:RulesGiven = $PSBoundParameters.ContainsKey('ReplaceRules')
 
 # ---- Tunables
 $SameTextShare  = 0.5    # tracks sharing at least this share of their 3-word phrases have the same text
-$SameSizeRatio  = 0.5    # ...and the smaller has at least this share of the larger's letters
-$ForcedInMain   = 0.3    # a forced track whose phrases are at least this share in a track: that's the main one
-$LongerLater    = 1.1    # two different full tracks, no other clue: the earlier is main if the later is this much longer
+$SameSizeRatio  = 0.8    # ...and the smaller has at least this share of the larger's letters
+$TwoTrackForcedPct   = 25   # two tracks: the shorter is forced if it's under this % of the longer
+$ThreeTrackForcedPct = 50   # three tracks: the odd one out is forced if it's under this % of the alike two
 $LangCodes      = @('eng', 'en')   # mkvmerge language / language_ietf values counted as English
 $FileLang       = 'en'             # language tag in the file names
 
@@ -388,125 +398,127 @@ function Test-SameText($A, $B) {
 
 # $Tracks: the OCR'd tracks (Order, Id, Name, Default, Forced, Cues, Letters, Shingles).
 # Sets each one's Role (main, forced, commentary, duplicate, unknown) and Reason; returns
-# Review (bool) and ReviewReasons.
+# Review (bool) and ReviewReasons. Only the Forced flag is trusted; otherwise sizes and text:
+#   Forced flag set: that's the forced track. Of the rest: one -> main; two alike -> the earlier
+#     is main, the other a duplicate (CC/SDH); two different -> the shorter is main, the longer
+#     commentary; more -> review (only the forced one is named).
+#   No Forced flag:
+#     1 track: main.
+#     2: the shorter under TwoTrackForcedPct (25%) of the longer -> forced + main; otherwise the
+#        shorter is main and the longer commentary (commentary is always longer than the film).
+#     3: two alike and the third under ThreeTrackForcedPct (50%) of them -> forced, main (the
+#        earlier of the two), duplicate; all three different -> forced, main, commentary by size
+#        (shortest first), as long as the shortest is under half the middle one; else review.
+#     4: two alike and the other two different from them and each other -> main + duplicate,
+#        and the shorter / longer of the other two are forced / commentary; else review.
+#     More: review.
+# "Alike" = Test-SameText (most of their 3-word phrases shared, sizes within SameSizeRatio).
+# Unnamed tracks (role unknown) aren't written; review puts every track in the review folder.
 function Set-SubtitleRoles($Tracks) {
     $reasons = [Collections.Generic.List[string]]::new()
     $use = @($Tracks | Where-Object { $_.Cues -gt 0 } | Sort-Object Order)
     foreach ($t in @($Tracks | Where-Object { $_.Cues -le 0 })) { $t.Role = 'unknown'; $t.Reason = 'no text came out of it' }
-    if ($use.Count -eq 0) { return [pscustomobject]@{ Review = $false; ReviewReasons = @() } }
-    if ($use.Count -eq 1) {
-        $t = $use[0]
-        if ($t.Forced) { $t.Role = 'forced'; $t.Reason = 'the only track, flagged Forced' }
-        else { $t.Role = 'main'; $t.Reason = 'the only track' }
-        return [pscustomobject]@{ Review = $false; ReviewReasons = @() }
+    $pct = { param($a, $b) if ($b.Letters -gt 0) { 100.0 * $a.Letters / $b.Letters } else { 100.0 } }
+    $set = { param($t, [string]$role, [string]$why) $t.Role = $role; $t.Reason = $why }
+    $review = { param([string]$why) $reasons.Add($why); foreach ($t in $use) { if (-not $t.Role) { & $set $t 'unknown' 'not named: needs review' } } }
+    $describe = { (($use | ForEach-Object { "track $($_.Id) $($_.Letters) letters" }) -join ', ') }
+    # One alike pair among $List and the rest (none of them alike with anything), or $null.
+    $onePair = {
+        param($List)
+        $pairs = @()
+        for ($i = 0; $i -lt $List.Count; $i++) { for ($j = $i + 1; $j -lt $List.Count; $j++) { if (Test-SameText $List[$i] $List[$j]) { $pairs += , @($List[$i], $List[$j]) } } }
+        if ($pairs.Count -ne 1) { return $null }
+        $p = $pairs[0]
+        [pscustomobject]@{ First = $p[0]; Second = $p[1]; Rest = @($List | Where-Object { $_ -ne $p[0] -and $_ -ne $p[1] }) }
     }
+    $done = { [pscustomobject]@{ Review = ($reasons.Count -gt 0); ReviewReasons = @($reasons) } }
+    if ($use.Count -eq 0) { return (& $done) }
 
-    $max = ($use | Measure-Object Letters -Maximum).Maximum
-    $isComment = { param($t) $t.Name -match 'comment' }
-    $isSdh = { param($t) $t.Name -match '\b(SDH|CC|HI|hearing)\b' }
-
-    # Forced candidates: flagged Forced; otherwise the much shorter tracks.
-    $forcedFlagged = @($use | Where-Object { $_.Forced })
-    $small = @($use | Where-Object { -not $_.Forced -and -not ($_.Default) -and -not (& $isComment $_) -and $_.Letters -lt ($max * $SmallPct / 100.0) })
-    $full = @($use | Where-Object { -not $_.Forced -and $small -notcontains $_ })
-
-    # Full tracks with the same text are one group (e.g. main and SDH).
-    $groups = [Collections.Generic.List[object]]::new()
-    foreach ($t in $full) {
-        $g = $null
-        foreach ($cand in $groups) { if (Test-SameText $t $cand[0]) { $g = $cand; break } }
-        if ($g) { $g.Add($t) } else { $l = [Collections.Generic.List[object]]::new(); $l.Add($t); $groups.Add($l) }
-    }
-    # Each group's kept track: the Default one, else one not named SDH/CC, else the earliest.
-    $reps = @(foreach ($g in $groups) {
-        $rep = @($g | Where-Object { $_.Default } | Sort-Object Order | Select-Object -First 1)
-        if (-not $rep) { $rep = @($g | Where-Object { -not (& $isSdh $_) } | Sort-Object Order | Select-Object -First 1) }
-        if (-not $rep) { $rep = @($g | Sort-Object Order | Select-Object -First 1) }
-        $rep = $rep[0]
-        foreach ($o in $g) { if ($o -ne $rep) { $o.Role = 'duplicate'; $o.Reason = "same text as track $($rep.Id)" } }
-        $rep
-    })
-
-    # ---- main
-    $main = $null
-    $nonComment = @($reps | Where-Object { -not (& $isComment $_) })
-    $defaults = @($nonComment | Where-Object { $_.Default })
-    if ($defaults.Count -ge 1) {
-        $main = $defaults[0]; $main.Reason = 'flagged Default'
-        if ($defaults.Count -gt 1) { $reasons.Add("tracks $(($defaults | ForEach-Object { $_.Id }) -join ' and ') are both flagged Default but have different text") }
-    } elseif ($nonComment.Count -eq 1) {
-        $main = $nonComment[0]
-        $main.Reason = $(if ($reps.Count -gt 1) { 'the only full-length track not named commentary' } else { 'the only full-length track' })
-    } elseif ($nonComment.Count -gt 1) {
-        # The forced track's lines are usually in the main subtitles too (not in commentary).
-        $fr = @($forcedFlagged + $small)
-        $best = $null; $bestShare = 0.0; $second = 0.0
-        foreach ($r in $nonComment) {
-            $share = 0.0
-            foreach ($f in $fr) { $share = [Math]::Max([double]$share, [double](Get-Containment $f.Shingles $r.Shingles)) }
-            if ($share -gt $bestShare) { $second = $bestShare; $bestShare = $share; $best = $r }
-            elseif ($share -gt $second) { $second = $share }
+    # ---- Forced flag: trusted
+    $flagged = @($use | Where-Object { $_.Forced })
+    if ($flagged.Count) {
+        $forced = $flagged[0]
+        & $set $forced 'forced' 'flagged Forced'
+        $rest = @($use | Where-Object { $_ -ne $forced })
+        switch ($rest.Count) {
+            0 { }
+            1 { & $set $rest[0] 'main' 'the only other track' }
+            2 {
+                $a = $rest[0]; $b = $rest[1]
+                if (Test-SameText $a $b) {
+                    & $set $a 'main' 'the earlier of two alike tracks'
+                    & $set $b 'duplicate' "same text as track $($a.Id)"
+                } else {
+                    $sh = $(if ($a.Letters -le $b.Letters) { $a } else { $b }); $lo = $(if ($sh -eq $a) { $b } else { $a })
+                    & $set $sh 'main' ('the shorter of the other two ({0:0}% of track {1})' -f (& $pct $sh $lo), $lo.Id)
+                    & $set $lo 'commentary' 'the longer of the other two, different text'
+                }
+            }
+            default { & $review "a Forced track plus $($rest.Count) others ($(& $describe)); only the forced one is named" }
         }
-        if ($best -and $bestShare -ge $ForcedInMain -and $second -le $bestShare / 2) {
-            $main = $best; $main.Reason = ('has the forced lines ({0:0}% of them)' -f ($bestShare * 100))
-        } else {
-            $main = $nonComment[0]
-            $later = @($nonComment | Select-Object -Skip 1)
-            $longer = @($later | Where-Object { $_.Letters -ge $main.Letters * $LongerLater })
-            if ($nonComment.Count -eq 2 -and $longer.Count -eq 1) {
-                $main.Reason = "the earliest; track $($later[0].Id) is longer, so likely commentary"
+        return (& $done)
+    }
+
+    # ---- no Forced flag: sizes and text
+    $bySize = @($use | Sort-Object Letters, Order)
+    switch ($use.Count) {
+        1 { & $set $use[0] 'main' 'the only track' }
+        2 {
+            $sh = $bySize[0]; $lo = $bySize[1]
+            $p = & $pct $sh $lo
+            if ($p -lt $TwoTrackForcedPct) {
+                & $set $sh 'forced' ('{0:0}% of the other track (under {1}%)' -f $p, $TwoTrackForcedPct)
+                & $set $lo 'main' 'the longer of two'
+            } elseif (Test-SameText $sh $lo) {
+                $first = @($use)[0]; $second = @($use)[1]
+                & $set $first 'main' 'the earlier of two alike tracks'
+                & $set $second 'duplicate' "same text as track $($first.Id)"
             } else {
-                $main.Reason = 'the earliest (best guess)'
-                $reasons.Add(("{0} full-length tracks with different text and nothing to tell the main one by (sizes: {1})" -f
-                    $nonComment.Count, (($nonComment | ForEach-Object { "track $($_.Id) $($_.Letters) letters" }) -join ', ')))
+                & $set $sh 'main' ('the shorter of two ({0:0}% of the other)' -f $p)
+                & $set $lo 'commentary' 'the longer of two, different text'
             }
         }
-    } else {
-        $reasons.Add('every full-length track is named commentary; no main subtitles')
-    }
-    if ($main) { $main.Role = 'main' }
-    $comm = @($reps | Where-Object { $_ -ne $main })
-    foreach ($c in $comm) {
-        $c.Role = 'commentary'
-        if (& $isComment $c) { $c.Reason = 'named commentary' }
-        elseif (-not $c.Reason) { $c.Reason = 'different text from the main track' }
-    }
-    if ($comm.Count -gt 2) { $reasons.Add("$($comm.Count) commentary tracks") }
-
-    # ---- forced
-    if ($forcedFlagged.Count) {
-        $forced = $forcedFlagged[0]
-        $forced.Role = 'forced'; $forced.Reason = $(if ($forced.Default) { 'flagged Default and Forced' } else { 'flagged Forced' })
-        foreach ($o in @($forcedFlagged | Select-Object -Skip 1)) {
-            if (Test-SameText $o $forced) { $o.Role = 'duplicate'; $o.Reason = "same text as track $($forced.Id)" }
-            else { $o.Role = 'unknown'; $o.Reason = 'flagged Forced, different text from the first forced track'; $reasons.Add("tracks $($forced.Id) and $($o.Id) are both flagged Forced but have different text") }
-        }
-        if ($max -gt 0 -and $forced.Letters -gt $max * 0.5) { Write-Warn "Track $($forced.Id) is flagged Forced but is $([Math]::Round(100.0 * $forced.Letters / $max))% the size of the longest track" }
-    } elseif ($small.Count) {
-        # The candidate whose lines are most in the main track (ties: the earliest).
-        $forced = $small[0]
-        if ($main -and $small.Count -gt 1) {
-            $bestShare = -1.0
-            foreach ($s in $small) {
-                $share = Get-Containment $s.Shingles $main.Shingles
-                if ($share -gt $bestShare) { $bestShare = $share; $forced = $s }
-            }
-        }
-        $forced.Role = 'forced'
-        $forced.Reason = ('{0:0}% the size of the longest track' -f (100.0 * $forced.Letters / $max))
-        foreach ($o in $small) {
-            if ($o -eq $forced) { continue }
-            # Same lines as the forced track (allowing for very different sizes of tiny tracks).
-            if ((Get-Containment $o.Shingles $forced.Shingles) -ge $SameTextShare -or (Get-Containment $forced.Shingles $o.Shingles) -ge $SameTextShare) {
-                $o.Role = 'duplicate'; $o.Reason = "same text as track $($forced.Id)"
+        3 {
+            $pr = & $onePair $use
+            if ($pr) {
+                $third = $pr.Rest[0]
+                $big = $(if ($pr.First.Letters -ge $pr.Second.Letters) { $pr.First } else { $pr.Second })
+                $p = & $pct $third $big
+                if ($p -lt $ThreeTrackForcedPct) {
+                    & $set $third 'forced' ('{0:0}% of the two alike tracks (under {1}%)' -f $p, $ThreeTrackForcedPct)
+                    & $set $pr.First 'main' 'the earlier of two alike tracks'
+                    & $set $pr.Second 'duplicate' "same text as track $($pr.First.Id)"
+                } else {
+                    & $review ("two alike tracks (tracks $($pr.First.Id), $($pr.Second.Id)) and a third that isn't much shorter (track $($third.Id), {0:0}%)" -f $p)
+                }
+            } elseif (-not (Test-SameText $use[0] $use[1]) -and -not (Test-SameText $use[0] $use[2]) -and -not (Test-SameText $use[1] $use[2])) {
+                $f = $bySize[0]; $m = $bySize[1]; $c = $bySize[2]
+                if ((& $pct $f $m) -lt 50) {
+                    & $set $f 'forced' ('the shortest of three different tracks ({0:0}% of the main)' -f (& $pct $f $m))
+                    & $set $m 'main' 'the middle of three different tracks'
+                    & $set $c 'commentary' 'the longest of three different tracks'
+                } else {
+                    & $review ("three different tracks, but the two shortest are close in size ($(& $describe))")
+                }
             } else {
-                $o.Role = 'unknown'; $o.Reason = ('short ({0:0}% of the longest), different text from the forced track' -f (100.0 * $o.Letters / $max))
-                $reasons.Add("tracks $($forced.Id) and $($o.Id) are both short with different text; which is forced?")
+                & $review "three tracks that are all alike, or alike in a chain ($(& $describe))"
             }
         }
+        4 {
+            $pr = & $onePair $use
+            if ($pr -and $pr.Rest.Count -eq 2) {
+                $o = @($pr.Rest | Sort-Object Letters, Order)
+                & $set $pr.First 'main' 'the earlier of two alike tracks'
+                & $set $pr.Second 'duplicate' "same text as track $($pr.First.Id)"
+                & $set $o[0] 'forced' 'the shorter of the two other tracks'
+                & $set $o[1] 'commentary' 'the longer of the two other tracks'
+            } else {
+                & $review "four tracks without exactly one alike pair ($(& $describe))"
+            }
+        }
+        default { & $review "$($use.Count) tracks ($(& $describe))" }
     }
-    foreach ($t in $use) { if (-not $t.Role) { $t.Role = 'unknown'; $t.Reason = 'not placed'; $reasons.Add("track $($t.Id) couldn't be placed") } }
-    return [pscustomobject]@{ Review = ($reasons.Count -gt 0); ReviewReasons = @($reasons) }
+    & $done
 }
 
 # The file name suffix for a role (".en.srt" etc.); $N = the commentary's number (1 = first).
@@ -571,7 +583,9 @@ function Invoke-Main {
             $(if ($t.Name) { " '$($t.Name)'" }), $(if ($t.Default) { ' [Default]' }), $(if ($t.Forced) { ' [Forced]' }))
     }
     if ($srcTracks.Count -eq 0) {
-        foreach ($f in $old) { Remove-Item -LiteralPath $f -Force; Write-Log "Removed old $([IO.Path]::GetFileName($f))" }
+        # (earlier .srt files are left alone: e.g. a finished .mkv has no subtitle tracks, but its
+        # .srt files from the backup are still good)
+        if ($old.Count) { Write-Log "Left $($old.Count) existing subtitle file(s) for $base as they are" }
         $script:Result.Status = 'None'; $script:Result.Message = 'no subtitle tracks in the source'
         Write-Log $script:Result.Message
         return
@@ -741,23 +755,135 @@ function Invoke-Main {
     Write-Log "$($script:Result.Status): $($script:Result.Message)"
 }
 
-try {
-    Invoke-Main
-} catch {
-    $script:Result.Status = 'Failed'
-    $script:Result.Message = $_.Exception.Message
-    Write-Log "FAILED: $($_.Exception.Message)" 'Red'
-    $script:LogLines.Add($_.ScriptStackTrace)
-} finally {
-    if ($script:SrcTracks.Count) {
-        $script:Result.Tracks = @($script:SrcTracks | ForEach-Object {
-            [ordered]@{ Order = $_.Order; Id = $_.Id; Language = $_.Language; Codec = $_.Codec; Name = $_.Name; Default = $_.Default
-                        Forced = $_.Forced; Cues = $_.Cues; Letters = $_.Letters; Role = $_.Role; Reason = $_.Reason }
-        })
+# One file: everything above, then the summary / plumbing line.
+function Invoke-One {
+    try {
+        Invoke-Main
+    } catch {
+        $script:Result.Status = 'Failed'
+        $script:Result.Message = $_.Exception.Message
+        Write-Log "FAILED: $($_.Exception.Message)" 'Red'
+        $script:LogLines.Add($_.ScriptStackTrace)
+    } finally {
+        if ($script:SrcTracks.Count) {
+            $script:Result.Tracks = @($script:SrcTracks | ForEach-Object {
+                [ordered]@{ Order = $_.Order; Id = $_.Id; Language = $_.Language; Codec = $_.Codec; Name = $_.Name; Default = $_.Default
+                            Forced = $_.Forced; Cues = $_.Cues; Letters = $_.Letters; Role = $_.Role; Reason = $_.Reason }
+            })
+        }
+        if ($script:Work -and [IO.Directory]::Exists($script:Work)) { Remove-Item -LiteralPath $script:Work -Recurse -Force -ErrorAction SilentlyContinue }
+        $script:Work = ''
+        Sync-Log
     }
-    if ($script:Work -and [IO.Directory]::Exists($script:Work)) { Remove-Item -LiteralPath $script:Work -Recurse -Force -ErrorAction SilentlyContinue }
-    Sync-Log
-    Write-Result
 }
-if ($script:Result.Status -eq 'Failed') { exit 1 }
+
+# The audio shift a finished title's subtitles need, from Encode-Batch's <name>.final.json next
+# to it (a "- 2160p" title's is <name>.final.json). $null if there's none.
+function Get-SavedOffset([string]$Dir, [string]$Base) {
+    foreach ($b in @($Base, ($Base -replace ' - 2160p$', ''))) {
+        $f = Join-Path $Dir "$b.final.json"
+        if (-not [IO.File]::Exists($f)) { continue }
+        try {
+            $d = [IO.File]::ReadAllText($f) | ConvertFrom-Json
+            if ($d.PSObject.Properties['Audio'] -and $d.Audio) {
+                if ($d.Audio.PSObject.Properties['SubtitleShiftMs']) { return [int]$d.Audio.SubtitleShiftMs }
+                if ($d.Audio.PSObject.Properties['SyncMs']) { return [int]$d.Audio.SyncMs }
+            }
+            return 0
+        } catch { }
+    }
+    return $null
+}
+
+if (-not [IO.Directory]::Exists($Source)) {
+    # ---------------------------------------------- a single .mkv / .mks
+    Invoke-One
+    Write-Result
+    if ($script:Result.Status -eq 'Failed') { exit 1 }
+    exit 0
+}
+
+# ---------------------------------------------- a folder (and sub-folders with -Recurse)
+# Each title once: its <name>.mks backup if there is one (loose, or inside "<folder> -
+# subtitles.zip"), else the .mkv itself when it has subtitle tracks (a source folder). Written
+# next to it under the same name; the offset comes from its <name>.final.json when there is
+# one (Encode-Batch's Dest folders), unless -OffsetMs is given.
+if ($Plumbing) { throw '-Plumbing only works with a single file.' }
+if ($Basename) { throw '-Basename only works with a single file (a folder''s titles keep their own names).' }
+if ($Dest) { throw '-Dest only works with a single file (a folder''s subtitles are written next to each title).' }
+$offsetGiven = $PSBoundParameters.ContainsKey('OffsetMs')
+$root = [IO.Path]::GetFullPath($Source)
+$dirs = @($root)
+if ($Recurse) { $dirs += @([IO.Directory]::GetDirectories($root, '*', [IO.SearchOption]::AllDirectories) | Where-Object { $_ -notmatch '[\\/]_subtitles review([\\/]|$)|[\\/]_encode-batch_tmp([\\/]|$)' }) }
+$jobs = [Collections.Generic.List[object]]::new()
+foreach ($d in ($dirs | Sort-Object)) {
+    $names = @{}
+    foreach ($f in [IO.Directory]::GetFiles($d, '*.mks')) { $b = [IO.Path]::GetFileNameWithoutExtension($f); $names[$b] = $true; $jobs.Add([pscustomobject]@{ Dir = $d; Base = $b; Path = $f; Zip = '' }) }
+    foreach ($z in [IO.Directory]::GetFiles($d, '* - subtitles.zip')) {
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $za = [IO.Compression.ZipFile]::OpenRead($z)
+            try {
+                foreach ($e in $za.Entries) {
+                    if ($e.FullName -notlike '*.mks' -or $e.FullName -match '[\\/]') { continue }
+                    $b = [IO.Path]::GetFileNameWithoutExtension($e.FullName)
+                    if ($names.ContainsKey($b)) { continue }
+                    $names[$b] = $true
+                    $jobs.Add([pscustomobject]@{ Dir = $d; Base = $b; Path = ''; Zip = $z; Entry = $e.FullName })
+                }
+            } finally { $za.Dispose() }
+        } catch { Write-Warn "Couldn't read ${z}: $($_.Exception.Message)" }
+    }
+    foreach ($f in [IO.Directory]::GetFiles($d, '*.mkv')) {
+        $b = [IO.Path]::GetFileNameWithoutExtension($f)
+        if ($names.ContainsKey($b) -or $f -match '\.(remux|partial)\.mkv$') { continue }
+        $jobs.Add([pscustomobject]@{ Dir = $d; Base = $b; Path = $f; Zip = ''; Mkv = $true })
+    }
+}
+Write-Log "$($jobs.Count) title(s) under $root$(if (-not $Recurse) { ' (sub-folders not included; add -Recurse)' })"
+$summary = [Collections.Generic.List[string]]::new()
+$counts = @{ Done = 0; Review = 0; None = 0; Failed = 0 }
+$tmpRoot = $(if ($WorkDir) { $WorkDir } else { [IO.Path]::GetTempPath() })
+$n = 0
+foreach ($j in $jobs) {
+    $n++
+    $extracted = ''
+    $script:Warnings = [Collections.Generic.List[string]]::new()
+    $script:SrcTracks = @()
+    $script:Result = [ordered]@{
+        Status = 'Failed'; Message = ''; OffsetMs = 0; BackupMks = ''
+        Outputs = @(); Tracks = @(); Review = $false; ReviewReason = ''; ReviewDir = ''
+        Warnings = @(); LogPath = $LogPath
+    }
+    $off = $OffsetMs
+    if (-not $offsetGiven) { $saved = Get-SavedOffset $j.Dir $j.Base; if ($null -ne $saved) { $off = $saved } }
+    Write-Log ("`n==== [{0}/{1}] {2}{3}" -f $n, $jobs.Count, (Join-Path $j.Dir $j.Base), $(if ($j.Zip) { ' (.mks from ' + [IO.Path]::GetFileName($j.Zip) + ')' })) 'Cyan'
+    try {
+        $src = $j.Path
+        if ($j.Zip) {
+            $extracted = Join-Path $tmpRoot ("Convert-Subtitles " + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.mks')
+            $za = [IO.Compression.ZipFile]::OpenRead($j.Zip)
+            try { [IO.Compression.ZipFileExtensions]::ExtractToFile($za.GetEntry($j.Entry), $extracted) } finally { $za.Dispose() }
+            $src = $extracted
+        }
+        $script:Source = $src; $script:Dest = $j.Dir; $script:Basename = $j.Base; $script:OffsetMs = $off
+        $script:Result.OffsetMs = $off
+        Invoke-One
+    } catch {
+        $script:Result.Status = 'Failed'; $script:Result.Message = $_.Exception.Message
+        Write-Log "FAILED: $($_.Exception.Message)" 'Red'
+    } finally {
+        if ($extracted -and [IO.File]::Exists($extracted)) { Remove-Item -LiteralPath $extracted -Force -ErrorAction SilentlyContinue }
+    }
+    $st = [string]$script:Result.Status
+    if ($counts.ContainsKey($st)) { $counts[$st]++ }
+    $line = "{0,-7} {1}: {2}" -f $st, (Join-Path $j.Dir $j.Base), $script:Result.Message
+    if ($script:Result.Review -and $script:Result.ReviewReason) { $line += "`n          REVIEW: $($script:Result.ReviewReason)" }
+    $summary.Add($line)
+}
+Write-Log ''
+Write-Log ("Summary: {0} done, {1} to review, {2} without English subtitles, {3} failed" -f $counts.Done, $counts.Review, $counts.None, $counts.Failed) 'Cyan'
+foreach ($l in $summary) { Write-Log "  $l" $(if ($l -like 'Failed*') { 'Red' } elseif ($l -like 'Review*') { 'Yellow' } else { '' }) }
+Sync-Log
+if ($counts.Failed) { exit 1 }
 exit 0

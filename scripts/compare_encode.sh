@@ -64,8 +64,11 @@
 #                                   (VMAF only looks at luma, so the 4:4:4 doesn't change it)
 #                                 yuv420p: everything converted to 8-bit on the CPU first
 #                  CUDA_DEVICE  GPU index (default 0)
-#                  CUDA_DECODE  1 (default): decode on the GPU. 0: decode, crop and convert on
-#                               the CPU and upload finished frames (slower, uses the CPU).
+#                  CUDA_DECODE  unset (default): decode on the GPU, except a VC-1 original,
+#                               which decodes on the CPU (the GPU's VC-1 decoder lands a frame
+#                               off after some seeks); its encode still decodes on the GPU.
+#                               1: decode both on the GPU, VC-1 too. 0: decode, crop and convert
+#                               both on the CPU and upload finished frames (slower).
 #                               GPU decoding is also skipped automatically for a pair whose
 #                               crop it can't do (odd crop values, unknown codec).
 #                If a GPU step fails it falls back, with a note: GPU decoding -> CPU decoding
@@ -114,6 +117,7 @@ VMAF_CUDA=${VMAF_CUDA:-auto}
 FFMPEG_CUDA=${FFMPEG_CUDA:-/opt/ffmpeg-cuda/bin/ffmpeg}
 CUDA_FMT=${CUDA_FMT:-yuv444p16}
 CUDA_DEVICE=${CUDA_DEVICE:-0}
+CUDA_DECODE_SET=${CUDA_DECODE:+1}   # set explicitly: it also overrides the VC-1 rule below
 CUDA_DECODE=${CUDA_DECODE:-1}
 
 FULL=0
@@ -289,6 +293,12 @@ run_score() {
   [ -s "$WORK/.cuda_fallbacks" ] && fails=$(wc -l < "$WORK/.cuda_fallbacks")
   [ -s "$WORK/.gpudec_fallbacks" ] && dfails=$(wc -l < "$WORK/.gpudec_fallbacks")
   # after 2 failures of a mode, the rest of this pair skips it
+  if [ "$VMAF_CUDA" = "1" ] && [ "$GPUDEC" = "2" ] && [ "$dfails" -lt 2 ]; then
+    run_score_mixed "$@" && return 0
+    echo "NOTE: GPU decoding of the encode failed for this step; redoing it with CPU decoding." >&2
+    echo x >> "$WORK/.gpudec_fallbacks"
+    [ -n "$json" ] && rm -f "$json"
+  fi
   if [ "$VMAF_CUDA" = "1" ] && [ "$GPUDEC" = "1" ] && [ "$dfails" -lt 2 ]; then
     run_score_gpudec "$@" && return 0
     echo "NOTE: GPU decoding failed for this step; redoing it with CPU decoding." >&2
@@ -328,6 +338,26 @@ run_score_cuda() {
     -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
     -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
     -lavfi "[0:v:0]${dt}${DSCALE}${TS},${up}[d];[1:v:0]${rt}${RCROP}${TS},${up}[r];[d][r]libvmaf_cuda=${opts}" \
+    -f null -
+  local rc=$?
+  [ $rc -eq 0 ] && [ -n "$json" ] && [ ! -s "$json" ] && rc=1
+  return $rc
+}
+
+# The encode decoded on the GPU (as in run_score_gpudec) and the original on the CPU (as in
+# run_score_cuda: cropped there, then uploaded), both handed to libvmaf_cuda on one device.
+run_score_mixed() {
+  local dt="$1" rt="$2" off="$3" len="$4" sub="$5" json="${6:-}"
+  local opts="n_subsample=${sub}:model=version=${MODEL}"
+  [ -n "$json" ] && opts="${opts}:log_fmt=json:log_path=${json}"
+  local up
+  if [ "$CUDA_FMT" = "yuv420p" ]; then up="format=yuv420p,hwupload"
+  else up="format=p010le,hwupload,scale_cuda=format=yuv444p16"; fi
+  "$FFMPEG_CUDA" -hide_banner -nostats -nostdin \
+    -init_hw_device "cuda=vmafgpu:${CUDA_DEVICE}" -filter_hw_device vmafgpu \
+    "${DGPU[@]}" -hwaccel_device vmafgpu -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
+    -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
+    -lavfi "[0:v:0]${dt}${DGPU_SCALE}${TS},scale_cuda=format=${CUDA_FMT}[d];[1:v:0]${rt}${RCROP}${TS},${up}[r];[d][r]libvmaf_cuda=${opts}" \
     -f null -
   local rc=$?
   [ $rc -eq 0 ] && [ -n "$json" ] && [ ! -s "$json" ] && rc=1
@@ -518,22 +548,33 @@ score_pair() {
   fi
 
   # ---- GPU decoding plan: the same crop / scale, done by NVDEC and scale_cuda ----
+  # GPUDEC: 0 = both decoded on the CPU, 1 = both on the GPU, 2 = the encode on the GPU and
+  # the original on the CPU (a VC-1 original: after a seek, the GPU's VC-1 decoder sometimes
+  # starts a frame off, differently from point to point, so the alignment checks disagree;
+  # the CPU decoder is consistent). CUDA_DECODE=1 set explicitly forces 1 for VC-1 too.
   GPUDEC=0; DGPU_SCALE=""; GPUDEC_WHY=""
   if [ "$VMAF_CUDA" = "1" ] && [ "$CUDA_DECODE" = "1" ]; then
     GPUDEC=1
+    if [ -z "$CUDA_DECODE_SET" ] && [ "$(vcodec_of "$ORIG")" = "vc1" ]; then
+      GPUDEC=2; GPUDEC_WHY="the original is VC-1 (the GPU decoder seeks inconsistently in VC-1)"
+    fi
     DGPU=(-hwaccel cuda -hwaccel_output_format cuda); RGPU=(-hwaccel cuda -hwaccel_output_format cuda)
     case "$DSCALE" in
       scale=*) DGPU_SCALE="scale_cuda=w=${OW}:h=${OH}:interp_algo=bicubic," ;;
       crop=*)  if ga=$(gpu_crop_args "${DSCALE#crop=}" "$EW" "$EH" "$ENC"); then DGPU+=($ga)
                else GPUDEC=0; GPUDEC_WHY="the encode's crop (${DSCALE%,}) can't be done in the GPU decoder"; fi ;;
     esac
-    case "$RCROP" in
-      crop=*)  if ga=$(gpu_crop_args "${RCROP#crop=}" "$OW" "$OH" "$ORIG"); then RGPU+=($ga)
-               else GPUDEC=0; GPUDEC_WHY="the original's crop (${RCROP%,}) can't be done in the GPU decoder"; fi ;;
-    esac
+    if [ "$GPUDEC" = "1" ]; then
+      case "$RCROP" in
+        crop=*)  if ga=$(gpu_crop_args "${RCROP#crop=}" "$OW" "$OH" "$ORIG"); then RGPU+=($ga)
+                 else GPUDEC=0; GPUDEC_WHY="the original's crop (${RCROP%,}) can't be done in the GPU decoder"; fi ;;
+      esac
+    fi
   fi
   if [ "$VMAF_CUDA" = "1" ] && [ "$GPUDEC" = "1" ]; then
     echo "VMAF engine: libvmaf_cuda on GPU ${CUDA_DEVICE}, decoding on the GPU (frames as ${CUDA_FMT}, n_subsample=${SUB}) via ${FFMPEG_CUDA}"
+  elif [ "$VMAF_CUDA" = "1" ] && [ "$GPUDEC" = "2" ]; then
+    echo "VMAF engine: libvmaf_cuda on GPU ${CUDA_DEVICE}, decoding the encode on the GPU and the original on the CPU because ${GPUDEC_WHY} (frames as ${CUDA_FMT}, n_subsample=${SUB}) via ${FFMPEG_CUDA}"
   elif [ "$VMAF_CUDA" = "1" ]; then
     echo "VMAF engine: libvmaf_cuda on GPU ${CUDA_DEVICE}, decoding on the CPU$([ -n "$GPUDEC_WHY" ] && echo " because ${GPUDEC_WHY}") (frames as ${CUDA_FMT}, n_subsample=${SUB}) via ${FFMPEG_CUDA}"
   else
