@@ -161,8 +161,8 @@
     to free any, the run stops starting titles. A Dolby Vision 7 title's conversion also waits
     for room (about twice the copy's size) after its inspect, for the same reason.
 
-    Dolby Vision 7: dovi_convert scan (on the source) -> copy to -WorkDir -> dovi_convert inspect
-    (the copy; it measures the brightness the enhancement layer adds) -> decide:
+    Dolby Vision 7: copy to -WorkDir -> dovi_convert inspect (on the copy; it measures the
+    brightness the enhancement layer adds) -> decide:
       - SIMPLE / SAFE or MEL: convert to 8.1 (convert --yes --include-simple --force --delete),
         then verify it's 8.1. Encoded like any HDR title, with its Dolby Vision 8.1 metadata.
       - COMPLEX FEL with the FEL peak at most -DoviOvershootNits (100) above the base layer's
@@ -1204,7 +1204,7 @@ $PrepBody = {
         }
 
         # ---------------------------------------------------------------- Dolby Vision profile 7
-        # scan on the source -> copy to the work folder -> inspect the copy -> decide:
+        # copy to the work folder -> inspect the copy -> decide:
         #   SIMPLE / SAFE or MEL                    -> convert to 8.1
         #   COMPLEX FEL within -DoviOvershootNits   -> convert to 8.1 anyway (highlights clipped; noted)
         #   COMPLEX FEL beyond it, or NO L1         -> keep as profile 7 (status 'KeepP7'): the main loop
@@ -1247,24 +1247,8 @@ $PrepBody = {
                 if ($own -and $own.Note) { $doviNote = [string]$own.Note }
             } elseif (-not $keepWhy) {
                 $dirW = ConvertTo-WslPath $workDir $wsl.MountRoot
-                Step 'dovi_convert scan'
-                $srcW = ConvertTo-WslPath $Cfg.SourceFile $wsl.MountRoot
-                $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($srcW) -StatusBase $status `
-                    -Body ("cd /tmp && {0} scan {1}" -f $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $srcW))
-                $action = $null; $dvStatus = ''
-                foreach ($l in $r.Lines) {
-                    if ($l -match '^\s*Action:\s*(.+?)\s*$') { $action = $Matches[1] }
-                    elseif ($l -match '^\s*Status:\s*(.+?)\s*$') { $dvStatus = $Matches[1] }
-                }
-                if ($r.ExitCode -ne 0 -or -not $action) {
-                    $last = @($r.Lines | Where-Object { $_.Trim() } | Select-Object -Last 1)
-                    return (Done 'Skipped' ("dovi_convert scan failed (exit {0}){1}." -f $r.ExitCode, $(if ($last.Count) { ": $($last[0].Trim())" })))
-                }
-                Write-Log "dovi_convert scan: $dvStatus -> Action: $action (inspect decides)"
-                # CONVERT / CONVERT* / SKIP (Complex) / MANUAL CHECK all go on to inspect, which measures the
-                # brightness properly. Anything else (an error, not profile 7) stops here.
-                if ($action -notmatch '^(CONVERT\*?|SKIP|MANUAL CHECK)$') { return (Done 'Skipped' "dovi_convert scan says $dvStatus, Action: $action.") }
-
+                # No dovi_convert scan on the source first: every profile 7 title is copied and
+                # inspected whatever scan would say (it's converted or kept as profile 7 either way).
                 if (-not [IO.File]::Exists($p7copy)) {
                     Step 'copying p7 source'
                     $srcLen = (New-Object IO.FileInfo $Cfg.SourceFile).Length
