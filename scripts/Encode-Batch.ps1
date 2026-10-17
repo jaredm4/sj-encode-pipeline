@@ -58,8 +58,11 @@
         titles from other folders (e.g. other seasons when -Source is a show), or idle. If the first
         title finds no passing rung, the next one searches from scratch. Folders don't share picks.
       - Then, once every rung in flight is scored:
-          some pass: smallest passer still above -TargetPct -> try the next smaller rung;
+          some pass: one within -CloseEnoughPct points of -TargetPct -> finished;
+                     smallest passer still above -TargetPct -> try the next smaller rung;
                      biggest passer below -TargetPct        -> try the next bigger rung;
+                     passers either side of -TargetPct with untried rungs between them
+                                                           -> try the middle one of those;
                      otherwise finished.
           none pass: passes the bar but over -MaxPct -> try smaller; fails the bar -> try bigger.
         A rung is never repeated, so the search always ends, at worst at an end of the ladder.
@@ -139,12 +142,15 @@
     are redone, and a title whose search (or fixed variant list) is finished is skipped. In ladder
     mode, variant folders that aren't rungs (e.g. from an older fixed run) are left alone.
 
-    Local copies (-LocalCopy, default on): prep copies each source to Dest\...\<name> - source.mkv
-    (next title's copy is made while the current ones encode). Everything reads that copy, and
-    it's deleted when the title is finished (after the audio step), or right away if it ends
-    without a suggested variant. An interrupted copy is redone; a complete one is reused.
-    (Dolby Vision 7 titles use their converted "<name> - p8.1.mkv" copy instead.) Local copies
-    go to -WorkDir (default: Dest).
+    Local copies (-LocalCopy; default on with -WorkDir, off without it): prep copies each source
+    to WorkDir\...\<name> - source.mkv (next title's copy is made while the current ones encode).
+    Without -WorkDir the sources are taken to be local already and are read in place (they're
+    never modified); Dolby Vision 7 titles are copied either way, to be checked and converted.
+    Everything reads the copy, and it's deleted when the title is finished (after the audio
+    step), or right away if it ends without a suggested variant. An interrupted copy is redone;
+    a complete one is reused.
+    (Dolby Vision 7 titles use their converted "<name> - p8.1.mkv" copy instead, made in
+    -WorkDir, default Dest.)
 
     Disk space is checked before each title starts. Dest needs -MinFreeGB free (for the encodes);
     the work drive needs room for the local copy, or -MinFreeDoviGB for a Dolby Vision 7 title
@@ -249,6 +255,10 @@ param(
     # Size rules, as video stream % of the source's video stream (see .DESCRIPTION).
     [double]$MaxPct = 70,        # hard cap: bigger variants don't pass
     [double]$TargetPct = 20,     # the search aims here; the passer closest to it is suggested
+    # A passer within this many points of -TargetPct ends the search: the rungs next to it (about
+    # 1.4x / 0.7x its size per 2 CQP) would land further from -TargetPct, so they can't win. With
+    # 20%: 17-23% stops. 0 turns it off.
+    [double]$CloseEnoughPct = 3,
 
     # Top bar: a passing variant under -TargetPct that also meets ALL of these is good enough to
     # take the extra space savings. The search stops climbing toward -TargetPct, and the biggest
@@ -301,9 +311,11 @@ param(
     # for review. Off by default: review the failures first, then re-run with this.
     [switch]$UseSourceFallback,
 
-    # Copy each source to Dest (next to its log, as "<name> - source.mkv") during prep, so the
-    # encodes, VMAF scoring, CropDetect and Add-BluRayAudio all read it locally instead of from
-    # the NAS. Deleted once the title is finished. -LocalCopy:$false reads from the NAS directly.
+    # Copy each source to -WorkDir (as "<name> - source.mkv") during prep, so the encodes, VMAF
+    # scoring, CropDetect and Add-BluRayAudio all read it locally instead of from the NAS.
+    # Deleted once the title is finished. Default: on with -WorkDir, off without it (the source
+    # is taken to be local already and is read in place; it's never modified). Dolby Vision 7
+    # titles are always copied either way (their copy is converted). Set it to override.
     [bool]$LocalCopy = $true,
 
     [string]$NVEncC = (Join-Path $env:APPDATA 'NVEnc\NVEncC64.exe'),
@@ -877,16 +889,18 @@ eb_ensure_visible() {
     # $Tried maps rung index -> finished row, or $null while it's queued / encoding / scoring.
     # Returns the rung to encode next, -1 to wait for the ones in flight, or -2 when finished.
     #   - Start rungs first (all at once, so both encoder slots can take one).
-    #   - Some pass: if the smallest passer is still above TargetPct, try the next smaller rung;
-    #     if the biggest passer is below TargetPct, try the next bigger one, unless a passer under
-    #     TargetPct meets the top bar (TopMean/TopP1/TopMin). Otherwise finished.
+    #   - Some pass: finished if one is within CloseEnoughPct points of TargetPct. Else if the
+    #     smallest passer is still above TargetPct, try the next smaller rung; if the biggest
+    #     passer is below TargetPct, try the next bigger one, unless a passer under TargetPct
+    #     meets the top bar (TopMean/TopP1/TopMin). If passers sit on both sides of TargetPct with
+    #     untried rungs between them, try the middle one of those. Otherwise finished.
     #   - None pass: passes the bar but over the cap -> try smaller; fails the bar -> try bigger.
     #   - Never repeats a rung, so it always ends (at worst at an end of the ladder).
     #   - $Skip: rungs to treat as already answered (see Get-KnownRungReason); never proposed.
     function Get-LadderNext {
         param([hashtable]$Tried, [int]$Count, [int[]]$Start, [double]$MinMean, [double]$MinP1, [double]$MinMin,
             [double]$MaxPct = 65, [double]$TargetPct = 20, [hashtable]$Skip = @{},
-            [double]$TopMean = 1000, [double]$TopP1 = 1000, [double]$TopMin = 1000)
+            [double]$TopMean = 1000, [double]$TopP1 = 1000, [double]$TopMin = 1000, [double]$CloseEnoughPct = 0)
         foreach ($i in @($Start)) { if ($i -ge 0 -and $i -lt $Count -and -not $Tried.ContainsKey($i) -and -not $Skip.ContainsKey($i)) { return $i } }
         foreach ($k in @($Tried.Keys)) { if ($null -eq $Tried[$k]) { return -1 } }
         $ok = @(); $overcap = @(); $fail = @()
@@ -900,10 +914,26 @@ eb_ensure_visible() {
             $lo = [int]($ok | Measure-Object -Minimum).Minimum
             $hi = [int]($ok | Measure-Object -Maximum).Maximum
             $loPct = $Tried[$lo].Pct; $hiPct = $Tried[$hi].Pct
+            # A passer this close to TargetPct: a neighbouring rung (about 1.4x the size, or 0.7x)
+            # would land further away, so it can't win.
+            if ($CloseEnoughPct -gt 0 -and @($ok | Where-Object { $null -ne $Tried[$_].Pct -and [Math]::Abs($Tried[$_].Pct - $TargetPct) -le $CloseEnoughPct }).Count) { return -2 }
             if (($null -eq $loPct -or $loPct -gt $TargetPct) -and (& $open ($lo - 1))) { return $lo - 1 }
             # Under TargetPct but over the top bar: good enough, don't climb for size.
             $topHit = @($ok | Where-Object { Test-TopBar $Tried[$_] $TargetPct $TopMean $TopP1 $TopMin }).Count
             if ($null -ne $hiPct -and $hiPct -lt $TargetPct -and -not $topHit -and (& $open ($hi + 1))) { return $hi + 1 }
+            # Passers either side of TargetPct with untried rungs between them (e.g. start rungs
+            # 11.9% and 25.7% with one between): one in between will very likely pass too, at a
+            # size between theirs, so try it. The middle one first.
+            if (-not $topHit) {
+                $below = @($ok | Where-Object { $null -ne $Tried[$_].Pct -and $Tried[$_].Pct -lt $TargetPct })
+                $above = @($ok | Where-Object { $null -ne $Tried[$_].Pct -and $Tried[$_].Pct -gt $TargetPct })
+                if ($below.Count -and $above.Count) {
+                    $b = [int]($below | Measure-Object -Maximum).Maximum; $a = [int]($above | Measure-Object -Minimum).Minimum
+                    $mid = ($a + $b) / 2.0
+                    $between = @(for ($i = $b + 1; $i -lt $a; $i++) { if (& $open $i) { $i } }) | Sort-Object { [Math]::Abs($_ - $mid) }, { $_ }
+                    if (@($between).Count) { return [int]@($between)[0] }
+                }
+            }
             return -2
         }
         if ($overcap.Count) { $i = [int]($overcap | Measure-Object -Minimum).Minimum - 1; if (& $open $i) { return $i } }
@@ -1732,6 +1762,9 @@ $srcPath = Resolve-UserPath $Source
 $sep = [IO.Path]::DirectorySeparatorChar
 $dstRoot = (Resolve-UserPath $Dest).TrimEnd('\', '/')
 $workRoot = if ($WorkDir) { (Resolve-UserPath $WorkDir).TrimEnd('\', '/') } else { $dstRoot }
+# No -WorkDir: the sources are already local, so they're read in place instead of copied
+# (Dolby Vision 7 still gets its own copy, to convert). -LocalCopy given explicitly wins.
+if (-not $PSBoundParameters.ContainsKey('LocalCopy')) { $LocalCopy = [bool]$WorkDir }
 if (-not ([IO.File]::Exists($srcPath) -or [IO.Directory]::Exists($srcPath))) { throw "Source not found: $srcPath" }
 [void][IO.Directory]::CreateDirectory($dstRoot)
 
@@ -1794,10 +1827,12 @@ if ($workRoot -ne $dstRoot) {
     [void][IO.Directory]::CreateDirectory($workRoot)
     Write-Log "Work:   $workRoot ($(Get-FreeGB $workRoot) GB free): local copies and Dolby Vision 7 conversions"
 }
+if ($LocalCopy) { Write-Log "Local copies: on (each source is copied to the work folder during prep)" }
+else { Write-Log "Local copies: off (sources are read in place; Dolby Vision 7 titles are still copied to convert)" }
 if ($fixedMode) { Write-Log "Mode: fixed variants" } else { Write-Log "Mode: ladder search, target $TargetPct% of the source, cap $MaxPct% (rungs weakest first)" }
 $ri = 0
 foreach ($s in $specs) { Write-Log ("{0} '{1}': {2}" -f $(if ($fixedMode) { 'Variant' } else { "Rung $ri" }), $s.Name, ($s.Args -join ' ')); $ri++ }
-Write-Log "Bar: mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; top bar (under $TargetPct%, good enough): mean >= $TopMean, p1 >= $TopP1, min >= $TopMin"
+Write-Log "Bar: mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; top bar (under $TargetPct%, good enough): mean >= $TopMean, p1 >= $TopP1, min >= $TopMin$(if ($CloseEnoughPct -gt 0) { "; a passer within $CloseEnoughPct points of $TargetPct% ends the search" })"
 
 Write-Log ("Slots: {0} encode (GPU){1}" -f $Threads, $(if ($SkipVmaf) { ', VMAF off' } else { ", $VmafThreads VMAF (GPU)" }))
 
@@ -2133,7 +2168,7 @@ function Get-Tried($t) {
 function Get-LadderStepFor([hashtable]$Tried, $Start, [string]$Folder, [string]$Self, [hashtable]$Skipped) {
     $ref = if ($folderRef.ContainsKey($Folder) -and $folderRef[$Folder].Name -ne $Self) { $folderRef[$Folder] } else { $null }
     while ($true) {
-        $i = Get-LadderNext -Tried $Tried -Count $specs.Count -Start $Start -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -Skip $Skipped -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin
+        $i = Get-LadderNext -Tried $Tried -Count $specs.Count -Start $Start -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -Skip $Skipped -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin -CloseEnoughPct $CloseEnoughPct
         if ($i -lt 0) { return $i }
         # (not for start rungs, which are tried before any result is in)
         if (@($Tried.Keys | Where-Object { $null -ne $Tried[$_] }).Count) {
@@ -2233,10 +2268,23 @@ function Get-NextTask($t) {
     $task = [pscustomobject]@{ Spec = $specs[$i]; Rung = $i; Index = @($t.Tasks).Count + 1; State = 'pending'; Row = $null }
     $t.Tasks = @($t.Tasks) + $task
     if (@($t.Tasks).Count -gt @($t.StartRungs).Count) {
-        Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  LADDER: next rung {1}`r`n" -f (Get-Date), $specs[$i].Name)
-        Write-Log ("NEXT  {0}: {1}" -f $t.Rel, $specs[$i].Name) 'Cyan'
+        $why = Get-StepWhy (Get-Tried $t) $i
+        Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  LADDER: next rung {1}{2}`r`n" -f (Get-Date), $specs[$i].Name, $(if ($why) { " ($why)" }))
+        Write-Log ("NEXT  {0}: {1}{2}" -f $t.Rel, $specs[$i].Name, $(if ($why) { " ($why)" })) 'Cyan'
     }
     $task
+}
+
+# Why the search goes to rung $i next, for the logs ('' when it's not one of these).
+function Get-StepWhy([hashtable]$Tried, [int]$i) {
+    $pass = @($Tried.Keys | Where-Object { $null -ne $Tried[$_] -and $null -ne $Tried[$_].Pct -and (Get-VariantClass $Tried[$_] $MinMean $MinP1 $MinMin $MaxPct) -eq 'pass' } | ForEach-Object { [int]$_ })
+    $lo = @($pass | Where-Object { $_ -lt $i -and $Tried[$_].Pct -lt $TargetPct } | Sort-Object -Descending | Select-Object -First 1)
+    $hi = @($pass | Where-Object { $_ -gt $i -and $Tried[$_].Pct -gt $TargetPct } | Sort-Object | Select-Object -First 1)
+    $f = { param($k) '{0} {1:0.#}%' -f $specs[$k].Name, $Tried[$k].Pct }
+    if ($lo.Count -and $hi.Count) { return "between two passers either side of $TargetPct%: $(& $f $lo[0]) and $(& $f $hi[0])" }
+    if ($hi.Count) { return "$(& $f $hi[0]) passes, over $TargetPct%: one smaller" }
+    if ($lo.Count) { return "$(& $f $lo[0]) passes, under $TargetPct%: one bigger" }
+    ''
 }
 
 # True when nothing is left to do for a ready title.
