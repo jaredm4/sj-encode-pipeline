@@ -16,7 +16,7 @@
           <name>.en.forced.default.srt   forced (always marked default) and
           <name>.en.Commentary.srt       commentary ("<name>.en.Commentary 2.srt", ...)
           <name>.mks                   every source subtitle track, unchanged (backup), until the folder is done
-          <folder> - subtitles.zip     all of the folder's subtitle backups, once every title in it is done
+          subtitles.zip                all of the folder's subtitle backups, once every title in it is done
           _subtitles review\<name>\    every English track's .srt, when the subtitles need your review
           <name>.encode.log            everything that happened to this title, every run
           <name>.audio.log             Add-BluRayAudio's own log (every detail of the audio step)
@@ -97,7 +97,7 @@
       4. This title's other variants (and their VMAF files) are deleted. Variant folders left
          empty are removed once every title in the folder is done.
       When every title in a folder (e.g. a season) is done, its <name>.mks files are bundled into
-      "<folder> - subtitles.zip" there (stored, not compressed; added to it if it exists), so
+      subtitles.zip there (stored, not compressed; added to it if it exists), so
       Jellyfin doesn't see them. Loose .mks files from earlier runs are bundled the same way.
       Progress is saved in <name>.final.json, so an interrupted finish resumes where it was,
       and a finished one is skipped on later runs (its pick still guides its folder).
@@ -2048,7 +2048,7 @@ function Get-FinishedRow($t, $spec) {
     $row
 }
 
-# ---- subtitle bundles: <folder> - subtitles.zip once every title of the folder is done
+# ---- subtitle bundles: subtitles.zip once every title of the folder is done
 $zipDirs = @{}                       # Dest folders with subtitle backups waiting to be bundled
 
 function Get-LooseSubtitles([string]$Dir) {
@@ -2065,12 +2065,12 @@ function Test-FolderDone([string]$Dir) {
     $true
 }
 
-# Adds the folder's loose .mks files to "<folder> - subtitles.zip" (stored, no compression),
+# Adds the folder's loose .mks files to subtitles.zip (stored, no compression),
 # keeping what's already in it, then deletes the loose files once the zip is verified.
 function Compress-FolderSubtitles([string]$Dir) {
     $loose = @(Get-LooseSubtitles $Dir)
     if (-not $loose.Count) { return }
-    $zip = Join-Path $Dir ((Split-Path -Leaf $Dir) + ' - subtitles.zip')
+    $zip = Join-Path $Dir 'subtitles.zip'
     $part = "$zip.partial"
     try {
         Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem

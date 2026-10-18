@@ -53,7 +53,7 @@
        are counted: moments where the track is clearly LOUDER than the main track
        predicts (someone talking over the film), and moments where it is clearly
        QUIETER (something missing, e.g. an isolated score). Then:
-         - median louder share across the clips 30%+ -> commentary (kept
+         - median louder share across the clips 35%+ -> commentary (kept
            automatically, if stereo or mono). A commentator talks through most of the
            film (the median tolerates a couple of quiet clips); a different mix, like an
            original theatrical stereo mix, only differs in some scenes.
@@ -238,7 +238,7 @@ $ErrorActionPreference = 'Stop'
 $script:Cmdlet = $PSCmdlet
 
 # ---- Tunables (adjust after testing on your discs) ----
-$CommentaryMinMedian  = 30    # median louder share across the clips at or above: commentary.
+$CommentaryMinMedian  = 35    # median louder share across the clips at or above: commentary.
                               # A commentator talks through most of the film; the median
                               # tolerates a couple of quiet clips, while a different mix (e.g.
                               # an original theatrical stereo mix) only differs in some scenes.
@@ -1546,7 +1546,7 @@ if (-not $batch) {
 } else {
     if ($SourceTrack -ge 0) { throw '-SourceTrack only works with single files.' }
     if ($SourceStartFrames -ge 0) { throw '-SourceStartFrames only works with single files.' }
-    if ($script:PassMode -ne 'Auto') {
+    if ($script:PassMode -ne 'Auto' -and $script:PassMode -ne 'None') {
         throw '-PassthruCommentaries only works with single files. Folders always keep detected commentary automatically.'
     }
 
