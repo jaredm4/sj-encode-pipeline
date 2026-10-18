@@ -16,6 +16,9 @@
                  "<name>.mp4" (an older encode, migrated to MKV by this script):
                    S:\Sources\Shows\Show (2010)\Season 01\Show (2010) S01E05 Episode Title.mkv
                    L:\Library\Shows\Show (2010)\Season 01\Show (2010) S01E05 Episode Title.mkv
+                 Encodes named "<name> - <resolution>.mkv" match too (e.g. a title kept as
+                 Dolby Vision 7: "<name> - 2160p.mkv" and "<name> - 1080p.mkv"); one source
+                 can have several. -DestFilter limits which encodes are processed.
                  - A folder whose MKVs have no mirrored file at all is skipped.
                  - In a partly matched folder, the matched pairs are processed and each
                    MKV without a mirrored file is listed with the path that was expected.
@@ -65,7 +68,8 @@
        Every compared track is listed in the summary with its result. The cutoffs and
        clip settings are at the top of the script, for tuning.
     5. Output track order: default track, then commentary (flagged as commentary),
-       then every master (main one first). Everything else is dropped. PCM, FLAC and
+       then every master (main one first; none with -PassthruMasters None). Everything
+       else is dropped. PCM, FLAC and
        ALAC masters (channel-based, no Atmos/DTS:X objects) are stored as Opus to save
        space: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1 ($OpusKbps at the top).
        TrueHD and DTS-HD MA masters are always copied unchanged. Chapters come from the
@@ -130,13 +134,13 @@
     Default: -1 (auto-detect: the master with the most channels, or the best lossy
     track if there is no lossless one).
 .PARAMETER PassthruCommentaries
-    Single mode only: overrides which commentary tracks are kept for this one file.
-    Without this option (the default, and always in batch mode), every stereo or mono
-    track the comparison detects as commentary is kept.
+    Overrides which commentary tracks are kept. Without this option (the default), every
+    stereo or mono track the comparison detects as commentary is kept.
       -PassthruCommentaries 2,3
-          Keep exactly these source audio tracks as commentary, copied as-is.
+          Single mode only: keep exactly these source audio tracks as commentary, copied as-is.
       -PassthruCommentaries None
-          Keep no commentary for this file (e.g. if the comparison got it wrong).
+          Keep no commentary (e.g. if the comparison got it wrong). Also works in batch
+          mode, for every file.
     TRACK NUMBERS: 0 = the first AUDIO track in the source MKV. Video and subtitle
     tracks are not counted. Use the "Pos" column the script prints (run with -WhatIf).
       - MediaInfo's "Audio #1" is Pos 0 (subtract 1).
@@ -149,6 +153,15 @@
       -PassthruCommentaries 2,3 -PassthruTitles "Director's Commentary","Cast Commentary"
     Only works with track numbers (not with None, and not in batch mode).
     Default: "Commentary" for every kept track.
+.PARAMETER PassthruMasters
+    Auto (the default): keep every lossless master. None: keep no masters, only the default
+    track (and any commentary), e.g. for a 1080p copy whose 2160p file has the masters
+    (Encode-Batch does this for the 1080p copy of a title kept as Dolby Vision 7, along with
+    -PassthruCommentaries None). Works in single and batch mode.
+.PARAMETER DestFilter
+    Batch mode only: process only the matched encodes whose file name matches this wildcard,
+    e.g. '* - 1080p.mkv' for the 1080p copies of titles kept as Dolby Vision 7.
+    Default: * (all).
 .PARAMETER AacBitrate
     AAC bitrate in kbps for a new default track made from a stereo source.
     Mono sources are capped at 256 (AAC's per-channel limit).
@@ -215,6 +228,9 @@
 .EXAMPLE
     .\Add-BluRayAudio.ps1 -Source '.\sources\Movie.mkv' -Dest '.\encodes\Movie.mkv' -PassthruCommentaries 3 -PassthruTitles "Director's Commentary"
     Single pair, keeping the source's 4th audio track (Pos 3) as a titled commentary.
+.EXAMPLE
+    .\Add-BluRayAudio.ps1 -Source 'S:\Sources\Movies' -Dest 'L:\Library\Movies' -DestFilter '* - 1080p.mkv' -PassthruMasters None -PassthruCommentaries None -Replace
+    Strips the 1080p copies (of titles kept as Dolby Vision 7) down to their default track.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -223,6 +239,8 @@ param(
     [int]$SourceTrack = -1,
     [string[]]$PassthruCommentaries = @(),
     [string[]]$PassthruTitles = @(),
+    [ValidateSet('Auto', 'None')][string]$PassthruMasters = 'Auto',
+    [string]$DestFilter = '*',
     [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
@@ -740,10 +758,6 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $script:SubShiftNote = "shift its .srt subtitles by $audioShiftMs ms (Convert-Subtitles -OffsetMs $audioShiftMs; video start $([Math]::Round($srcVideoStart, 3))s -> $([Math]::Round($destVideoStart, 3))s)"
     }
 
-    if ($srcVideo.Count -gt 0 -and (Test-DolbyVision $srcVideo[0]) -and -not $destHasDv) {
-        Write-Warning 'The source has Dolby Vision but the encoded video does not. The output will be HDR10/SDR only.'
-    }
-
     # mkvmerge track IDs (its options refer to tracks by these).
     $destMkvVideo = @(Get-MkvTracks $DestFile | Where-Object { $_.type -eq 'video' })
     if ($destMkvVideo.Count -eq 0) { throw "mkvmerge sees no video track in $DestFile" }
@@ -945,6 +959,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     # main track that had to be converted (e.g. lossy DTS) is kept as-is instead.
     $keep = @($masters | Where-Object { $_.Pos -eq $pick.Pos }) + @($masters | Where-Object { $_.Pos -ne $pick.Pos })
     if ($masters.Count -eq 0 -and $compat.From -eq 'encode') { $keep = @($pick) }
+    # -PassthruMasters None: the default track only (e.g. a 1080p copy next to a 2160p file
+    # that has the masters).
+    $masterPos = @($keep | ForEach-Object { $_.Pos })
+    if ($PassthruMasters -eq 'None') { $keep = @() }
     $keepPos = @($keep | ForEach-Object { $_.Pos })
 
     # ------------------------------------------------ commentary tracks to keep
@@ -1059,6 +1077,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $v = $null
         if ($verdicts.ContainsKey($d.Pos)) { $v = $verdicts[$d.Pos] }
         if ($d.Pos -in $dupDropped) { $reason = 'lossless copy of a kept commentary' }
+        elseif ($PassthruMasters -eq 'None' -and $d.Pos -in $masterPos) { $reason = 'master, not kept (-PassthruMasters None)' }
         elseif ($v -and $v.Kind -eq 'commentary') { $reason = 'commentary, not kept (-PassthruCommentaries)' }
         elseif ($v) { $reason = $v.Kind }
         elseif ($masters.Count -gt 0) { $reason = 'lossy surround, not compared (the lossless master is kept)' }
@@ -1542,16 +1561,18 @@ if ($PassthruTitles.Count -gt 0) {
 if ($Plumbing -and $batch) { throw '-Plumbing only works with single files.' }
 if (-not $batch) {
     if ([IO.Path]::GetExtension($Dest) -notin @('.mkv', '.mp4')) { throw '-Dest must be an .mkv or .mp4 file.' }
+    if ($DestFilter -ne '*') { throw '-DestFilter only works with folders.' }
     $pairs.Add([pscustomobject]@{ Source = $Source; Video = $Dest })
 } else {
     if ($SourceTrack -ge 0) { throw '-SourceTrack only works with single files.' }
     if ($SourceStartFrames -ge 0) { throw '-SourceStartFrames only works with single files.' }
     if ($script:PassMode -ne 'Auto' -and $script:PassMode -ne 'None') {
-        throw '-PassthruCommentaries only works with single files. Folders always keep detected commentary automatically.'
+        throw '-PassthruCommentaries with track numbers only works with single files. Folders keep detected commentary automatically (or none with -PassthruCommentaries None).'
     }
 
     $srcRoot = $Source.TrimEnd('\', '/')
     $dstRoot = $Dest.TrimEnd('\', '/')
+    $filteredOut = 0
 
     # Each source MKV maps to one encoded file: same relative folder under Dest, same base
     # name, as .mkv (or else .mp4, an older encode to migrate).
@@ -1564,19 +1585,32 @@ if (-not $batch) {
 
         $matched = [Collections.Generic.List[object]]::new()
         $missing = [Collections.Generic.List[string]]::new()
+        # The mirrored folder's encodes, for "<name> - <resolution>.mkv" (e.g. a title kept as
+        # Dolby Vision 7: "<name> - 2160p.mkv" and "<name> - 1080p.mkv", both from "<name>.mkv").
+        $dstMkvs = @()
+        if (Test-Path -LiteralPath $mirrorDir -PathType Container) {
+            $dstMkvs = @(Get-ChildItem -LiteralPath $mirrorDir -File -Filter '*.mkv' | Where-Object { $_.Name -notlike '*.remux.mkv' })
+        }
         foreach ($mkv in ($group.Group | Sort-Object Name)) {
-            $target = $null
+            $targets = @()
             foreach ($ext in @('.mkv', '.mp4')) {
                 $candidate = Join-Path $mirrorDir ($mkv.BaseName + $ext)
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) { $target = $candidate; break }
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { $targets += $candidate; break }
             }
-            if ($target) {
-                $matched.Add([pscustomobject]@{ Source = $mkv.FullName; Video = $target })
+            foreach ($d in $dstMkvs) {
+                if ($d.BaseName.Length -gt $mkv.BaseName.Length -and $d.BaseName.StartsWith($mkv.BaseName + ' - ', [StringComparison]::Ordinal) -and
+                    $d.BaseName.Substring($mkv.BaseName.Length) -match '^ - \d{3,4}p(\.[^.\s]+)*$') { $targets += $d.FullName }
+            }
+            if ($targets.Count) {
+                $filtered = @($targets | Where-Object { [IO.Path]::GetFileName($_) -like $DestFilter })
+                foreach ($tg in $filtered) { $matched.Add([pscustomobject]@{ Source = $mkv.FullName; Video = $tg }) }
+                $filteredOut += $targets.Count - $filtered.Count
             } else {
                 $missing.Add("$($mkv.FullName)`n      expected: $(Join-Path $mirrorDir ($mkv.BaseName + '.mkv'))")
             }
         }
 
+        if ($matched.Count -eq 0 -and -not $missing.Count) { continue }   # all left out by -DestFilter
         if ($matched.Count -eq 0) {
             $why = 'mirrored folder exists, but none of the file names match'
             if (-not (Test-Path -LiteralPath $mirrorDir -PathType Container)) { $why = 'mirrored folder does not exist' }
@@ -1586,8 +1620,9 @@ if (-not $batch) {
             foreach ($m in $missing) { $unmatched.Add($m) }
         }
     }
-    Write-Host ("Found {0} MKV(s): {1} matched, {2} unmatched in partly matched folders, {3} folder(s) skipped." -f
-        $mkvs.Count, $pairs.Count, $unmatched.Count, $skippedDirs.Count)
+    Write-Host ("Found {0} MKV(s): {1} encode(s) matched, {2} unmatched in partly matched folders, {3} folder(s) skipped{4}." -f
+        $mkvs.Count, $pairs.Count, $unmatched.Count, $skippedDirs.Count,
+        $(if ($DestFilter -ne '*') { "; -DestFilter '$DestFilter' left out $filteredOut other encode(s)" }))
 }
 
 for ($n = 0; $n -lt $pairs.Count; $n++) {

@@ -31,6 +31,12 @@
                                        its files are named "<name> - 1080p.*")
           <variant name>\<name>.mkv    one folder per variant while a title is in progress
           <variant name>\<name>.vmaf.txt  (and kept afterwards in fixed mode / -KeepVariants)
+          encode logs.zip              once every title in the folder is finished: this script's
+                                       .log / .json / .csv / .md files there (the title files above,
+                                       the _encode-batch files below). They're deleted, except
+                                       _encode-batch_all.md, which you delete after looking it over.
+                                       A later run reads finished titles from it; if the folder has
+                                       a title to do again, its files are put back first.
 
       WorkDir (default: Dest)\<same sub-folders>\
           <name> - source.mkv          local copy of the source, until the title is finished
@@ -172,7 +178,8 @@
         copy gets the audio (and subtitles) only and becomes "<name> - 2160p.mkv"; a second
         title "<name> - 1080p" is added: a near-lossless 1080p SDR reference is made from the
         profile 7 video (cropped, tone-mapped, scaled to fit 1920x1080, in -WorkDir) and searched
-        and finished like any title, ending as "<name> - 1080p.mkv". Logged ("KEEP P7 ..."), and
+        and finished like any title, ending as "<name> - 1080p.mkv" (with the default audio track
+        only: the 2160p file has the masters and commentary). Logged ("KEEP P7 ..."), and
         noted in the reports. Its "% of source" is relative to that reference.
     The decision is saved in "<name>.dovi.json". A season stays one format: once a title in a
     folder is kept as profile 7, the folder's later Dolby Vision 7 titles are too (titles already
@@ -1566,6 +1573,9 @@ $FinalizeBody = {
             # -Plumbing: its details go to <name>.audio.log, and it reports back one line of JSON
             # (tracks, what was dropped, sync shift, warnings), kept in final.json.
             $audioLog = Join-Path $titleDir "$base.audio.log"
+            # A 1080p copy (of a title kept as Dolby Vision 7) gets the default track only: its
+            # 2160p file next to it has the masters and commentary.
+            if ($Cfg.IsDerived) { $startArgs += @('-PassthruMasters', 'None', '-PassthruCommentaries', 'None') }
             $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Cfg.AddAudio, '-Source', $audioSrc, '-Dest', $winner, '-Replace',
                    '-LogPath', $audioLog, '-Plumbing') + $startArgs
             Write-Log "> Add-BluRayAudio -Source `"$audioSrc`" -Dest `"$winner`" -Replace -LogPath `"$audioLog`" -Plumbing $($startArgs -join ' ')"
@@ -2110,6 +2120,98 @@ function Compress-FolderSubtitles([string]$Dir) {
     }
 }
 
+# ---- "encode logs.zip": a finished folder's logs, json, csv and md files, bundled
+$logsZipName = 'encode logs.zip'
+$logsZipCache = @{}                  # folder -> @{ entry name -> text } read from its logs zip
+
+# A title file's text: from disk, or else from its folder's "encode logs.zip". $null if neither.
+function Read-TitleText([string]$Path) {
+    if ([IO.File]::Exists($Path)) { try { return [IO.File]::ReadAllText($Path) } catch { return $null } }
+    $dir = [IO.Path]::GetDirectoryName($Path)
+    if (-not $logsZipCache.ContainsKey($dir)) {
+        $h = @{}
+        $zip = Join-Path $dir $logsZipName
+        if ([IO.File]::Exists($zip)) {
+            try {
+                Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+                $in = [IO.Compression.ZipFile]::OpenRead($zip)
+                try {
+                    foreach ($e in $in.Entries) {
+                        if ($e.FullName -notlike '*.json') { continue }
+                        $sr = New-Object IO.StreamReader($e.Open(), [Text.Encoding]::UTF8)
+                        try { $h[$e.FullName] = $sr.ReadToEnd() } finally { $sr.Dispose() }
+                    }
+                } finally { $in.Dispose() }
+            } catch { }
+        }
+        $logsZipCache[$dir] = $h
+    }
+    $name = [IO.Path]::GetFileName($Path)
+    if ($logsZipCache[$dir].ContainsKey($name)) { return $logsZipCache[$dir][$name] }
+    $null
+}
+
+# Once every title in a folder is finished: its .log, .json, .csv and .md files (this script's:
+# "_encode-batch*" and "<title>.*") go into "encode logs.zip" (added to it if it exists), and
+# are deleted once the zip is verified, except _encode-batch_all.md (in the zip too; delete it
+# yourself after looking it over). Returns nothing; problems are logged and the files kept.
+function Compress-FolderLogs([string]$Dir, $Titles) {
+    $bases = @($Titles | ForEach-Object { "$($_.Base)." })
+    $files = @([IO.Directory]::GetFiles($Dir) | Where-Object {
+        $n = [IO.Path]::GetFileName($_)
+        $ext = [IO.Path]::GetExtension($n).ToLowerInvariant()
+        if ($ext -ne '.log' -and $ext -ne '.json' -and $ext -ne '.csv' -and $ext -ne '.md') { $false }
+        elseif ($n.StartsWith('_encode-batch', [StringComparison]::OrdinalIgnoreCase)) { $true }
+        else { @($bases | Where-Object { $n.StartsWith($_, [StringComparison]::Ordinal) }).Count -gt 0 }
+    })
+    $keep = '_encode-batch_all.md'
+    if (-not @($files | Where-Object { [IO.Path]::GetFileName($_) -ne $keep }).Count) { return }
+    $zip = Join-Path $Dir $logsZipName
+    $part = "$zip.partial"
+    Write-Log ("LOGS  {0}: bundling {1} file(s) into {2} (keeping {3} for you to look over)" -f $Dir, $files.Count, $logsZipName, $keep) 'Cyan'
+    try {
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $level = [IO.Compression.CompressionLevel]::Optimal
+        $new = @{}; foreach ($f in $files) { $new[[IO.Path]::GetFileName($f)] = $true }
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        $outFs = New-Object IO.FileStream($part, [IO.FileMode]::CreateNew)
+        $out = New-Object IO.Compression.ZipArchive($outFs, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            if ([IO.File]::Exists($zip)) {   # keep what's already in it (older files, other runs)
+                $in = [IO.Compression.ZipFile]::OpenRead($zip)
+                try {
+                    foreach ($e in $in.Entries) {
+                        if ($new.ContainsKey($e.FullName)) { continue }
+                        $ne = $out.CreateEntry($e.FullName, $level); $ne.LastWriteTime = $e.LastWriteTime
+                        $src = $e.Open(); $dst = $ne.Open()
+                        try { $src.CopyTo($dst) } finally { $dst.Dispose(); $src.Dispose() }
+                    }
+                } finally { $in.Dispose() }
+            }
+            foreach ($f in $files) {
+                # (shared read: the run log may still be open for writing)
+                $ne = $out.CreateEntry([IO.Path]::GetFileName($f), $level); $ne.LastWriteTime = [IO.File]::GetLastWriteTime($f)
+                $src = New-Object IO.FileStream($f, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                $dst = $ne.Open()
+                try { $src.CopyTo($dst) } finally { $dst.Dispose(); $src.Dispose() }
+            }
+        } finally { $out.Dispose(); $outFs.Dispose() }
+        $chk = [IO.Compression.ZipFile]::OpenRead($part)
+        try {
+            foreach ($f in $files) {
+                $e = $chk.GetEntry([IO.Path]::GetFileName($f))
+                if (-not $e -or $e.Length -lt (New-Object IO.FileInfo $f).Length) { throw "verification failed for $([IO.Path]::GetFileName($f))" }
+            }
+        } finally { $chk.Dispose() }
+        Move-Item -LiteralPath $part -Destination $zip -Force -ErrorAction Stop
+        $logsZipCache.Remove($Dir)
+        foreach ($f in $files) { if ([IO.Path]::GetFileName($f) -ne $keep) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } }
+    } catch {
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        Write-Log "Couldn't bundle the logs in ${Dir}: $($_.Exception.Message) (files kept)" 'Yellow'
+    }
+}
+
 # Once nothing in the folder is in progress: bundle its subtitle backups and remove the variant
 # folders (rungs, _source) that finishing left empty.
 function Invoke-SubtitleBundles {
@@ -2561,9 +2663,11 @@ function Get-NextPrepTitle {
             if (@($all | Where-Object { $_ }).Count -eq $specs.Count) { Add-Skip $t 'all variants already finished' 'Done (fixed variants)'; continue }
         } else {
             # Finished (or being finished) by an earlier run: final.json.
-            if ([IO.File]::Exists($t.FinalJson)) {
+            # (in "encode logs.zip" once the folder is complete and its logs are bundled)
+            $fdText = Read-TitleText $t.FinalJson
+            if ($null -ne $fdText) {
                 $fd = $null
-                try { $fd = [IO.File]::ReadAllText($t.FinalJson) | ConvertFrom-Json } catch { }
+                try { $fd = $fdText | ConvertFrom-Json } catch { }
                 if ($fd -and $fd.Variant) {
                     Set-FolderMemoryFromRows $t $fd.Variants $fd.Variant
                     if ($fd.State -eq 'done') { Remove-LocalCopy $t 'left over from an earlier run' -Dovi; Add-Skip $t "finished: $($fd.Variant) -> $($fd.Final)"; continue }
@@ -2684,8 +2788,9 @@ function Test-MoreWork {
 
 # ---- whole-batch report: every title under -Source, from what's saved on disk (any run)
 function Read-JsonFile([string]$Path) {
-    if (-not [IO.File]::Exists($Path)) { return $null }
-    try { [IO.File]::ReadAllText($Path) | ConvertFrom-Json } catch { $null }
+    $txt = Read-TitleText $Path
+    if ($null -eq $txt) { return $null }
+    try { $txt | ConvertFrom-Json } catch { $null }
 }
 
 # Crop (<name>.crop.json) and audio (what Add-BluRayAudio reported, kept in final.json) for the reports.
@@ -2823,7 +2928,8 @@ function Write-BatchReport([string]$Dir, $Titles, [bool]$Touched) {
         }
         return
     }
-    if (-not $Touched -and [IO.File]::Exists($mdAll)) { return }   # nothing new in this folder
+    # nothing new in this folder (or it's finished and bundled, and you've deleted the report)
+    if (-not $Touched -and ([IO.File]::Exists($mdAll) -or [IO.File]::Exists((Join-Path $Dir $logsZipName)))) { return }
     $srcGB = 0.0; $finGB = 0.0; $nSized = 0
     foreach ($o in $outs) {
         if ($o.Outcome -notlike 'Finished*') { continue }
@@ -2955,10 +3061,36 @@ function Write-FolderRunLog($grp, $allRels, $allDirs) {
 
 # Dolby Vision 7 titles kept as profile 7 by an earlier run: bring back their 1080p copies.
 foreach ($t in $titleList.ToArray()) {
-    $dec = Join-Path $t.TitleDir "$($t.Base).dovi.json"
-    if (-not [IO.File]::Exists($dec)) { continue }
-    try { $o = [IO.File]::ReadAllText($dec) | ConvertFrom-Json } catch { continue }
-    if ($o.Decision -eq 'keep-p7') { [void](Add-DerivedTitle $t) }
+    $o = Read-JsonFile (Join-Path $t.TitleDir "$($t.Base).dovi.json")
+    if ($o -and $o.Decision -eq 'keep-p7') { [void](Add-DerivedTitle $t) }
+}
+
+# A folder whose logs were bundled into "encode logs.zip" (every title finished) but that now
+# has a title to do (e.g. a new one in the source): put its files back, so this run works with
+# them as usual; it's bundled again once the folder is finished. Finished folders are left
+# zipped (their titles are read from the zip and skipped).
+foreach ($grp in @($titleList | Group-Object TitleDir)) {
+    $zip = Join-Path $grp.Name $logsZipName
+    if (-not [IO.File]::Exists($zip)) { continue }
+    $open = @($grp.Group | Where-Object { $fd = Read-JsonFile $_.FinalJson; -not ($fd -and $fd.State -eq 'done') })
+    if (-not $open.Count) { continue }
+    try {
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $in = [IO.Compression.ZipFile]::OpenRead($zip)
+        $n = 0
+        try {
+            foreach ($e in $in.Entries) {
+                $dst = Join-Path $grp.Name $e.FullName
+                if ($e.FullName -match '[\\/]' -or [IO.File]::Exists($dst)) { continue }
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dst); $n++
+            }
+        } finally { $in.Dispose() }
+        Remove-Item -LiteralPath $zip -Force -ErrorAction Stop
+        $logsZipCache.Remove($grp.Name)
+        Write-Log ("UNZIP {0}: {1} file(s) put back from {2} ({3} title(s) to do: {4})" -f $grp.Name, $n, $logsZipName, $open.Count, (($open | ForEach-Object { $_.Base }) -join '; ')) 'Cyan'
+    } catch {
+        Write-Log "Couldn't put back the files from ${zip}: $($_.Exception.Message)" 'Yellow'
+    }
 }
 
 [IO.File]::WriteAllText($lockPath, (@{ Pid = $PID; Started = (Get-Process -Id $PID).StartTime.ToString('o'); RunId = $runId } | ConvertTo-Json -Compress))
@@ -3208,6 +3340,16 @@ try {
     Write-Log ("Finished in {0}. Folder logs: {1}" -f $elapsed.ToString('hh\:mm\:ss'), $(if ($touchedDirs.Count) { $touchedDirs -join '; ' } else { 'none (nothing happened)' })) 'Cyan'
     foreach ($grp in @($groups | Where-Object { $_.Touched })) {
         try { Write-FolderRunLog $grp $allRels @($groups | ForEach-Object { $_.Dir }) } catch { Write-Log "Couldn't write the run log for $($grp.Dir): $($_.Exception.Message)" 'Yellow' }
+    }
+    # Folders where every title is finished: logs, json, csv and md into "encode logs.zip".
+    # Last, so this run's folder logs go in too. (-KeepVariants / fixed mode: left as they are.)
+    if (-not $fixedMode -and -not $KeepVariants) {
+        foreach ($grp in $groups) {
+            if (-not [IO.Directory]::Exists($grp.Dir)) { continue }
+            $notDone = @($grp.Titles | Where-Object { $fd = Read-JsonFile $_.FinalJson; -not ($fd -and $fd.State -eq 'done') })
+            if ($notDone.Count) { continue }
+            try { Compress-FolderLogs $grp.Dir $grp.Titles } catch { Write-Log "Couldn't bundle the logs in $($grp.Dir): $($_.Exception.Message)" 'Yellow' }
+        }
     }
     if ($script:PushedLocation) { Pop-Location -ErrorAction SilentlyContinue }
 }

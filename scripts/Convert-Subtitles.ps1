@@ -54,9 +54,9 @@
 .PARAMETER Source
     Required. The source MKV (or a "<name>.mks" backup made earlier), or a folder: then every
     title in it is done, each written next to itself under its own name: its <name>.mks backup
-    if there is one (loose, or inside the folder's "<folder> - subtitles.zip"), else its .mkv
+    if there is one (loose, or inside the folder's subtitles.zip), else its .mkv
     (when it has subtitle tracks). Each title's shift comes from Encode-Batch's
-    <name>.final.json next to it, unless -OffsetMs is given. A summary is shown at the end.
+    <name>.final.json next to it (or in the folder's "encode logs.zip"), unless -OffsetMs is given. A summary is shown at the end.
 .PARAMETER Recurse
     With a folder as -Source: sub-folders too.
 .PARAMETER Dest
@@ -778,13 +778,29 @@ function Invoke-One {
 }
 
 # The audio shift a finished title's subtitles need, from Encode-Batch's <name>.final.json next
-# to it (a "- 2160p" title's is <name>.final.json). $null if there's none.
+# to it, or inside the folder's "encode logs.zip" (a "- 2160p" title's is <name>.final.json).
+# $null if there's none.
 function Get-SavedOffset([string]$Dir, [string]$Base) {
     foreach ($b in @($Base, ($Base -replace ' - 2160p$', ''))) {
         $f = Join-Path $Dir "$b.final.json"
-        if (-not [IO.File]::Exists($f)) { continue }
+        $txt = $null
+        if ([IO.File]::Exists($f)) { $txt = [IO.File]::ReadAllText($f) }
+        else {
+            $z = Join-Path $Dir 'encode logs.zip'
+            if ([IO.File]::Exists($z)) {
+                try {
+                    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+                    $za = [IO.Compression.ZipFile]::OpenRead($z)
+                    try {
+                        $e = $za.GetEntry("$b.final.json")
+                        if ($e) { $sr = New-Object IO.StreamReader($e.Open(), [Text.Encoding]::UTF8); try { $txt = $sr.ReadToEnd() } finally { $sr.Dispose() } }
+                    } finally { $za.Dispose() }
+                } catch { }
+            }
+        }
+        if ($null -eq $txt) { continue }
         try {
-            $d = [IO.File]::ReadAllText($f) | ConvertFrom-Json
+            $d = $txt | ConvertFrom-Json
             if ($d.PSObject.Properties['Audio'] -and $d.Audio) {
                 if ($d.Audio.PSObject.Properties['SubtitleShiftMs']) { return [int]$d.Audio.SubtitleShiftMs }
                 if ($d.Audio.PSObject.Properties['SyncMs']) { return [int]$d.Audio.SyncMs }
@@ -804,8 +820,8 @@ if (-not [IO.Directory]::Exists($Source)) {
 }
 
 # ---------------------------------------------- a folder (and sub-folders with -Recurse)
-# Each title once: its <name>.mks backup if there is one (loose, or inside "<folder> -
-# subtitles.zip"), else the .mkv itself when it has subtitle tracks (a source folder). Written
+# Each title once: its <name>.mks backup if there is one (loose, or inside the folder's
+# subtitles.zip), else the .mkv itself when it has subtitle tracks (a source folder). Written
 # next to it under the same name; the offset comes from its <name>.final.json when there is
 # one (Encode-Batch's Dest folders), unless -OffsetMs is given.
 if ($Plumbing) { throw '-Plumbing only works with a single file.' }
@@ -819,7 +835,7 @@ $jobs = [Collections.Generic.List[object]]::new()
 foreach ($d in ($dirs | Sort-Object)) {
     $names = @{}
     foreach ($f in [IO.Directory]::GetFiles($d, '*.mks')) { $b = [IO.Path]::GetFileNameWithoutExtension($f); $names[$b] = $true; $jobs.Add([pscustomobject]@{ Dir = $d; Base = $b; Path = $f; Zip = '' }) }
-    foreach ($z in [IO.Directory]::GetFiles($d, '* - subtitles.zip')) {
+    foreach ($z in [IO.Directory]::GetFiles($d, '*subtitles.zip')) {   # "subtitles.zip" (older: "<folder> - subtitles.zip")
         try {
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             $za = [IO.Compression.ZipFile]::OpenRead($z)
