@@ -10,7 +10,7 @@
     Single mode: -Source is the source MKV and -Dest is the encoded video (.mkv, or an
                  older .mp4 to migrate).
 
-    Batch mode:  -Source and -Dest are two different, mirrored folder trees. Every MKV
+    Batch mode:  -Source and -Dest are two mirrored folder trees. Every MKV
                  under -Source (recursively) is matched only to the file at the same
                  relative path under -Dest with the same name: "<name>.mkv", or else
                  "<name>.mp4" (an older encode, migrated to MKV by this script):
@@ -19,6 +19,11 @@
                  Encodes named "<name> - <resolution>.mkv" match too (e.g. a title kept as
                  Dolby Vision 7: "<name> - 2160p.mkv" and "<name> - 1080p.mkv"); one source
                  can have several. -DestFilter limits which encodes are processed.
+                 -Source and -Dest can also be the same folder: then every MKV in it is
+                 rebuilt from its own audio (e.g. to drop tracks).
+
+    -Source and -Dest can be the same file, too: its own audio is the source. Handy for a
+    one-off fix of a finished file (e.g. -PassthruMasters None), at the cost of reading it twice.
                  - A folder whose MKVs have no mirrored file at all is skipped.
                  - In a partly matched folder, the matched pairs are processed and each
                    MKV without a mirrored file is listed with the path that was expected.
@@ -125,7 +130,7 @@
     Alias: -SourceFile.
 .PARAMETER Dest
     Required. The encoded .mkv or .mp4 (single mode), or the root folder of the mirrored
-    encoded tree (batch mode). Must be a different folder from -Source.
+    encoded tree (batch mode). Can be the same as -Source (the file is rebuilt from its own audio).
     Alias: -VideoFile.
 .PARAMETER SourceTrack
     Single mode only. Use this source audio track as the main track (the one the
@@ -1510,9 +1515,10 @@ $batch = Test-Path -LiteralPath $Source -PathType Container
 if ($batch -ne (Test-Path -LiteralPath $Dest -PathType Container)) {
     throw '-Source and -Dest must both be files, or both be folders.'
 }
-if ($Source.TrimEnd('\', '/') -eq $Dest.TrimEnd('\', '/')) {
-    throw '-Source and -Dest must be different (both hold .mkv files with the same names).'
-}
+# The same file (or folder) for both is fine: the audio is read from the file itself and the
+# result is written as "<name>.remux.mkv" next to it (or replaces it with -Replace). Useful for a
+# one-off fix of a finished file, e.g. dropping tracks with -PassthruMasters / -PassthruCommentaries.
+$sameTree = ($Source.TrimEnd('\', '/') -eq $Dest.TrimEnd('\', '/'))
 
 $pairs            = [Collections.Generic.List[object]]::new()
 $done             = [Collections.Generic.List[string]]::new()
@@ -1597,7 +1603,7 @@ if (-not $batch) {
                 $candidate = Join-Path $mirrorDir ($mkv.BaseName + $ext)
                 if (Test-Path -LiteralPath $candidate -PathType Leaf) { $targets += $candidate; break }
             }
-            foreach ($d in $dstMkvs) {
+            foreach ($d in $(if ($sameTree) { @() } else { $dstMkvs })) {   # (same folder: each file is its own pair)
                 if ($d.BaseName.Length -gt $mkv.BaseName.Length -and $d.BaseName.StartsWith($mkv.BaseName + ' - ', [StringComparison]::Ordinal) -and
                     $d.BaseName.Substring($mkv.BaseName.Length) -match '^ - \d{3,4}p(\.[^.\s]+)*$') { $targets += $d.FullName }
             }
