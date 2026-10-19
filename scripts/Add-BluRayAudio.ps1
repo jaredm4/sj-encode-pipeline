@@ -37,7 +37,8 @@
     For each pair:
     1. Checks that the encoded file and the source MKV are the same length (within 2 s).
     2. Masters: every lossless track in the source (TrueHD incl. Atmos, DTS-HD MA incl.
-       DTS:X and its built-in DTS core, PCM, FLAC, ALAC, MLP). The source's Default flag
+       DTS:X and its built-in DTS core, PCM, FLAC, ALAC, MLP), and every track with the Keep
+       tag (see step 5: a master this script converted, when the source is an earlier result). The source's Default flag
        is ignored. Main track: the master with the most channels (then highest
        bitrate, then first in the list). -SourceTrack overrides it (single mode only).
     3. Default (compatibility) track, chosen from the main track:
@@ -77,6 +78,13 @@
        else is dropped. PCM, FLAC and
        ALAC masters (channel-based, no Atmos/DTS:X objects) are stored as Opus to save
        space: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1 ($OpusKbps at the top).
+       The original isn't kept, so the Opus track gets a track tag, ADD_BLURAYAUDIO =
+       "Keep; from PCM 2.0 master" (Keep, then where it came from). When this script runs
+       on a file that has it (e.g. on a finished file against itself), that track is a
+       master: copied as is, never compared, dropped or converted again (only
+       -PassthruMasters None drops it, like any master). Copied tracks get no tag. A file
+       made before the tag existed has none: run it against its Blu-ray source once (the
+       missing tag alone makes it redo the file), and its Opus track gets the tag.
        TrueHD and DTS-HD MA masters are always copied unchanged. Chapters come from the
        source MKV.
        Metadata comes from the file name, using Matroska's tag scheme: bracketed parts
@@ -202,7 +210,8 @@
       Summary       e.g. "Dolby Digital 5.1 (default) + TrueHD Atmos 7.1 (master) + 1 commentary"
       Tracks        the output audio tracks in order: Track, Role (default, commentary or
                     master), Name, Codec, Channels, Kbps, Title, Made (copied or encoded),
-                    SourceTrack and SourceName (the source track it came from)
+                    SourceTrack and SourceName (the source track it came from), Keep (has
+                    the Keep tag)
       Dropped       source tracks not kept: SourceTrack, Name, Channels, Kbps, Title,
                     Reason, and the comparison's Louder/Quieter/Median shares if compared
       SyncMs        how far the encode's picture is from the source's (negative = early);
@@ -469,10 +478,30 @@ function Test-DolbyVision($VideoStream) {
     return [bool](@($sideData | Where-Object { (Get-Field $_ 'side_data_type') -like 'DOVI*' }).Count)
 }
 
-# "codec channels" for each audio stream, e.g. "ac3 6", "truehd 8"; compared with the plan.
+# The track tag this script puts on a master it converted (e.g. PCM stored as Opus), whose
+# original isn't kept: ADD_BLURAYAUDIO = "Keep; from <the master>". A track with it counts as a
+# master on a later run (copied as is, never dropped or converted again). Returns its value, or ''.
+# (ffprobe may show the name with a language suffix, e.g. "ADD_BLURAYAUDIO-eng".)
+$KeepTagName = 'ADD_BLURAYAUDIO'
+function Get-KeepTag($Stream) {
+    $tags = Get-Field $Stream 'tags'
+    if (-not $tags) { return '' }
+    foreach ($p in $tags.PSObject.Properties) {
+        if ($p.Name -match "^$KeepTagName(-[A-Za-z]{2,3})?$" -and [string]$p.Value -match '^\s*Keep\b') { return [string]$p.Value }
+    }
+    return ''
+}
+
+# "codec channels" for each audio stream, e.g. "ac3 6", "truehd 8", plus " keep" for a track with
+# the Keep tag ("opus 2 keep"); compared with the plan.
 function Get-AudioLayout($Streams) {
     return @($Streams | Where-Object { $_.codec_type -eq 'audio' } |
-        ForEach-Object { "$($_.codec_name) $([int]$_.channels)" })
+        ForEach-Object { "$($_.codec_name) $([int]$_.channels)$(if (Get-KeepTag $_) { ' keep' })" })
+}
+
+# mkvmerge --tags file for one track: the Keep tag.
+function Get-KeepTagXml([string]$Value) {
+    "<?xml version=`"1.0`" encoding=`"UTF-8`"?>`n<Tags><Tag><Targets></Targets><Simple><Name>$KeepTagName</Name><String>$([Security.SecurityElement]::Escape($Value))</String></Simple></Tag></Tags>"
 }
 
 # One planned output audio track.
@@ -483,7 +512,7 @@ function New-OutputTrack([string]$From, [int]$SrcPos, [string]$Codec, [int]$Kbps
     return [pscustomobject]@{
         From = $From; SrcPos = $SrcPos; Codec = $Codec; Kbps = $Kbps; Ac = $Ac
         Title = $Title; Note = $Note; Layout = $Layout
-        IsDefault = $false; IsCommentary = $false; TempFile = ''
+        IsDefault = $false; IsCommentary = $false; TempFile = ''; KeepTag = ''; TagsFile = ''
     }
 }
 
@@ -794,6 +823,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             Channels = [int](ConvertTo-Number (Get-Field $st 'channels'))
             BitRate  = $bitrate
             Lossless = Test-Lossless $codecName $codecProfile
+            Keep     = Get-KeepTag $st
             Title    = [string](Get-Field $tags 'title')
             Seconds  = Get-StreamSeconds $st
             Start    = ConvertTo-Number (Get-Field $st 'start_time')
@@ -805,11 +835,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $audio | Format-Table -AutoSize Pos, Name,
         @{ n = 'Ch';   e = { Get-ChannelLabel $_.Channels } },
         @{ n = 'kbps'; e = { if ($_.BitRate -gt 0) { [math]::Round($_.BitRate / 1000) } else { '?' } } },
-        Lossless, Title | Out-Host
+        Lossless, @{ n = 'Keep'; e = { [bool]$_.Keep } }, Title | Out-Host
 
     # ------------------------------------------------ masters and the main track
-    # Masters = every lossless track (a DTS-HD MA track keeps its DTS core inside it).
-    $masters = @($audio | Where-Object { $_.Lossless })
+    # Masters = every lossless track (a DTS-HD MA track keeps its DTS core inside it), and every
+    # track with the Keep tag (a master this script converted earlier, e.g. PCM stored as Opus).
+    $masters = @($audio | Where-Object { $_.Lossless -or $_.Keep })
 
     # Best track = most channels, then highest bitrate, then first in the list.
     function Select-BestTrack($Tracks) {
@@ -829,6 +860,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     } elseif ($masters.Count -gt 0) {
         $pick = Select-BestTrack $masters
         $why = 'lossless track with the most channels'
+        if ($pick.Keep) { $why = "master with the most channels; kept from an earlier run ($($pick.Keep))" }
     } else {
         $pick = Select-BestTrack $audio
         $why = 'NO LOSSLESS TRACK in the source; best lossy track'
@@ -839,10 +871,11 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 
     # ------------------------------------------------ comparison with the main track
     $isTrueHdMain = ($pick.Lossless -and $pick.Codec -eq 'truehd' -and $pick.Channels -ge 6)
+    $pickMaster = ($pick.Lossless -or $pick.Keep)
     $toCompare = @($audio | Where-Object {
-        -not $_.Lossless -and $_.Pos -ne $pick.Pos -and (
+        -not $_.Lossless -and -not $_.Keep -and $_.Pos -ne $pick.Pos -and (
             $_.Channels -le 2 -or
-            ($_.Codec -eq 'ac3' -and $_.Channels -eq 6 -and $pick.Lossless -and -not $isTrueHdMain -and $pick.Channels -ge 6))
+            ($_.Codec -eq 'ac3' -and $_.Channels -eq 6 -and $pickMaster -and -not $isTrueHdMain -and $pick.Channels -ge 6))
     })
 
     $runtime = $sLen
@@ -929,15 +962,15 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         }
         $compat = New-OutputTrack 'source' $core.Pos 'copy' 0 0 "$($core.Name) $(Get-ChannelLabel $core.Channels)" `
             "audio $($core.Pos): the TrueHD's AC-3 core ($how), copied" "ac3 $($core.Channels)"
-    } elseif ($pick.Lossless -and $pick.Channels -ge 6) {
+    } elseif ($pickMaster -and $pick.Channels -ge 6) {
         $same = Select-SameMix @($audio | Where-Object { $_.Codec -eq 'ac3' -and $_.Channels -eq 6 })
         if ($same) {
             $compat = New-OutputTrack 'source' $same.Pos 'copy' 0 0 "$($same.Name) $(Get-ChannelLabel $same.Channels)" `
                 "audio $($same.Pos): existing AC-3, same mix as the main track, copied" "ac3 6"
         }
-    } elseif ($pick.Lossless -and $pick.Channels -le 2) {
+    } elseif ($pickMaster -and $pick.Channels -le 2) {
         $same = Select-SameMix @($audio | Where-Object {
-            -not $_.Lossless -and $_.Codec -ne 'dts' -and $_.Channels -eq $pick.Channels })
+            -not $_.Lossless -and -not $_.Keep -and $_.Codec -ne 'dts' -and $_.Channels -eq $pick.Channels })
         if ($same) {
             $compat = New-OutputTrack 'source' $same.Pos 'copy' 0 0 "$($same.Name) $(Get-ChannelLabel $same.Channels)" `
                 "audio $($same.Pos): existing $($same.Name), same mix as the main track, copied" "$($same.Codec) $($same.Channels)"
@@ -1004,7 +1037,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $dupDropped = @()
     foreach ($pt in $passTracks) {
         $twins = @($keep | Where-Object {
-            $_.Lossless -and $_.Pos -ne $pick.Pos -and $_.Channels -eq $pt.Channels -and $_.Pos -notin $dupDropped })
+            ($_.Lossless -or $_.Keep) -and $_.Pos -ne $pick.Pos -and $_.Channels -eq $pt.Channels -and $_.Pos -notin $dupDropped })
         if ($twins.Count -eq 0) { continue }
         $ptCurves = @(foreach ($st0 in $starts) { ,(Get-LoudnessCurve $SourceFile $pt.Pos $st0 $clipLen) })
         foreach ($tw in $twins) {
@@ -1041,14 +1074,19 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     foreach ($m in $keep) {
         if ($m.Codec -match '^(pcm_.*|flac|alac)$') {
             # Channel-based lossless (no Atmos/DTS:X objects to keep for a future format):
-            # stored as high-bitrate Opus to save space.
+            # stored as high-bitrate Opus to save space. The original isn't kept, so the Opus
+            # track gets the Keep tag: a later run (e.g. on this file itself) keeps it as the master.
             $ok = Get-OpusKbps $m.Channels
-            $outputs.Add((New-OutputTrack 'encode' $m.Pos 'libopus' $ok 0 "Opus $(Get-ChannelLabel $m.Channels)" `
-                "audio $($m.Pos): $($m.Name) encoded to Opus at $ok kbps" "opus $($m.Channels)"))
+            $t = New-OutputTrack 'encode' $m.Pos 'libopus' $ok 0 "Opus $(Get-ChannelLabel $m.Channels)" `
+                "audio $($m.Pos): $($m.Name) encoded to Opus at $ok kbps (tagged Keep)" "opus $($m.Channels) keep"
+            $t.KeepTag = "Keep; from $($m.Name) $(Get-ChannelLabel $m.Channels) master"
+            $outputs.Add($t)
         } else {
             $note = "audio $($m.Pos): copied"
-            if (-not $m.Lossless) { $note = "audio $($m.Pos): copied (original lossy track; the default track is a converted copy)" }
-            $outputs.Add((New-OutputTrack 'source' $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note "$($m.Codec) $($m.Channels)"))
+            $layout = "$($m.Codec) $($m.Channels)"
+            if ($m.Keep) { $note = "audio $($m.Pos): copied (Keep tag: $($m.Keep))"; $layout += ' keep' }
+            elseif (-not $m.Lossless) { $note = "audio $($m.Pos): copied (original lossy track; the default track is a converted copy)" }
+            $outputs.Add((New-OutputTrack 'source' $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note $layout))
         }
     }
     $plannedLayout = @($outputs | ForEach-Object { $_.Layout })
@@ -1074,7 +1112,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $trackName = $o.Title
         if ($o.IsCommentary) { $trackName = $srcName }
         [ordered]@{
-            Track = $i; Role = $role; Name = $trackName; Codec = ($o.Layout -split ' ')[0]; Channels = $outCh
+            Track = $i; Role = $role; Name = $trackName; Codec = ($o.Layout -split ' ')[0]; Channels = $outCh; Keep = [bool]($o.Layout -like '* keep')
             Kbps = $kb; Title = $o.Title; Made = $made; SourceTrack = $o.SrcPos; SourceName = $srcName
         }
     })
@@ -1213,6 +1251,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $mk.AddRange([string[]]@('--no-chapters', '--no-global-tags', '--language', "0:$AudioLanguage",
             '--track-name', "0:$($o.Title)", '--default-track-flag', "0:$(if ($o.IsDefault) { 'yes' } else { 'no' })"))
         if ($audioShiftMs -ne 0) { $mk.AddRange([string[]]@('--sync', "0:$audioShiftMs")) }
+        if ($o.KeepTag) {
+            $o.TagsFile = Join-Path $tempDir ('abr-' + [guid]::NewGuid().ToString('N') + '.xml')
+            $mk.AddRange([string[]]@('--tags', "0:$($o.TagsFile)"))
+        }
         $mk.Add($o.TempFile)
         $trackOpts[$i] = "${fileNo}:0"
         $fileNo++
@@ -1275,6 +1317,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $mkWarnings = $false
     try {
         [IO.File]::WriteAllText($tagsFile, (Get-TagsXml $titleInfo), [Text.UTF8Encoding]::new($false))
+        foreach ($o in $outputs) { if ($o.TagsFile) { [IO.File]::WriteAllText($o.TagsFile, (Get-KeepTagXml $o.KeepTag), [Text.UTF8Encoding]::new($false)) } }
         foreach ($enc in $encodeCmds) {
             if ($Plumbing) { Invoke-ToolLogged $script:ffmpeg $enc } else { & $script:ffmpeg @enc }
             if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed with exit code $LASTEXITCODE" }
@@ -1287,6 +1330,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         Remove-Item -LiteralPath $tagsFile -Force -ErrorAction SilentlyContinue
         foreach ($o in $outputs) {
             if ($o.TempFile) { Remove-Item -LiteralPath $o.TempFile -Force -ErrorAction SilentlyContinue }
+            if ($o.TagsFile) { Remove-Item -LiteralPath $o.TagsFile -Force -ErrorAction SilentlyContinue }
         }
     }
 
