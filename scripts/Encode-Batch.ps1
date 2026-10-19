@@ -7,8 +7,8 @@
 
 .DESCRIPTION
     For each .mkv found (recursively) under -Source, mirrored into -Dest. A source folder holding
-    a file named DONE (no extension; you add it once you've signed the folder off) is skipped:
-    its MKVs aren't looked at (sub-folders are judged on their own; see -CompleteMarker).
+    a file named DONE or SKIP (no extension; you add it: DONE once you've signed the folder off,
+    SKIP to leave it out for now) is skipped entirely, sub-folders included (see -CompleteMarker).
 
       Dest\<same sub-folders>\
           <name>.mkv                   the finished encode, with audio (ladder mode, see below)
@@ -131,8 +131,8 @@
     Work is a queue, not one thread per title:
       - Prep (one title at a time, no encoder slot used): probe with ffprobe (and mediainfo when
         installed); skip Dolby Vision other than 7 / 8.1 (and VC-1 with -SkipVC1 $true). For profile 7:
-        see "Dolby Vision 7" below. Then CropDetect -Plumbing for the Suggested crop.
-      - Encodes (up to -Threads at once, GPU): each free slot takes the next encode of the oldest
+        see "Dolby Vision 7" below (Convert-DolbyVision.ps1). Then CropDetect -Plumbing for the crop.
+      - Encodes (up to -Threads at once, GPU; Encode-Video.ps1 runs NVEncC): each free slot takes the next encode of the oldest
         title that has one ready, so an earlier title's next rung always goes first. A title waiting on VMAF to choose its next rung doesn't hold a
         slot; the slot moves on to another title. Up to -Threads + 2 searches from scratch are in
         progress at once; titles starting from their folder's pick aren't limited and are prepped
@@ -296,11 +296,18 @@ param(
     # Ladder mode, once a title has a suggested variant: add the Blu-ray audio to it with
     # Add-BluRayAudio (-Replace), move it up to the mirrored folder (Dest\...\<name>.mkv), and
     # delete this title's other variants. -NoAudio skips the audio, -KeepVariants the deleting.
-    # A SOURCE folder holding a file with this name is finished and signed off: its MKVs are
-    # skipped entirely. Only that folder; sub-folders are judged on their own. '' turns it off.
-    [string]$CompleteMarker = 'DONE',
+    # A SOURCE folder holding a file with one of these names is skipped entirely: its MKVs and
+    # everything in its sub-folders (e.g. a whole series from one file in the series folder).
+    # DONE = finished and signed off, SKIP = left out for now; they work the same, the names are
+    # just for you. Only folders under -Source count. '' turns it off.
+    [string[]]$CompleteMarker = @('DONE', 'SKIP'),
 
     [string]$AddBluRayAudio = (Join-Path $PSScriptRoot 'Add-BluRayAudio.ps1'),
+    # The worker scripts: NVEncC encodes (Encode-Video) and Dolby Vision 7 handling: inspect,
+    # convert to 8.1 or keep as profile 7, and the 1080p SDR reference (Convert-DolbyVision).
+    # Both need Encode-Batch.Common.ps1 next to them.
+    [string]$EncodeVideo = (Join-Path $PSScriptRoot 'Encode-Video.ps1'),
+    [string]$ConvertDolbyVision = (Join-Path $PSScriptRoot 'Convert-DolbyVision.ps1'),
     [switch]$NoAudio,
     [switch]$KeepVariants,
 
@@ -371,247 +378,11 @@ if (-not $cwdNow -or -not [IO.Directory]::Exists($cwdNow)) {
 
 # =====================================================================================
 # Helpers shared by the orchestrator and the worker jobs (jobs are separate processes,
-# so these are passed in as text and dot-sourced there).
+# so these are passed in as text and dot-sourced there): the general ones from
+# Encode-Batch.Common.ps1 (shared with Encode-Video.ps1 and Convert-DolbyVision.ps1), plus
+# Encode-Batch's own below. Put together as $Helpers further down.
 # =====================================================================================
-$Helpers = {
-    $script:LogPath = $null
-    $script:EchoLog = $false
-    $script:StatusFile = $null
-    $script:LogPrefix = ''
-    $script:Utf8 = New-Object System.Text.UTF8Encoding $false
-
-    # Several processes (two variants of one title) can write the same log. Take the file
-    # exclusively for each write (readers like Get-Content -Wait are still allowed) and retry
-    # briefly if another writer has it.
-    function Add-LogText {
-        param([string]$Path, [string]$Text)
-        if (-not $Path) { return }
-        $bytes = $script:Utf8.GetBytes($Text)
-        for ($try = 0; $try -lt 400; $try++) {
-            try {
-                $fs = New-Object IO.FileStream($Path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-                try { [void]$fs.Seek(0, [IO.SeekOrigin]::End); $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
-                return
-            } catch [IO.IOException] { Start-Sleep -Milliseconds 25 }
-        }
-    }
-
-    function Write-Log {
-        param([string]$Message, [string]$Color = 'Gray')
-        $line = '{0:yyyy-MM-dd HH:mm:ss}  {1}{2}' -f (Get-Date), $script:LogPrefix, $Message
-        Add-LogText $script:LogPath ($line + "`r`n")
-        if ($script:EchoLog) { Write-Host $line -ForegroundColor $Color }
-    }
-
-    function Write-LogRaw {
-        param([string]$Text)
-        if ($script:LogPrefix -and $Text) { $Text = $Text -replace '^( {0,4})', ('$1' + $script:LogPrefix.Replace('$', '$$')) }
-        Add-LogText $script:LogPath ($Text + "`r`n")
-    }
-
-    function Set-Status {
-        param([hashtable]$Status)
-        if (-not $script:StatusFile) { return }
-        try {
-            $tmp = $script:StatusFile + '.tmp'
-            [IO.File]::WriteAllText($tmp, ($Status | ConvertTo-Json -Compress), $script:Utf8)
-            Move-Item -LiteralPath $tmp -Destination $script:StatusFile -Force
-        } catch { }
-    }
-
-    # Windows command-line quoting (CommandLineToArgvW rules).
-    function Join-Args {
-        param([string[]]$ArgList)
-        ($ArgList | ForEach-Object {
-            $s = [string]$_
-            if ($s -eq '') { '""' }
-            elseif ($s -notmatch '[\s"]') { $s }
-            else { '"' + (($s -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"' }
-        }) -join ' '
-    }
-
-    function ConvertTo-BashQuoted {
-        param([string]$Text)
-        "'" + ($Text -replace "'", "'\''") + "'"
-    }
-
-    function ConvertTo-WslPath {
-        param([string]$Path, [string]$MountRoot = '/mnt')
-        if ($Path.StartsWith('/')) { return $Path }   # already a Linux path
-        if ($Path -match '^([A-Za-z]):\\?(.*)$') {
-            return ($MountRoot.TrimEnd('/') + '/' + $Matches[1].ToLower() + '/' + ($Matches[2] -replace '\\', '/')).TrimEnd('/')
-        }
-        throw "Can't map '$Path' into WSL (only drive-letter paths are supported, not UNC)."
-    }
-
-    function Get-FreeGB {
-        param([string]$Path)
-        $root = [IO.Path]::GetPathRoot($Path)
-        if (-not $root -or $root.StartsWith('\\')) { throw "Free-space check needs a drive-letter path: '$Path'." }
-        [Math]::Round((New-Object IO.DriveInfo $root).AvailableFreeSpace / 1GB, 1)
-    }
-
-    # Copies a file via "<Dest>.partial" (renamed when complete), reporting progress to the status
-    # file. Large sequential reads: much faster from a NAS than the encoders' own small reads.
-    function Copy-FileWithProgress {
-        param([string]$Src, [string]$Dst, [hashtable]$StatusBase = @{})
-        $part = "$Dst.partial"
-        $total = (New-Object IO.FileInfo $Src).Length
-        $buf = New-Object byte[] (8MB)
-        $in = New-Object IO.FileStream($Src, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, 1MB, [IO.FileOptions]::SequentialScan)
-        try {
-            $out = New-Object IO.FileStream($part, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None, 1MB)
-            try {
-                $done = 0L; $t0 = Get-Date; $last = [DateTime]::MinValue
-                while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
-                    $out.Write($buf, 0, $n); $done += $n
-                    if (((Get-Date) - $last).TotalSeconds -ge 2) {
-                        $last = Get-Date
-                        $secs = [Math]::Max([double]0.1, ((Get-Date) - $t0).TotalSeconds)
-                        $st = @{} + $StatusBase
-                        $st.Pct = [Math]::Round(100.0 * $done / [Math]::Max([double]1, [double]$total), 1)
-                        $st.Detail = '{0:N1} of {1:N1} GB, {2:N0} MB/s' -f ($done / 1GB), ($total / 1GB), ($done / 1MB / $secs)
-                        Set-Status $st
-                    }
-                }
-            } finally { $out.Dispose() }
-        } finally { $in.Dispose() }
-        if ((New-Object IO.FileInfo $part).Length -ne $total) { throw "copy of $Src is incomplete" }
-        Move-Item -LiteralPath $part -Destination $Dst -Force -ErrorAction Stop
-    }
-
-    # Runs a program, streaming stdout+stderr into the log (minus progress lines, which go to the
-    # status file instead). Returns ExitCode and the logged Lines.
-    function Invoke-Logged {
-        param(
-            [Parameter(Mandatory)][string]$Exe,
-            [Parameter(Mandatory)][string[]]$ArgList,
-            [string]$TempDir = [IO.Path]::GetTempPath(),
-            [hashtable]$StatusBase = @{},
-            [string]$ProgressPattern = '^\[(\d+(?:\.\d+)?)%\]\s*(.*)$',
-            [switch]$Quiet
-        )
-        $argStr = Join-Args $ArgList
-        if (-not $Quiet) { Write-Log "> $Exe $argStr" }
-        $id = [guid]::NewGuid().ToString('N')
-        $outFile = Join-Path $TempDir "$id.out"
-        $errFile = Join-Path $TempDir "$id.err"
-        # Input is an empty file: a program that inherited this background job's input could wait
-        # on it forever (seconv, under Convert-Subtitles, did).
-        $inFile = Join-Path $TempDir "$id.in"
-        [IO.File]::WriteAllText($inFile, '')
-        # Started in the temp folder: Start-Process otherwise uses PowerShell's current folder, and
-        # fails with "The directory name is invalid" if that folder no longer exists.
-        $p = Start-Process -FilePath $Exe -ArgumentList $argStr -NoNewWindow -PassThru -WorkingDirectory $TempDir `
-            -RedirectStandardOutput $outFile -RedirectStandardError $errFile -RedirectStandardInput $inFile
-        $null = $p.Handle   # keeps ExitCode available after exit (Windows PowerShell quirk)
-        $st = @{} + $StatusBase; $st.Pid = $p.Id; $st.Exe = [IO.Path]::GetFileNameWithoutExtension($Exe)
-        Set-Status $st
-
-        $lines = New-Object System.Collections.Generic.List[string]
-        $streams = @()
-        foreach ($f in $outFile, $errFile) {
-            $streams += [pscustomobject]@{ File = $f; Reader = $null; Pending = '' }
-        }
-        $throttle = @{ Last = [DateTime]::MinValue }
-
-        $drain = {
-            param([bool]$Final)
-            foreach ($s in $streams) {
-                if (-not $s.Reader) {
-                    if (-not [IO.File]::Exists($s.File)) { continue }
-                    $fs = New-Object IO.FileStream($s.File, [IO.FileMode]::Open, [IO.FileAccess]::Read,
-                        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-                    $s.Reader = New-Object IO.StreamReader($fs, $script:Utf8)
-                }
-                $chunk = $s.Reader.ReadToEnd()
-                if (-not $chunk -and -not $Final) { continue }
-                $text = $s.Pending + $chunk
-                $parts = [regex]::Split($text, '\r\n|\r|\n')
-                if ($Final) { $s.Pending = '' }
-                else {
-                    $s.Pending = $parts[-1]
-                    # (careful: 0..-1 in PowerShell is "first and last", not empty)
-                    if ($parts.Count -gt 1) { $parts = $parts[0..($parts.Count - 2)] } else { $parts = @() }
-                }
-                foreach ($line0 in $parts) {
-                    # Colour/cursor codes (e.g. dovi_convert prints "\e[1mAction:\e[0m ...") would break matching.
-                    $line = $line0 -replace '\x1b\[[0-9;?]*[ -/]*[@-~]', ''
-                    # Animated spinner frames (dovi_convert: "Extracting RPU...  <spinner> (0m 05s)").
-                    if ($line -match '[\u2800-\u28FF|/\\-] \(\d+m \d{2}s\)\s*$') { continue }
-                    if ($line -match $ProgressPattern) {
-                        if (((Get-Date) - $throttle.Last).TotalSeconds -ge 2) {
-                            $st.Pct = [double]$Matches[1]; $st.Detail = $Matches[2]
-                            Set-Status $st
-                            $throttle.Last = Get-Date
-                        }
-                    } elseif ($line.Trim()) {
-                        $lines.Add($line)
-                        if (-not $Quiet) { Write-LogRaw "    $line" }
-                    }
-                }
-            }
-        }
-
-        while (-not $p.HasExited) {
-            & $drain $false
-            Start-Sleep -Milliseconds 500
-        }
-        $p.WaitForExit()
-        & $drain $false
-        & $drain $true
-        foreach ($s in $streams) { if ($s.Reader) { $s.Reader.Dispose() } }
-        Remove-Item -LiteralPath $outFile, $errFile, $inFile -Force -ErrorAction SilentlyContinue
-        if (-not $Quiet) { Write-Log "  exit code $($p.ExitCode)" }
-        [pscustomobject]@{ ExitCode = $p.ExitCode; Lines = $lines.ToArray() }
-    }
-
-    # Runs a bash snippet inside WSL as a login shell. Paths listed in -NeedPaths are checked
-    # first; if any are missing the remount command is run once (serialised with flock).
-    function Invoke-Wsl {
-        param(
-            [Parameter(Mandatory)][string]$Body,
-            [string[]]$NeedPaths = @(),
-            [Parameter(Mandatory)]$Wsl,
-            [string]$TempDir = [IO.Path]::GetTempPath(),
-            [hashtable]$StatusBase = @{},
-            [switch]$Quiet
-        )
-        $need = ($NeedPaths | ForEach-Object { ConvertTo-BashQuoted $_ }) -join ' '
-        $prelude = @'
-set -u
-export NO_COLOR=1
-exec </dev/null
-if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"; fi
-eb_ensure_visible() {
-  local p missing=0
-  for p in "$@"; do [ -e "$p" ] || missing=1; done
-  [ "$missing" -eq 0 ] && return 0
-  echo "[encode-batch] not visible in WSL; running remount"
-  ( flock -w 300 9 || exit 0; timeout 180 __REMOUNT__ </dev/null ) 9>/tmp/encode-batch-remount.lock
-  for p in "$@"; do
-    [ -e "$p" ] || { echo "[encode-batch] still not visible in WSL after remount: $p"; return 97; }
-  done
-}
-'@
-        $prelude = $prelude.Replace('__REMOUNT__', $Wsl.RemountCmd)
-        $script = $prelude + "`n"
-        if ($need) { $script += "eb_ensure_visible $need || exit `$?`n" }
-        $script += $Body + "`n"
-        $shFile = Join-Path $TempDir ([guid]::NewGuid().ToString('N') + '.sh')
-        [IO.File]::WriteAllText($shFile, ($script -replace "`r`n", "`n"), $script:Utf8)
-        $a = @()
-        if ($Wsl.Distro) { $a += @('-d', $Wsl.Distro) }
-        $a += @('-e', 'bash', '-l', (ConvertTo-WslPath $shFile $Wsl.MountRoot))
-        $env:WSL_UTF8 = '1'
-        try {
-            Invoke-Logged -Exe 'wsl.exe' -ArgList $a -TempDir $TempDir -StatusBase $StatusBase -Quiet:$Quiet
-        } finally {
-            Remove-Item -LiteralPath $shFile -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    # ffprobe (+ mediainfo when available) summary of the first video stream.
+$BatchHelpers = {
     # The crop to use from a crop.json (CropDetect -Plumbing): its top level is the crop in use,
     # Mode says which kind it is, and Crops holds all three (Strict: black bars only; Suggested:
     # plus soft edges beside black bars; Full: plus all soft edges). A different -CropMode
@@ -668,133 +439,6 @@ eb_ensure_visible() {
             }
         } catch { }
         $res
-    }
-
-    function Get-SourceInfo {
-        param([string]$Path)
-        $ErrorActionPreference = 'Continue'
-        $raw = & ffprobe -v error -select_streams v:0 -show_streams -show_format -of json $Path 2>$null
-        if (-not $raw) { throw "ffprobe could not read '$Path'." }
-        $j = ($raw -join "`n") | ConvertFrom-Json
-        $s = @($j.streams)[0]
-        if (-not $s) { throw "No video stream in '$Path'." }
-
-        $ffDv = $null
-        if ($s.PSObject.Properties['side_data_list']) {
-            foreach ($sd in @($s.side_data_list)) {
-                if ($sd.side_data_type -eq 'DOVI configuration record') {
-                    $ffDv = [pscustomobject]@{ Profile = [int]$sd.dv_profile; Compat = [int]$sd.dv_bl_signal_compatibility_id }
-                }
-            }
-        }
-        $ffClass = 'None'
-        if ($ffDv) {
-            $ffClass = switch ($ffDv.Profile) {
-                7 { 'P7' }
-                8 { switch ($ffDv.Compat) { 1 { 'P8.1' } 2 { 'P8.2' } 4 { 'P8.4' } default { "P8 (compat $($ffDv.Compat))" } } }
-                default { "P$($ffDv.Profile)" }
-            }
-        }
-
-        $miClass = $null; $miText = ''
-        if (Get-Command mediainfo -ErrorAction SilentlyContinue) {
-            try {
-                $miRaw = & mediainfo --Output=JSON $Path 2>$null
-                $mj = ($miRaw -join "`n") | ConvertFrom-Json
-                $vt = @($mj.media.track | Where-Object { $_.'@type' -eq 'Video' })[0]
-                $miClass = 'None'
-                if ($vt -and $vt.PSObject.Properties['HDR_Format']) { $miText = [string]$vt.HDR_Format }
-                if ($vt -and $vt.PSObject.Properties['HDR_Format'] -and $vt.HDR_Format -match 'Dolby Vision') {
-                    $fmt = @($vt.HDR_Format -split ' / ')
-                    $idx = 0
-                    for ($k = 0; $k -lt $fmt.Count; $k++) { if ($fmt[$k] -match 'Dolby Vision') { $idx = $k; break } }
-                    $prof = ''; $comp = ''
-                    if ($vt.PSObject.Properties['HDR_Format_Profile']) {
-                        $ps = @($vt.HDR_Format_Profile -split ' / ')
-                        if ($idx -lt $ps.Count) { $prof = $ps[$idx] } else { $prof = $ps[0] }
-                    }
-                    if ($vt.PSObject.Properties['HDR_Format_Compatibility']) {
-                        $cs = @($vt.HDR_Format_Compatibility -split ' / ')
-                        if ($idx -lt $cs.Count) { $comp = $cs[$idx] }
-                    }
-                    $miText = "$($vt.HDR_Format) | $prof | $comp"
-                    if ($prof -match 'dv[a-z0-9]{2}\.(\d{2})') {
-                        $pn = [int]$Matches[1]
-                        $miClass = switch ($pn) {
-                            7 { 'P7' }
-                            8 { if ($comp -match 'HDR10') { 'P8.1' } elseif ($comp -match 'HLG') { 'P8.4' } elseif ($comp -match 'SDR') { 'P8.2' } else { "P8 ($comp)" } }
-                            default { "P$pn" }
-                        }
-                    } else { $miClass = 'DV (unknown profile)' }
-                }
-            } catch { $miClass = $null }
-        }
-
-        # Use both opinions: any disagreement about Dolby Vision is a reason to stop, not guess.
-        $dv = $ffClass
-        if ($null -ne $miClass -and $miClass -ne $ffClass) {
-            if ($ffClass -eq 'None') { $dv = $miClass } elseif ($miClass -ne 'None') { $dv = "Mismatch (ffprobe $ffClass, mediainfo $miClass)" }
-        }
-
-        $dur = 0.0
-        if ($j.format -and $j.format.PSObject.Properties['duration']) {
-            [void][double]::TryParse([string]$j.format.duration, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$dur)
-        }
-        $trc = ''; if ($s.PSObject.Properties['color_transfer']) { $trc = [string]$s.color_transfer }
-        $fps = '24000/1001'; if ($s.PSObject.Properties['r_frame_rate'] -and $s.r_frame_rate -match '^\d+/\d+$') { $fps = $s.r_frame_rate }
-        $hdr = ($trc -eq 'smpte2084' -or $trc -eq 'arib-std-b67')
-
-        # HDR only: read the static metadata and whether HDR10+ is present, the way FastFlix does,
-        # so NVEncC gets explicit values instead of relying on "auto"/"copy".
-        $colorArgs = @(); $masterDisplay = ''; $maxCll = ''; $hdr10Plus = $false
-        if ($hdr) {
-            $okMatrix = 'bt709', 'bt2020nc', 'bt2020c', 'smpte170m', 'bt470bg'
-            $okPrim = 'bt709', 'bt2020', 'smpte170m', 'bt470bg', 'smpte432'
-            if ($s.PSObject.Properties['color_space'] -and $okMatrix -contains $s.color_space) { $colorArgs += @('--colormatrix', [string]$s.color_space) }
-            $colorArgs += @('--transfer', $trc)
-            if ($s.PSObject.Properties['color_primaries'] -and $okPrim -contains $s.color_primaries) { $colorArgs += @('--colorprim', [string]$s.color_primaries) }
-
-            $side = @()
-            if ($s.PSObject.Properties['side_data_list']) { $side += @($s.side_data_list) }
-            $fr = & ffprobe -v error -select_streams v:0 -read_intervals '%+#6' -show_frames -show_entries 'frame=side_data_list' -of json $Path 2>$null
-            if ($fr) {
-                try { foreach ($f in @((($fr -join "`n") | ConvertFrom-Json).frames)) { if ($f.PSObject.Properties['side_data_list']) { $side += @($f.side_data_list) } } } catch { }
-            }
-            $num = {
-                param($v)
-                $t = [string]$v
-                if ($t -match '^(-?[\d.]+)/([\d.]+)$') { [double]$Matches[1] / [double]$Matches[2] } else { [double]$t }
-            }
-            $md = $side | Where-Object { $_.side_data_type -eq 'Mastering display metadata' -and $_.PSObject.Properties['red_x'] } | Select-Object -First 1
-            if ($md) {
-                $c = { param($v) [int][Math]::Round((& $num $v) * 50000) }
-                $l = { param($v) [long][Math]::Round((& $num $v) * 10000) }
-                $masterDisplay = 'G({0},{1})B({2},{3})R({4},{5})WP({6},{7})L({8},{9})' -f `
-                    (& $c $md.green_x), (& $c $md.green_y), (& $c $md.blue_x), (& $c $md.blue_y),
-                    (& $c $md.red_x), (& $c $md.red_y), (& $c $md.white_point_x), (& $c $md.white_point_y),
-                    (& $l $md.max_luminance), (& $l $md.min_luminance)
-            }
-            $cl = $side | Where-Object { $_.side_data_type -eq 'Content light level metadata' } | Select-Object -First 1
-            if ($cl -and ([int]$cl.max_content -gt 0 -or [int]$cl.max_average -gt 0)) { $maxCll = '{0},{1}' -f [int]$cl.max_content, [int]$cl.max_average }
-            $hdr10Plus = [bool]($side | Where-Object { $_.side_data_type -match '2094-40|HDR10\+' } | Select-Object -First 1)
-            if (-not $hdr10Plus -and $miText -match '2094') { $hdr10Plus = $true }
-        }
-
-        [pscustomobject]@{
-            Codec     = [string]$s.codec_name
-            Width     = [int]$s.width
-            Height    = [int]$s.height
-            Fps       = $fps
-            Duration  = $dur
-            Transfer  = $trc
-            Hdr       = $hdr
-            Hdr10Plus = $hdr10Plus
-            ColorArgs = $colorArgs
-            MasterDisplay = $masterDisplay
-            MaxCll    = $maxCll
-            Dv        = $dv
-            DvDetail  = "ffprobe=$ffClass mediainfo=$(if ($null -eq $miClass) { 'n/a' } else { $miClass }) $miText".Trim()
-        }
     }
 
     function Read-VmafResult {
@@ -1047,8 +691,10 @@ eb_ensure_visible() {
 # Workers. Each runs in its own job process; config arrives (and the result leaves) as JSON,
 # because job serialization only keeps one level of nesting and would turn argument arrays
 # into the string "System.Object[]".
-#   Prep worker:    one per title, one at a time. Dolby Vision 7 conversion + crop detection.
-#   Variant worker: one per (title, variant), up to -Threads at once. Encode + VMAF.
+#   Prep worker:    one per title, one at a time. Local copy, Dolby Vision 7 (Convert-DolbyVision.ps1)
+#                   + crop detection (CropDetect.ps1).
+#   Variant worker: one per (title, variant), up to -Threads at once. Encode (Encode-Video.ps1) + VMAF.
+# The worker scripts run inside the job (with -Plumbing), logging to the title's log.
 # =====================================================================================
 $WorkerHeader = {
     param([string]$CfgJson)
@@ -1077,6 +723,19 @@ $WorkerHeader = {
     }
     $tmp = $Cfg.TempDir
     $wsl = $Cfg.Wsl
+    # Runs one of the worker scripts (Encode-Video, Convert-DolbyVision) in this job, with
+    # -Plumbing: it logs to the title's log and reports back one line of JSON.
+    function Invoke-WorkerScript([string]$Path, [hashtable]$Params) {
+        $Params.Plumbing = $true
+        $out = @(& $Path @Params)
+        $json = @($out | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+        if (-not $json.Count) { throw "$([IO.Path]::GetFileName($Path)) reported nothing back." }
+        $json[0] | ConvertFrom-Json
+    }
+    # Its log and status settings: this job's.
+    function Get-WorkerScriptCommon([hashtable]$Status) {
+        @{ LogPath = [string]$Cfg.LogPath; LogPrefix = $script:LogPrefix; StatusFile = [string]$Cfg.StatusFile; Status = $Status; TempDir = [string]$tmp }
+    }
 }
 
 $PrepBody = {
@@ -1089,18 +748,6 @@ $PrepBody = {
         if ($reason) { Write-Log "PREP: $st - $reason" } else { Write-Log "PREP: $st" }
         [pscustomobject]@{ Status = $st; Reason = $reason; WorkSrc = $workSrc; IsDv81 = [bool]$isDv81; Crop = $crop; LocalCopy = $localCopy
                            Seconds = [int]((Get-Date) - $t0).TotalSeconds }
-    }
-
-    # Waits until the work folder has $needGB free (re-checked every 30 s). The main loop gives up
-    # on the title if nothing else is running that could ever free the space.
-    function Wait-WorkSpace([double]$needGB, [string]$what) {
-        $logged = $false
-        while (($freeW = Get-FreeGB $workDir) -lt $needGB) {
-            if (-not $logged) { Write-Log "Waiting for space to ${what}: needs $needGB GB free in $workDir, $freeW GB now"; $logged = $true }
-            $status.Step = "waiting for space to $what ($needGB GB needed, $freeW GB free)"; Set-Status $status
-            Start-Sleep -Seconds 30
-        }
-        if ($logged) { Write-Log "Space available ($freeW GB free): going on to $what" }
     }
 
     # 1080p SDR copy of a title kept as Dolby Vision 7 (the main loop adds these titles). Makes a
@@ -1131,29 +778,15 @@ $PrepBody = {
         $cw = [int]$crop.Width; $ch = [int]$crop.Height
         $scale = [Math]::Min([double]1, [Math]::Min(1920.0 / $cw, 1080.0 / $ch))
         $w = [int](2 * [Math]::Round($cw * $scale / 2)); $h = [int](2 * [Math]::Round($ch * $scale / 2))
-        if (-not [IO.File]::Exists($refPath)) {
-            if (-not $src.Count) { return (Done 'Failed' 'the profile 7 video to make the 1080p copy from is gone (local copy, finished 2160p file and source all missing).') }
-            [void][IO.Directory]::CreateDirectory($workDir)
-            Wait-WorkSpace ([Math]::Round(0.6 * (New-Object IO.FileInfo $src[0]).Length / 1GB + 20, 1)) 'make the 1080p SDR reference'
-            Step 'making the 1080p SDR reference'
-            $peak = 1000
-            if ($Cfg.SourcePeak -gt 0) { $peak = [int]$Cfg.SourcePeak }
-            $partial = "$refPath.partial.mkv"
-            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
-            $a = @('--avsw', '--device', '0', '-i', $src[0])
-            if (($crop.Left + $crop.Top + $crop.Right + $crop.Bottom) -gt 0) { $a += @('--crop', ('{0},{1},{2},{3}' -f $crop.Left, $crop.Top, $crop.Right, $crop.Bottom)) }
-            $a += @('--output-res', "${w}x${h}", '--vpp-resize', 'spline36',
-                '--vpp-colorspace', "matrix=bt2020nc:bt709,colorprim=bt2020:bt709,transfer=smpte2084:bt709,range=limited:limited,hdr2sdr=hable,source_peak=$peak,ldr_nits=100",
-                '--colormatrix', 'bt709', '--colorprim', 'bt709', '--transfer', 'bt709',
-                '--video-metadata', 'clear', '--metadata', 'clear', '--chapter-copy', '-c', 'hevc', '--profile', 'main10', '--output-depth', '10',
-                '--cqp', '12', '--preset', 'P7', '--avsync', 'cfr', '-o', $partial)
-            Write-Log ("Making the 1080p SDR reference {0}x{1} from {2} (crop L{3} T{4} R{5} B{6}, tone-mapped from {7} nits)" -f $w, $h, $src[0], $crop.Left, $crop.Top, $crop.Right, $crop.Bottom, $peak)
-            $r = Invoke-Logged -Exe $Cfg.NVEncC -ArgList $a -TempDir $tmp -StatusBase $status
-            if ($r.ExitCode -ne 0 -or -not [IO.File]::Exists($partial)) { return (Done 'Failed' "NVEncC failed making the 1080p SDR reference (exit $($r.ExitCode)).") }
-            Move-Item -LiteralPath $partial -Destination $refPath -Force -ErrorAction Stop
-        } else {
-            Write-Log "Reusing the 1080p SDR reference $refPath"
-        }
+        if (-not [IO.File]::Exists($refPath) -and -not $src.Count) { return (Done 'Failed' 'the profile 7 video to make the 1080p copy from is gone (local copy, finished 2160p file and source all missing).') }
+        # Made (or reused) by Convert-DolbyVision -SdrReference.
+        $peak = 1000
+        if ($Cfg.SourcePeak -gt 0) { $peak = [int]$Cfg.SourcePeak }
+        $p = Get-WorkerScriptCommon $status
+        $p.SdrReference = $true; $p.Source = $(if ($src.Count) { $src[0] } else { '' }); $p.Output = $refPath; $p.Width = $w; $p.Height = $h; $p.SourcePeak = $peak; $p.NVEncC = [string]$Cfg.NVEncC
+        $p.Crop = '{0},{1},{2},{3}' -f $crop.Left, $crop.Top, $crop.Right, $crop.Bottom
+        $dv = Invoke-WorkerScript $Cfg.ConvertDoVi $p
+        if ($dv.Status -ne 'Done') { return (Done 'Failed' $dv.Message) }
         # For the reports: the original picture, its crop, and the final 1080p size.
         $show = [ordered]@{ SourceWidth = $crop.SourceWidth; SourceHeight = $crop.SourceHeight; Width = $w; Height = $h
                             Left = $crop.Left; Top = $crop.Top; Right = $crop.Right; Bottom = $crop.Bottom; Scaled = $true }
@@ -1211,7 +844,7 @@ $PrepBody = {
         }
 
         # ---------------------------------------------------------------- Dolby Vision profile 7
-        # copy to the work folder -> inspect the copy -> decide:
+        # Convert-DolbyVision.ps1: copy to the work folder -> inspect the copy -> decide:
         #   SIMPLE / SAFE or MEL                    -> convert to 8.1
         #   COMPLEX FEL within -DoviOvershootNits   -> convert to 8.1 anyway (highlights clipped; noted)
         #   COMPLEX FEL beyond it, or NO L1         -> keep as profile 7 (status 'KeepP7'): the main loop
@@ -1221,125 +854,16 @@ $PrepBody = {
         # profile 7, the folder's later profile 7 titles follow (a season stays one format); ones
         # already finished as 8.1 are left alone.
         if ($Cfg.Info.Dv -eq 'P7') {
-            [void][IO.Directory]::CreateDirectory($workDir)
-            $p81 = Get-WorkFile ' - p8.1.mkv'
-            $p7copy = Get-WorkFile ' - p7 source.mkv'
-            if (-not [IO.File]::Exists($p7copy)) { $p7copy = Join-Path $workDir "$base - p7 source.mkv" }
-            $decFile = Join-Path $titleDir "$base.dovi.json"
-            $saveDecision = { param([string]$decision, [string]$note, $basePeak, $felPeak, [string]$verdict)
-                $o = [ordered]@{ Decision = $decision; Note = $note; BasePeak = $basePeak; FelPeak = $felPeak; Verdict = $verdict
-                                 Limit = $Cfg.DoviOvershootNits; Time = (Get-Date).ToString('s') }
-                [IO.File]::WriteAllText($decFile, ($o | ConvertTo-Json -Compress), $script:Utf8) }
-            $readJson = { param($f) try { [IO.File]::ReadAllText($f) | ConvertFrom-Json } catch { $null } }
-            # An older version's "unsafe" flag: re-checked under the current rules.
-            $legacy = Join-Path $titleDir "$base - p7 source.mkv.review.txt"
-            if ([IO.File]::Exists($legacy)) {
-                Write-Log "Removing the unsafe flag from an earlier version ($(@(Get-Content -LiteralPath $legacy -TotalCount 1)[0])): re-checking with the current rules"
-                Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
+            $p = Get-WorkerScriptCommon $status
+            $p.Source = [string]$Cfg.SourceFile; $p.WorkDir = $workDir; $p.DecisionDir = $titleDir; $p.Basename = $base
+            $p.OvershootNits = [int]$Cfg.DoviOvershootNits
+            $p.WslDistro = [string]$wsl.Distro; $p.WslMountRoot = [string]$wsl.MountRoot; $p.DoviConvertCmd = [string]$wsl.DoviConvertCmd; $p.RemountCmd = [string]$wsl.RemountCmd
+            $dv = Invoke-WorkerScript $Cfg.ConvertDoVi $p
+            switch ($dv.Status) {
+                'Converted' { $workSrc = $dv.WorkSrc; $isDv81 = $true; $doviNote = [string]$dv.Note }
+                'KeepP7'    { $r0 = Done 'KeepP7' $dv.Message; $r0 | Add-Member -NotePropertyName P7Copy -NotePropertyValue $dv.P7Copy; return $r0 }
+                default     { return (Done 'Failed' $dv.Message) }
             }
-            $own = if ([IO.File]::Exists($decFile)) { & $readJson $decFile } else { $null }
-            $keepWhy = ''
-            foreach ($f in @([IO.Directory]::GetFiles($titleDir, '*.dovi.json') | Where-Object { $_ -ne $decFile })) {
-                $o = & $readJson $f
-                if ($o -and $o.Decision -eq 'keep-p7') {
-                    $keepWhy = "the rest of the season follows $([IO.Path]::GetFileName($f) -replace '\.dovi\.json$', ''): $($o.Note)"
-                    break
-                }
-            }
-            if (-not $keepWhy -and $own -and $own.Decision -eq 'keep-p7') { $keepWhy = [string]$own.Note }
-            $doviNote = ''
-
-            if (-not $keepWhy -and [IO.File]::Exists($p81)) {
-                Write-Log "Dolby Vision 7: reusing previously converted copy $p81"
-                if ($own -and $own.Note) { $doviNote = [string]$own.Note }
-            } elseif (-not $keepWhy) {
-                $dirW = ConvertTo-WslPath $workDir $wsl.MountRoot
-                # No dovi_convert scan on the source first: every profile 7 title is copied and
-                # inspected whatever scan would say (it's converted or kept as profile 7 either way).
-                if (-not [IO.File]::Exists($p7copy)) {
-                    Step 'copying p7 source'
-                    $srcLen = (New-Object IO.FileInfo $Cfg.SourceFile).Length
-                    Write-Log ("Copying source to {0} ({1:N1} GB, {2} GB free there)" -f $p7copy, ($srcLen / 1GB), (Get-FreeGB $workDir))
-                    $c0 = Get-Date
-                    Copy-FileWithProgress -Src $Cfg.SourceFile -Dst $p7copy -StatusBase $status
-                    $secs = [Math]::Max([double]1, ((Get-Date) - $c0).TotalSeconds)
-                    Write-Log ("Copied in {0} ({1:N0} MB/s)" -f [TimeSpan]::FromSeconds([int]$secs), ($srcLen / 1MB / $secs))
-                } else {
-                    Write-Log "Reusing existing local copy $p7copy"
-                }
-                $copyW = ConvertTo-WslPath $p7copy $wsl.MountRoot
-
-                Step 'dovi_convert inspect'
-                $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($copyW) -StatusBase $status `
-                    -Body ("cd {0} && {1} inspect {2}" -f (ConvertTo-BashQuoted $dirW), $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $copyW))
-                $verdict = $null; $basePeak = 0; $felPeak = 0
-                foreach ($l in $r.Lines) {
-                    if ($l -match '^\s*VERDICT:\s*(.+?)\s*$') { $verdict = $Matches[1] }
-                    elseif ($l -match '^\s*Base Layer Peak[^:]*:\s*(\d+)') { $basePeak = [int]$Matches[1] }
-                    elseif ($l -match '^\s*FEL Peak Brightness:\s*(\d+)') { $felPeak = [int]$Matches[1] }
-                }
-                # dovi_convert's verdicts: "SIMPLE / SAFE", "MEL (Minimal Enhancement Layer)",
-                # "COMPLEX FEL (Active Brightness Expansion)", "NO L1 METADATA".
-                if ($r.ExitCode -ne 0 -or -not $verdict) {
-                    $last = @($r.Lines | Where-Object { $_.Trim() } | Select-Object -Last 1)
-                    return (Done 'Failed' ("dovi_convert inspect failed (exit {0}){1}. Local copy kept: {2}" -f $r.ExitCode, $(if ($last.Count) { ": $($last[0].Trim())" }), $p7copy))
-                }
-                $peaks = if ($basePeak -gt 0 -and $felPeak -gt 0) { "FEL peak $felPeak nits, base layer $basePeak nits" } else { 'peaks not reported' }
-                Write-Log "dovi_convert inspect: VERDICT: $verdict ($peaks)"
-                if ($verdict -match '^(SIMPLE / SAFE|MEL\b)') {
-                    & $saveDecision 'convert' '' $basePeak $felPeak $verdict
-                } elseif ($verdict -match '^COMPLEX' -and $basePeak -gt 0 -and $felPeak -gt 0 -and ($felPeak - $basePeak) -le $Cfg.DoviOvershootNits) {
-                    $doviNote = "converted to 8.1 although inspect found Complex FEL: FEL peak $felPeak nits vs base layer $basePeak nits (+$($felPeak - $basePeak), within +$($Cfg.DoviOvershootNits)); highlights above $basePeak nits are clipped"
-                    Write-Log "Dolby Vision 7: $doviNote"
-                    & $saveDecision 'convert-overshoot' $doviNote $basePeak $felPeak $verdict
-                } else {
-                    $keepWhy = if ($verdict -match '^COMPLEX' -and $basePeak -gt 0 -and $felPeak -gt 0) {
-                        "Complex FEL: FEL peak $felPeak nits vs base layer $basePeak nits (+$($felPeak - $basePeak), over +$($Cfg.DoviOvershootNits))"
-                    } else { "inspect VERDICT: $verdict ($peaks)" }
-                    & $saveDecision 'keep-p7' $keepWhy $basePeak $felPeak $verdict
-                }
-
-                if (-not $keepWhy) {
-                    Wait-WorkSpace ([Math]::Round(2 * (New-Object IO.FileInfo $p7copy).Length / 1GB + 20, 1)) 'convert'
-                    Step 'dovi_convert convert'
-                    # --yes: no prompts; --include-simple: --yes alone skips Simple FEL; --force: convert's own
-                    # quick check would refuse Complex FEL, but inspect (above) already decided;
-                    # --delete: removes the renamed original (.bak.dovi_convert) once converted.
-                    $before = @(Get-ChildItem -LiteralPath $workDir -File | ForEach-Object { $_.Name })
-                    $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($copyW) -StatusBase $status `
-                        -Body ("cd {0} && {1} convert --yes --include-simple --force --delete {2}" -f (ConvertTo-BashQuoted $dirW), $wsl.DoviConvertCmd, (ConvertTo-BashQuoted $copyW))
-                    $after = @(Get-ChildItem -LiteralPath $workDir -File | ForEach-Object { $_.Name })
-                    $new = @($after | Where-Object { $before -notcontains $_ })
-                    if ($new.Count) { Write-Log "New files after convert: $($new -join ', ')" }
-                    if ($r.ExitCode -ne 0) { return (Done 'Failed' "dovi_convert convert failed (exit $($r.ExitCode)). Files left in place for review.") }
-                    $chk = Get-SourceInfo $p7copy
-                    if ($chk.Dv -ne 'P8.1') { return (Done 'Failed' "after conversion the copy reports '$($chk.Dv)', not P8.1 ($($chk.DvDetail)). Files left in place for review.") }
-                    $p81 = Join-Path ([IO.Path]::GetDirectoryName($p7copy)) "$base - p8.1.mkv"
-                    Move-Item -LiteralPath $p7copy -Destination $p81 -Force -ErrorAction Stop
-                    Write-Log "Converted to Dolby Vision 8.1: $p81"
-                }
-            }
-
-            if ($keepWhy) {
-                # Profile 7 route: the untouched copy is finished as "<name> - 2160p.mkv" (audio only),
-                # and a 1080p SDR title is made from it. A converted copy from before is no use now.
-                if (-not ($own -and $own.Decision -eq 'keep-p7')) { & $saveDecision 'keep-p7' $keepWhy 0 0 '' }
-                Write-Log "Dolby Vision 7: keeping as profile 7 ($keepWhy)"
-                if ([IO.File]::Exists($p81)) {
-                    Remove-Item -LiteralPath $p81 -Force -ErrorAction SilentlyContinue
-                    Write-Log "Deleted the earlier 8.1 conversion $p81 (the season stays profile 7)"
-                }
-                if (-not [IO.File]::Exists($p7copy)) {
-                    Step 'copying p7 source'
-                    Write-Log "Copying source to $p7copy ($(Get-FreeGB $workDir) GB free there)"
-                    Copy-FileWithProgress -Src $Cfg.SourceFile -Dst $p7copy -StatusBase $status
-                }
-                $r0 = Done 'KeepP7' $keepWhy
-                $r0 | Add-Member -NotePropertyName P7Copy -NotePropertyValue $p7copy
-                return $r0
-            }
-            $workSrc = $p81
-            $isDv81 = $true
         }
 
         # ---------------------------------------------------------------- crop
@@ -1408,50 +932,13 @@ $EncodeBody = {
     function Invoke-Encode {
       try {
         Write-Log "---- $($Cfg.Label): $($v.Name) - encode"
-        [void][IO.Directory]::CreateDirectory($vdir)
-        $partial = Join-Path $vdir "$base.partial.mkv"
-        if ([IO.File]::Exists($final)) {
-            Write-Log "Encode already exists, reusing: $final"
-        } else {
-            $free = Get-FreeGB $vdir
-            if ($free -lt 10) { $row.Error = "only $free GB free"; Write-Log "Skipping encode: $($row.Error)"; return }
-            if ([IO.File]::Exists($partial)) { Remove-Item -LiteralPath $partial -Force }
-            Step 'encoding'
-            $a = @("--$($Cfg.Decoder)", '--device', '0', '-i', $workSrc)
-            if ($hasCrop) { $a += @('--crop', ('{0},{1},{2},{3}' -f $crop.Left, $crop.Top, $crop.Right, $crop.Bottom)) }
-            $a += @('--video-metadata', 'clear', '--metadata', 'clear', '--chapter-copy', '-c', 'hevc')
-            $a += @($v.Args)
-            $a += @('--bref-mode', 'middle', '--preset', 'P7', '--tier', 'main', '--level', '5.1', '--chromaloc', 'auto', '--colorrange', 'auto')
-            # Only pass the HDR / HDR10+ / Dolby Vision options a source actually has (FastFlix
-            # always adds the "copy" ones). Their avhw implementation re-orders frames by
-            # timestamp to match the metadata, so there's no reason to involve it otherwise.
-            $colorArgs = @($Cfg.Info.ColorArgs | Where-Object { $_ })
-            if ($Cfg.Info.Hdr -and $colorArgs.Count) { $a += $colorArgs }
-            else { $a += @('--colormatrix', 'auto', '--transfer', 'auto', '--colorprim', 'auto') }
-            if ($Cfg.Info.Hdr) {
-                if ($Cfg.Info.MasterDisplay) { $a += @('--master-display', $Cfg.Info.MasterDisplay) } else { Write-Log 'WARNING: HDR source without mastering display metadata; none written.' }
-                if ($Cfg.Info.MaxCll) { $a += @('--max-cll', $Cfg.Info.MaxCll) }
-            }
-            if ($Cfg.Info.Hdr10Plus) { $a += @('--dhdr10-info', 'copy') }
-            if ($Cfg.IsDv81) {
-                $a += @('--dolby-vision-rpu', 'copy', '--dolby-vision-profile', 'copy')
-                if ($hasCrop) { $a += @('--dolby-vision-rpu-prm', 'crop=true') }
-            }
-            $a += @('--output-depth', '10', '--multipass', '2pass-full', '--mv-precision', 'Auto', '--avsync', 'cfr', '-o', $partial)
-            $a = @($a | Where-Object { $null -ne $_ -and "$_" -ne '' })
-            $e0 = Get-Date
-            $r = Invoke-Logged -Exe $Cfg.NVEncC -ArgList $a -TempDir $tmp -StatusBase $status
-            $row.EncodeSec = [int]((Get-Date) - $e0).TotalSeconds
-            if ($r.ExitCode -ne 0 -or -not [IO.File]::Exists($partial) -or (Get-Item -LiteralPath $partial).Length -eq 0) {
-                $row.Error = "NVEncC exit $($r.ExitCode)"
-                Write-Log "Encode FAILED: $($row.Error)"
-                return
-            }
-            Move-Item -LiteralPath $partial -Destination $final -Force -ErrorAction Stop
-            # A score left over from an earlier encode of this variant no longer applies.
-            if ([IO.File]::Exists($vmafFile)) { Remove-Item -LiteralPath $vmafFile -Force -ErrorAction Stop; Write-Log "Removed the old VMAF result (it was for a previous encode)." }
-            Write-Log ("Encoded in {0}: {1}" -f [TimeSpan]::FromSeconds($row.EncodeSec), $final)
-        }
+        $p = Get-WorkerScriptCommon $status
+        $p.Source = $workSrc; $p.Output = $final; $p.EncoderArgs = @($v.Args); $p.Decoder = [string]$Cfg.Decoder
+        $p.Crop = '{0},{1},{2},{3}' -f $crop.Left, $crop.Top, $crop.Right, $crop.Bottom
+        $p.SourceInfo = $Cfg.Info; $p.DolbyVision = [bool]$Cfg.IsDv81; $p.NVEncC = [string]$Cfg.NVEncC; $p.VmafFile = $vmafFile
+        $e = Invoke-WorkerScript $Cfg.EncodeVideo $p
+        $row.EncodeSec = $e.EncodeSec
+        if ($e.Status -eq 'Failed') { $row.Error = [string]$e.Error; return }
         $row.Status = $(if ($Cfg.SkipVmaf) { 'Done' } else { 'Encoded' })
       } catch {
         $row.Error = $_.Exception.Message
@@ -1738,6 +1225,10 @@ $EncodeWorker = [scriptblock]::Create($WorkerHeader.ToString() + "`n" + $Variant
 $VmafWorker = [scriptblock]::Create($WorkerHeader.ToString() + "`n" + $VariantCommon.ToString() + "`n" + $VmafBody.ToString())
 $FinalizeWorker = [scriptblock]::Create($WorkerHeader.ToString() + "`n" + $FinalizeBody.ToString())
 
+$commonPath = Join-Path $PSScriptRoot 'Encode-Batch.Common.ps1'
+if (-not [IO.File]::Exists($commonPath)) { throw "Encode-Batch.Common.ps1 not found next to Encode-Batch.ps1 ($commonPath). It holds the helpers Encode-Batch, Encode-Video and Convert-DolbyVision share; keep the scripts together." }
+$Helpers = [scriptblock]::Create([IO.File]::ReadAllText($commonPath) + "`n" + $BatchHelpers.ToString())
+
 # =====================================================================================
 # Orchestrator
 # =====================================================================================
@@ -1847,6 +1338,18 @@ if ($parseErrors) {
     $pe = $parseErrors[0]
     throw ("{0} has a syntax error at line {1}, char {2}: {3}`n    {4}" -f $CropDetect, $pe.Extent.StartLineNumber, $pe.Extent.StartColumnNumber, $pe.Message, $pe.Extent.StartScriptPosition.Line.Trim())
 }
+# The worker scripts (and the helpers they share), checked the same way.
+$EncodeVideo = Resolve-UserPath $EncodeVideo
+$ConvertDolbyVision = Resolve-UserPath $ConvertDolbyVision
+foreach ($ws in @(@($EncodeVideo, '-EncodeVideo'), @($ConvertDolbyVision, '-ConvertDolbyVision'), @($commonPath, ''))) {
+    if (-not [IO.File]::Exists($ws[0])) { throw "$([IO.Path]::GetFileName($ws[0])) not found: $($ws[0])$(if ($ws[1]) { " (pass $($ws[1]))" })." }
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($ws[0], [ref]$null, [ref]$parseErrors)
+    if ($parseErrors) {
+        $pe = $parseErrors[0]
+        throw ("{0} has a syntax error at line {1}, char {2}: {3}`n    {4}" -f $ws[0], $pe.Extent.StartLineNumber, $pe.Extent.StartColumnNumber, $pe.Message, $pe.Extent.StartScriptPosition.Line.Trim())
+    }
+}
 
 
 $finishing = -not $fixedMode -and -not ($NoAudio -and $KeepVariants)
@@ -1947,16 +1450,34 @@ if ([IO.File]::Exists($srcPath)) {
     } | Sort-Object FullName)
 }
 Write-Log "Found $($files.Count) .mkv file(s)." 'Cyan'
-# Folders you've signed off: a "<CompleteMarker>" (DONE) file in a source folder skips every
-# MKV directly in that folder. Sub-folders are judged on their own.
-if ($CompleteMarker) {
+# Folders you've signed off (DONE) or put aside (SKIP): a marker file in a source folder skips
+# every MKV in that folder and in all its sub-folders. Markers above -Source don't count.
+$markers = @($CompleteMarker | Where-Object { $_ })
+if ($markers.Count) {
+    $markedBy = @{}   # folder -> the marker file that covers it ('' = none)
+    $findMarker = {
+        param([string]$Dir)
+        if ($markedBy.ContainsKey($Dir)) { return $markedBy[$Dir] }
+        $hit = ''
+        foreach ($m in $markers) { $p = Join-Path $Dir $m; if ([IO.File]::Exists($p)) { $hit = $p; break } }
+        if (-not $hit) {
+            $up = [IO.Path]::GetDirectoryName($Dir)
+            if ($up -and $Dir.TrimEnd('\', '/').Length -gt $srcRoot.TrimEnd('\', '/').Length -and $up.StartsWith($srcRoot.TrimEnd('\', '/'), [StringComparison]::OrdinalIgnoreCase)) { $hit = & $findMarker $up }
+        }
+        $markedBy[$Dir] = $hit
+        $hit
+    }
     $keep = New-Object System.Collections.Generic.List[object]
-    foreach ($g in @($files | Group-Object DirectoryName)) {
-        $relDir = $g.Name.Substring([Math]::Min($srcRoot.Length, $g.Name.Length)).TrimStart('\', '/')
-        $marker = Join-Path $g.Name $CompleteMarker
-        if (-not [IO.File]::Exists($marker)) { $marker = '' }
-        if ($marker) { Write-Log ("DONE  {0}: {1} found, its {2} .mkv file(s) skipped" -f $(if ($relDir) { $relDir } else { '.' }), $marker, $g.Count) 'DarkGray' }
-        else { foreach ($f in $g.Group) { $keep.Add($f) } }
+    $skippedBy = [ordered]@{}
+    foreach ($f in $files) {
+        $hit = & $findMarker $f.DirectoryName
+        if ($hit) { if (-not $skippedBy.Contains($hit)) { $skippedBy[$hit] = 0 }; $skippedBy[$hit]++ }
+        else { $keep.Add($f) }
+    }
+    foreach ($hit in $skippedBy.Keys) {
+        $d = [IO.Path]::GetDirectoryName($hit)
+        $relDir = $d.Substring([Math]::Min($srcRoot.Length, $d.Length)).TrimStart('\', '/')
+        Write-Log ("{0,-5} {1}: {2} found, {3} .mkv file(s) skipped (sub-folders included)" -f [IO.Path]::GetFileName($hit).ToUpper(), $(if ($relDir) { $relDir } else { '.' }), $hit, $skippedBy[$hit]) 'DarkGray'
     }
     if ($keep.Count -ne $files.Count) {
         $files = @($keep.ToArray())
@@ -2599,6 +2120,7 @@ function Start-Prep($t) {
         StatusFile = $prepStatusFile; TempDir = $tempDir; Info = $t.Info; Wsl = $wsl
         CropDetect = $CropDetect; CropMode = $CropMode; MinFreeDoviGB = $MinFreeDoviGB; LocalCopy = [bool]$LocalCopy; WorkDir = $t.WorkDir; DoviOvershootNits = $DoviOvershootNits
         NVEncC = $NVEncC; Derived = [bool]$t.IsDerived; ParentBase = $t.ParentBase; CropHw = [bool]($t.IsDerived -and $t.CropHw); RefSources = @($t.RefSources); SourcePeak = $t.SourcePeak
+        ConvertDoVi = $ConvertDolbyVision
     }
     $job = Start-Job -ScriptBlock $PrepWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 6 -Compress)
     $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'prep'; Title = $t; Task = $null; Slot = -1; Start = Get-Date; StatusFile = $prepStatusFile }
@@ -2638,7 +2160,7 @@ function Start-Variant($t, $task, [int]$slot, [string]$kind) {
         BaseName = $t.Base; TitleDir = $t.TitleDir; LogPath = $t.LogPath; StatusFile = $statusFile; TempDir = $tempDir
         Info = $t.Info; WorkSrc = $t.Prep.WorkSrc; IsDv81 = $t.Prep.IsDv81; Crop = $t.Prep.Crop
         Variant = $task.Spec; Index = $task.Index; Count = @($t.Tasks).Count; Label = (Get-TaskLabel $t $task)
-        Decoder = $Decoder; NVEncC = $NVEncC; Wsl = $wsl; SkipVmaf = [bool]$SkipVmaf
+        Decoder = $Decoder; NVEncC = $NVEncC; Wsl = $wsl; SkipVmaf = [bool]$SkipVmaf; EncodeVideo = $EncodeVideo
     }
     if ($kind -eq 'encode') {
         $job = Start-Job -ScriptBlock $EncodeWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 6 -Compress)
