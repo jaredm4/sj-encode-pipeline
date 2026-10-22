@@ -45,7 +45,8 @@
          - TrueHD 5.1 or more: its AC-3 core, copied (448 kbps or more). The core is
            the AC-3 with the same disc stream ID (the SOURCE_ID tag), or else the
            AC-3 right after the TrueHD. No core, or one under 448 kbps, is an ERROR:
-           the source MKV is probably missing tracks.
+           the source MKV is probably missing tracks (or use -NewDefaultTrack to make a new
+           AC-3 5.1 from the TrueHD instead).
          - Other masters of 5.1 or more (DTS-HD MA, PCM...): an existing 5.1 AC-3 that
            the comparison (step 4) shows is the same mix, copied. Otherwise a new
            AC-3 5.1 (-Ac3Bitrate).
@@ -75,8 +76,8 @@
        clip settings are at the top of the script, for tuning.
     5. Output track order: default track, then commentary (flagged as commentary),
        then every master (main one first; none with -PassthruMasters None). Everything
-       else is dropped. PCM, FLAC and
-       ALAC masters (channel-based, no Atmos/DTS:X objects) are stored as Opus to save
+       else is dropped. PCM, FLAC and ALAC masters, and DTS-HD MA / TrueHD masters in
+       stereo or mono (channel-based, no Atmos/DTS:X objects) are stored as Opus to save
        space: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1 ($OpusKbps at the top).
        The original isn't kept, so the Opus track gets a track tag, ADD_BLURAYAUDIO =
        "Keep; from PCM 2.0 master" (Keep, then where it came from). When this script runs
@@ -85,7 +86,7 @@
        -PassthruMasters None drops it, like any master). Copied tracks get no tag. A file
        made before the tag existed has none: run it against its Blu-ray source once (the
        missing tag alone makes it redo the file), and its Opus track gets the tag.
-       TrueHD and DTS-HD MA masters are always copied unchanged. Chapters come from the
+       TrueHD and DTS-HD MA surround masters are always copied unchanged. Chapters come from the
        source MKV.
        Metadata comes from the file name, using Matroska's tag scheme: bracketed parts
        like " [tmdbid-1234]" are removed and trailing ".tag" parts become " [tag]".
@@ -175,6 +176,11 @@
     Batch mode only: process only the matched encodes whose file name matches this wildcard,
     e.g. '* - 1080p.mkv' for the 1080p copies of titles kept as Dolby Vision 7.
     Default: * (all).
+.PARAMETER NewDefaultTrack
+    Always make a new default track from the main track (AC-3 5.1 at -Ac3Bitrate for 5.1 or
+    more, AAC for stereo or mono), instead of copying the TrueHD's AC-3 core or an existing
+    track that's the same mix. E.g. for a disc whose AC-3 core is under 448 kbps (normally an
+    error). Works in single and batch mode. Default: off.
 .PARAMETER AacBitrate
     AAC bitrate in kbps for a new default track made from a stereo source.
     Mono sources are capped at 256 (AAC's per-channel limit).
@@ -254,6 +260,7 @@ param(
     [string[]]$PassthruCommentaries = @(),
     [string[]]$PassthruTitles = @(),
     [ValidateSet('Auto', 'None')][string]$PassthruMasters = 'Auto',
+    [switch]$NewDefaultTrack,
     [string]$DestFilter = '*',
     [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
@@ -942,7 +949,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     $copyable = $pick.Codec -in @('ac3', 'eac3', 'aac')
     $compat = $null
 
-    if ($masters.Count -eq 0 -and $copyable) {
+    # -NewDefaultTrack: no copy (no AC-3 core, no existing same mix); always a new track below.
+    if ($NewDefaultTrack) {
+        Write-Host "Default track: a new one from the main track (-NewDefaultTrack)"
+    } elseif ($masters.Count -eq 0 -and $copyable) {
         $compat = New-OutputTrack 'source' $pick.Pos 'copy' 0 0 $srcLabel 'copied as-is (no lossless track)' "$($pick.Codec) $($pick.Channels)"
     } elseif ($isTrueHdMain) {
         $core = @($audio | Where-Object {
@@ -954,10 +964,10 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $how = 'the AC-3 right after the TrueHD'
         }
         if (-not $core) {
-            throw "The TrueHD master (audio $($pick.Pos)) has no AC-3 core track. The source MKV is probably missing tracks."
+            throw "The TrueHD master (audio $($pick.Pos)) has no AC-3 core track. The source MKV is probably missing tracks (or use -NewDefaultTrack to encode a new AC-3 from the TrueHD)."
         }
         if ($core.BitRate -gt 0 -and $core.BitRate -lt $CoreMinKbps * 1000) {
-            throw ("The TrueHD's AC-3 core (audio {0}) is {1} kbps, below {2}. The source MKV is probably missing tracks." -f
+            throw ("The TrueHD's AC-3 core (audio {0}) is {1} kbps, below {2}. The source MKV is probably missing tracks (or use -NewDefaultTrack to encode a new AC-3 from the TrueHD)." -f
                 $core.Pos, [math]::Round($core.BitRate / 1000), $CoreMinKbps)
         }
         $compat = New-OutputTrack 'source' $core.Pos 'copy' 0 0 "$($core.Name) $(Get-ChannelLabel $core.Channels)" `
@@ -1072,7 +1082,9 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $outputs.Add($track)
     }
     foreach ($m in $keep) {
-        if ($m.Codec -match '^(pcm_.*|flac|alac)$') {
+        # (DTS-HD MA / TrueHD in stereo or mono: no Atmos / DTS:X objects there either.)
+        $channelBased = ($m.Codec -match '^(pcm_.*|flac|alac)$') -or ($m.Lossless -and $m.Channels -le 2 -and $m.Codec -match '^(dts|truehd|mlp)$')
+        if ($channelBased) {
             # Channel-based lossless (no Atmos/DTS:X objects to keep for a future format):
             # stored as high-bitrate Opus to save space. The original isn't kept, so the Opus
             # track gets the Keep tag: a later run (e.g. on this file itself) keeps it as the master.

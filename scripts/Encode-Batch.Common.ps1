@@ -123,15 +123,20 @@ function Invoke-Logged {
     $argStr = Join-Args $ArgList
     if (-not $Quiet) { Write-Log "> $Exe $argStr" }
     $id = [guid]::NewGuid().ToString('N')
-    $outFile = Join-Path $TempDir "$id.out"
-    $errFile = Join-Path $TempDir "$id.err"
+    # Start-Process reads these paths as wildcard patterns (in Windows PowerShell), so a folder
+    # with [ ] in its name (e.g. a Dest of "...\Movie (2024) [tmdbid-1]") breaks it: then the
+    # system temp folder is used for them instead.
+    $runDir = $TempDir
+    if ($runDir -match '[\[\]\*\?]') { $runDir = [IO.Path]::GetTempPath() }
+    $outFile = Join-Path $runDir "$id.out"
+    $errFile = Join-Path $runDir "$id.err"
     # Input is an empty file: a program that inherited this background job's input could wait
     # on it forever (seconv, under Convert-Subtitles, did).
-    $inFile = Join-Path $TempDir "$id.in"
+    $inFile = Join-Path $runDir "$id.in"
     [IO.File]::WriteAllText($inFile, '')
     # Started in the temp folder: Start-Process otherwise uses PowerShell's current folder, and
     # fails with "The directory name is invalid" if that folder no longer exists.
-    $p = Start-Process -FilePath $Exe -ArgumentList $argStr -NoNewWindow -PassThru -WorkingDirectory $TempDir `
+    $p = Start-Process -FilePath $Exe -ArgumentList $argStr -NoNewWindow -PassThru -WorkingDirectory $runDir `
         -RedirectStandardOutput $outFile -RedirectStandardError $errFile -RedirectStandardInput $inFile
     $null = $p.Handle   # keeps ExitCode available after exit (Windows PowerShell quirk)
     $st = @{} + $StatusBase; $st.Pid = $p.Id; $st.Exe = [IO.Path]::GetFileNameWithoutExtension($Exe)
