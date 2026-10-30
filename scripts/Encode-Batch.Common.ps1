@@ -118,6 +118,9 @@ function Invoke-Logged {
         [string]$TempDir = [IO.Path]::GetTempPath(),
         [hashtable]$StatusBase = @{},
         [string]$ProgressPattern = '^\[(\d+(?:\.\d+)?)%\]\s*(.*)$',
+        # NVEncC reading a pipe doesn't know the length, so it prints "<n> frames: ..." with no
+        # percent: given the total, those lines are progress too.
+        [long]$ProgressFrames = 0,
         [switch]$Quiet
     )
     $argStr = Join-Args $ArgList
@@ -173,7 +176,13 @@ function Invoke-Logged {
                 $line = $line0 -replace '\x1b\[[0-9;?]*[ -/]*[@-~]', ''
                 # Animated spinner frames (dovi_convert: "Extracting RPU...  <spinner> (0m 05s)").
                 if ($line -match '[\u2800-\u28FF|/\\-] \(\d+m \d{2}s\)\s*$') { continue }
-                if ($line -match $ProgressPattern) {
+                if ($ProgressFrames -gt 0 -and $line -match '^\s*(\d+) frames:\s*(.*)$') {
+                    if (((Get-Date) - $throttle.Last).TotalSeconds -ge 2) {
+                        $st.Pct = [Math]::Min(100, [Math]::Round(100.0 * [double]$Matches[1] / $ProgressFrames, 1)); $st.Detail = "$($Matches[1]) of $ProgressFrames frames: $($Matches[2])"
+                        Set-Status $st
+                        $throttle.Last = Get-Date
+                    }
+                } elseif ($line -match $ProgressPattern) {
                     if (((Get-Date) - $throttle.Last).TotalSeconds -ge 2) {
                         $st.Pct = [double]$Matches[1]; $st.Detail = $Matches[2]
                         Set-Status $st
@@ -198,6 +207,55 @@ function Invoke-Logged {
     Remove-Item -LiteralPath $outFile, $errFile, $inFile -Force -ErrorAction SilentlyContinue
     if (-not $Quiet) { Write-Log "  exit code $($p.ExitCode)" }
     [pscustomobject]@{ ExitCode = $p.ExitCode; Lines = $lines.ToArray() }
+}
+
+# Windows (cmd.exe for pipes) or not (bash: only for the tests).
+function Test-IsWindows { $env:OS -eq 'Windows_NT' }
+
+# One argument quoted for a line run by Invoke-ShellLines (cmd.exe on Windows, else bash).
+function Format-ShellArg {
+    param([string]$Text)
+    if (Test-IsWindows) {
+        # (in a .cmd file % is expanded even inside quotes)
+        if ($Text -eq '' -or $Text -match '[\s"&|<>^()%!,;=]') { '"' + $Text.Replace('%', '%%') + '"' } else { $Text }
+    } else { ConvertTo-BashQuoted $Text }
+}
+
+# Runs command lines (quoted with Format-ShellArg) from a .cmd file with cmd.exe on Windows, or
+# with bash elsewhere: for programs piped into each other, since Windows PowerShell's own pipe
+# would mangle a binary stream. -WorkingDir: cd there first. Output is logged like
+# Invoke-Logged (which runs it); the exit code is the last line's (bash: any part of a pipe).
+function Invoke-ShellLines {
+    param(
+        [Parameter(Mandatory)][string[]]$Lines,
+        [string]$WorkingDir = '',
+        [string]$TempDir = [IO.Path]::GetTempPath(),
+        [hashtable]$StatusBase = @{},
+        [long]$ProgressFrames = 0,
+        [switch]$Quiet
+    )
+    $win = Test-IsWindows
+    # (cmd.exe /c keeps the quotes around the file's path only if there are no special
+    # characters in it)
+    if ($TempDir -match '[\[\]\*\?&()^%!,;=@"]') { $TempDir = [IO.Path]::GetTempPath() }
+    $file = Join-Path $TempDir ([guid]::NewGuid().ToString('N') + $(if ($win) { '.cmd' } else { '.sh' }))
+    if ($win) {
+        $text = "@echo off`r`nchcp 65001 >nul`r`n"
+        if ($WorkingDir) { $text += "cd /d $(Format-ShellArg $WorkingDir)`r`n" }
+        $text += ($Lines -join "`r`n") + "`r`nexit /b %ERRORLEVEL%`r`n"
+    } else {
+        $text = "set -o pipefail`n"
+        if ($WorkingDir) { $text += "cd $(Format-ShellArg $WorkingDir) || exit 1`n" }
+        $text += ($Lines -join "`n") + "`n"
+    }
+    [IO.File]::WriteAllText($file, $text, $script:Utf8)
+    if (-not $Quiet) { foreach ($l in $Lines) { Write-Log "> $l" } }
+    try {
+        if ($win) { Invoke-Logged -Exe 'cmd.exe' -ArgList @('/d', '/c', $file) -TempDir $TempDir -StatusBase $StatusBase -ProgressFrames $ProgressFrames -Quiet:$Quiet }
+        else { Invoke-Logged -Exe 'bash' -ArgList @($file) -TempDir $TempDir -StatusBase $StatusBase -ProgressFrames $ProgressFrames -Quiet:$Quiet }
+    } finally {
+        Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Runs a bash snippet inside WSL as a login shell. Paths listed in -NeedPaths are checked

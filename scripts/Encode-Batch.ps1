@@ -24,8 +24,8 @@
           <name>.crop.json             CropDetect's result (delete it to redo the crop)
           <name>.results.json          machine-readable variant results
           <name>.final.json            what was kept, and the finishing progress
-          <name>.dovi.json             Dolby Vision 7 decision: converted, converted with clipped
-                                       highlights, or kept as profile 7 (see "Dolby Vision 7")
+          <name>.dovi.json             Dolby Vision 7 decision: converted (MEL), baked (FEL), or
+                                       kept as profile 7 (see "Dolby Vision 7")
           <name> - 2160p.mkv           a title kept as Dolby Vision 7: the original video, with audio
           <name> - 1080p.mkv           ...and its 1080p SDR copy (searched and finished like any title;
                                        its files are named "<name> - 1080p.*")
@@ -40,8 +40,12 @@
 
       WorkDir (default: Dest)\<same sub-folders>\
           <name> - source.mkv          local copy of the source, until the title is finished
-          <name> - p7 source.mkv       Dolby Vision 7 copy being checked / converted
+          <name> - p7 source.mkv       Dolby Vision 7 copy being checked / converted (for a baked
+                                       title: its audio and subtitle source, until it's finished)
           <name> - p8.1.mkv            converted Dolby Vision 7 copy, until the title is finished
+          <name> - bake\               a bake's working files (layers, RPU, script), while it runs
+          <name> - baked.mkv           baked Dolby Vision 7 FEL (8.1, video only), until the title
+                                       is finished
           <name> - 1080p ref.mkv       near-lossless 1080p SDR reference for a 1080p copy, until it's finished
 
       Dest\_encode-batch_<timestamp>.log                the whole run's log (every folder)
@@ -155,26 +159,34 @@
     Everything reads the copy, and it's deleted when the title is finished (after the audio
     step), or right away if it ends without a suggested variant. An interrupted copy is redone;
     a complete one is reused.
-    (Dolby Vision 7 titles use their converted "<name> - p8.1.mkv" copy instead, made in
-    -WorkDir, default Dest.)
+    (Dolby Vision 7 titles use their converted "<name> - p8.1.mkv" or baked "<name> - baked.mkv"
+    copy instead, made in -WorkDir, default Dest.)
 
     Disk space is checked before each title starts. Dest needs -MinFreeGB free (for the encodes);
     the work drive needs room for the local copy, or -MinFreeDoviGB for a Dolby Vision 7 title
     that still has to be downloaded and converted (one with its copy already there doesn't).
     With no -WorkDir, both come out of Dest. At most -MaxDoviTitles Dolby Vision 7 titles hold
     work files at once. When there isn't enough space, new titles wait until finished titles
-    free some (copies, p8.1 files and other variants are deleted); if nothing is left running
-    to free any, the run stops starting titles. A Dolby Vision 7 title's conversion also waits
-    for room (about twice the copy's size) after its inspect, for the same reason.
+    free some (copies, p8.1 / baked files and other variants are deleted); if nothing is left
+    running to free any, the run stops starting titles. A Dolby Vision 7 title's conversion also
+    waits for room after its inspect (about twice the copy's size; a bake, about 2.2 times + 20 GB),
+    for the same reason.
 
-    Dolby Vision 7: copy to -WorkDir -> dovi_convert inspect (on the copy; it measures the
-    brightness the enhancement layer adds) -> decide:
-      - SIMPLE / SAFE or MEL: convert to 8.1 (convert --yes --include-simple --force --delete),
-        then verify it's 8.1. Encoded like any HDR title, with its Dolby Vision 8.1 metadata.
-      - COMPLEX FEL with the FEL peak at most -DoviOvershootNits (100) above the base layer's
-        peak: converted to 8.1 anyway; the highlights above the base layer's peak are clipped.
-        Logged ("DOVI ..."), and noted in the reports.
-      - Anything else (Complex FEL beyond that, NO L1 METADATA): kept as profile 7. The untouched
+    Dolby Vision 7: copy to -WorkDir -> dovi_convert inspect (on the copy; only used to tell an
+    MEL from an FEL, as its Simple / Complex call isn't reliable) -> decide:
+      - MEL (empty enhancement layer): convert to 8.1 with dovi_convert (convert --yes
+        --include-simple --force --delete), then verify it's 8.1 ("<name> - p8.1.mkv"). Encoded
+        like any HDR title, with its Dolby Vision 8.1 metadata.
+      - SIMPLE / SAFE or COMPLEX FEL: baked into 8.1 ("<name> - baked.mkv", video only): the
+        enhancement layer is applied to the base layer (felbaker in VapourSynth, via -VsPipe)
+        and the whole picture encoded near-losslessly (NVEncC CQP 12) with the RPU converted to
+        8.1 (-DoviTool, dovi_tool -m 2) and HDR10 MaxCLL from the RPU's L6. Then encoded and
+        scored like any 8.1 title, against the baked file; the audio and subtitles come from the
+        profile 7 copy, kept until the title is finished. The bake runs in prep (one title at a
+        time) at about the speed of the GPU encode (~35-40 fps at 2160p), and needs about 2.2
+        times the copy's size free in -WorkDir while it runs. Logged ("DOVI ..."), and noted in
+        the reports. See Convert-DolbyVision.ps1 for the steps.
+      - Anything else (NO L1 METADATA): kept as profile 7. The untouched
         copy gets the audio (and subtitles) only and becomes "<name> - 2160p.mkv"; a second
         title "<name> - 1080p" is added: a near-lossless 1080p SDR reference is made from the
         profile 7 video (cropped, tone-mapped, scaled to fit 1920x1080, in -WorkDir) and searched
@@ -305,10 +317,15 @@ param(
 
     [string]$AddBluRayAudio = (Join-Path $PSScriptRoot 'Add-BluRayAudio.ps1'),
     # The worker scripts: NVEncC encodes (Encode-Video) and Dolby Vision 7 handling: inspect,
-    # convert to 8.1 or keep as profile 7, and the 1080p SDR reference (Convert-DolbyVision).
-    # Both need Encode-Batch.Common.ps1 next to them.
+    # convert or bake to 8.1 or keep as profile 7, and the 1080p SDR reference
+    # (Convert-DolbyVision). Both need Encode-Batch.Common.ps1 next to them.
     [string]$EncodeVideo = (Join-Path $PSScriptRoot 'Encode-Video.ps1'),
     [string]$ConvertDolbyVision = (Join-Path $PSScriptRoot 'Convert-DolbyVision.ps1'),
+    # For baking a Dolby Vision 7 FEL into 8.1: dovi_tool.exe, and VapourSynth's vspipe.exe (or a
+    # portable install's vspipe.bat) with the ffms2 and felbaker plugins autoloaded. Full paths,
+    # or names on PATH. Without them, Dolby Vision 7 titles are skipped.
+    [string]$DoviTool = (Join-Path $HOME 'Documents\dovi_tool\dovi_tool'),
+    [string]$VsPipe = (Join-Path $HOME 'Documents\vapoursynth-portable\vspipe'),
     # -NoAudio: no audio step (you add it by hand later); the title's local copy of its source is
     # kept for that (not deleted at the end), and listed at the end of the run.
     [switch]$NoAudio,
@@ -363,12 +380,6 @@ param(
     [string]$CompareEncodeCmd = 'compare_encode',
     [string]$DoviConvertCmd = 'dovi_convert',
 
-    # Dolby Vision 7 titles whose enhancement layer adds brightness (Complex FEL) are still
-    # converted to 8.1 when inspect's FEL peak is at most this many nits above the base layer's
-    # peak (the highlights above the base layer's peak are clipped; noted in the log and reports).
-    # Above it, the title is kept as profile 7 ("<name> - 2160p.mkv", audio only) plus a 1080p
-    # SDR copy ("<name> - 1080p.mkv", searched and finished like any other title).
-    [int]$DoviOvershootNits = 100,
     [string]$RemountCmd = 'remount',
 
     # Encode only; don't run compare_encode.
@@ -842,6 +853,7 @@ $PrepBody = {
         $workSrc = $Cfg.SourceFile
         $isDv81 = ($Cfg.Info.Dv -eq 'P8.1')
         $localCopy = $null
+        $baked = $false
 
         # ---------------------------------------------------------------- local copy
         if ($Cfg.LocalCopy -and $Cfg.Info.Dv -ne 'P7') {
@@ -870,22 +882,23 @@ $PrepBody = {
 
         # ---------------------------------------------------------------- Dolby Vision profile 7
         # Convert-DolbyVision.ps1: copy to the work folder -> inspect the copy -> decide:
-        #   SIMPLE / SAFE or MEL                    -> convert to 8.1
-        #   COMPLEX FEL within -DoviOvershootNits   -> convert to 8.1 anyway (highlights clipped; noted)
-        #   COMPLEX FEL beyond it, or NO L1         -> keep as profile 7 (status 'KeepP7'): the main loop
-        #                                              finishes the copy as "<name> - 2160p.mkv" (audio
-        #                                              only) and adds a 1080p SDR title for it
+        #   MEL                         -> convert to 8.1 (dovi_convert)
+        #   SIMPLE / COMPLEX FEL        -> bake to 8.1 ("<name> - baked.mkv", video only; the copy
+        #                                  stays for the audio and subtitles)
+        #   NO L1 (or anything else)    -> keep as profile 7 (status 'KeepP7'): the main loop
+        #                                  finishes the copy as "<name> - 2160p.mkv" (audio
+        #                                  only) and adds a 1080p SDR title for it
         # The decision is saved as "<name>.dovi.json" in Dest. Once any title in a folder is kept as
         # profile 7, the folder's later profile 7 titles follow (a season stays one format); ones
         # already finished as 8.1 are left alone.
         if ($Cfg.Info.Dv -eq 'P7') {
             $p = Get-WorkerScriptCommon $status
             $p.Source = [string]$Cfg.SourceFile; $p.WorkDir = $workDir; $p.DecisionDir = $titleDir; $p.Basename = $base
-            $p.OvershootNits = [int]$Cfg.DoviOvershootNits
+            $p.DoviTool = [string]$Cfg.DoviTool; $p.VsPipe = [string]$Cfg.VsPipe; $p.NVEncC = [string]$Cfg.NVEncC
             $p.WslDistro = [string]$wsl.Distro; $p.WslMountRoot = [string]$wsl.MountRoot; $p.DoviConvertCmd = [string]$wsl.DoviConvertCmd; $p.RemountCmd = [string]$wsl.RemountCmd
             $dv = Invoke-WorkerScript $Cfg.ConvertDoVi $p
             switch ($dv.Status) {
-                'Converted' { $workSrc = $dv.WorkSrc; $isDv81 = $true; $doviNote = [string]$dv.Note }
+                'Converted' { $workSrc = $dv.WorkSrc; $isDv81 = $true; $doviNote = [string]$dv.Note; $baked = [bool]$dv.Baked }
                 'KeepP7'    { $r0 = Done 'KeepP7' $dv.Message; $r0 | Add-Member -NotePropertyName P7Copy -NotePropertyValue $dv.P7Copy; return $r0 }
                 default     { return (Done 'Failed' $dv.Message) }
             }
@@ -916,6 +929,11 @@ $PrepBody = {
             $(if ($crop.PSObject.Properties['Mode'] -and $crop.Mode) { "$($crop.Mode) crop" } else { 'crop from an older CropDetect (delete the crop.json to redo it)' }))
         $ready = Done 'Ready' '' $workSrc $isDv81 $crop $localCopy
         if ($Cfg.Info.Dv -eq 'P7' -and $doviNote) { $ready | Add-Member -NotePropertyName DoviNote -NotePropertyValue $doviNote }
+        # A baked title is encoded with the baked file's own HDR10 values (MaxCLL from the RPU).
+        if ($baked) {
+            $ready | Add-Member -NotePropertyName Baked -NotePropertyValue $true
+            $ready | Add-Member -NotePropertyName EncodeInfo -NotePropertyValue (Get-SourceInfo $workSrc)
+        }
         return $ready
       } catch {
         Write-Log "ERROR: $($_.Exception.Message)"
@@ -1057,7 +1075,7 @@ $FinalizeBody = {
                     Copy-FileWithProgress -Src $doc.LinkFrom -Dst $winner -StatusBase $status
                 }
             } elseif ($doc.SourceVideo -and [IO.File]::Exists($doc.SourceVideo)) {
-                Write-Log "No variant passed: using the converted Dolby Vision copy $($doc.SourceVideo)"
+                Write-Log "No variant passed: using the Dolby Vision 8.1 copy (converted or baked) $($doc.SourceVideo)"
                 Copy-FileWithProgress -Src $doc.SourceVideo -Dst $winner -StatusBase $status
             } elseif ($doc.LocalCopy -and [IO.File]::Exists($doc.LocalCopy)) {
                 if ($doc.PSObject.Properties['KeepP7'] -and $doc.KeepP7) { Write-Log "Kept as Dolby Vision 7: the untouched local copy becomes $([IO.Path]::GetFileName($doc.Final))" }
@@ -1484,7 +1502,45 @@ while ($missing.Count -and (Get-Date) -lt $deadline) {
 }
 if ($missing.Count) { Write-Log "WARNING: WSL still can't see: $($missing -join ', '). Continuing; each WSL step will try $RemountCmd once." 'Red' }
 else { Write-Log 'WSL can see Source and Dest.' }
-if (-not $doviAvailable) { Write-Log "dovi_convert not reachable from WSL; Dolby Vision 7 titles will be skipped." 'Yellow' }
+# Dolby Vision 7 needs dovi_convert (WSL; inspect, and converting an MEL), and for baking an FEL
+# dovi_tool, mkvmerge and vspipe with the ffms2 and felbaker plugins (checked here with a
+# one-frame script, so a missing plugin shows now rather than after a title's copy and inspect).
+$doviMissing = @()
+if (-not $doviAvailable) { $doviMissing += 'dovi_convert (WSL)' }
+function Resolve-Program([string]$name) {
+    if (-not $name) { return '' }
+    $f = Resolve-UserPath $name
+    if ([IO.File]::Exists($f)) { return $f }
+    $c = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return $c.Source }
+    ''
+}
+$dt = Resolve-Program $DoviTool
+if ($dt) { $DoviTool = $dt } else { $doviMissing += "dovi_tool ('$DoviTool'; pass -DoviTool)" }
+if (-not (Get-Command mkvmerge -ErrorAction SilentlyContinue) -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvmerge.exe'))) { $doviMissing += 'mkvmerge (MKVToolNix)' }
+$vp = Resolve-Program $VsPipe
+if (-not $vp) { $doviMissing += "vspipe ('$VsPipe'; pass -VsPipe)" }
+else {
+    $VsPipe = $vp
+    $chkVpy = Join-Path $tempDir 'plugin-check.vpy'
+    [IO.File]::WriteAllText($chkVpy, (@(
+        'import vapoursynth as vs'
+        'core = vs.core'
+        "missing = [n for n in ('ffms2', 'fel') if not hasattr(core, n)]"
+        "if missing: raise vs.Error('plugin(s) not loaded: ' + ', '.join(missing))"
+        'core.std.BlankClip(length=1).set_output()'
+    ) -join "`n") + "`n", $script:Utf8)
+    $vsCall = $(if ((Test-IsWindows) -and $VsPipe -match '\.(bat|cmd)$') { 'call ' } else { '' }) + (Format-ShellArg $VsPipe)
+    $vr = Invoke-ShellLines -Lines @("$vsCall --info $(Format-ShellArg $chkVpy)") -WorkingDir ([IO.Path]::GetDirectoryName($VsPipe)) -TempDir $tempDir -Quiet
+    Remove-Item -LiteralPath $chkVpy -Force -ErrorAction SilentlyContinue
+    if ($vr.ExitCode -ne 0) {
+        foreach ($l in $vr.Lines) { Write-Log "vspipe: $l" }
+        $doviMissing += 'VapourSynth with the ffms2 and felbaker plugins (vspipe --info failed, see above; autoloaded plugins go in VapourSynth''s plugins folder)'
+    }
+}
+$doviMissing = $doviMissing -join ', '
+if ($doviMissing) { Write-Log "Dolby Vision 7 titles will be skipped: missing $doviMissing." 'Yellow' }
+else { Write-Log "Dolby Vision 7: dovi_convert (WSL), dovi_tool $DoviTool, vspipe $VsPipe (ffms2, felbaker)" }
 if ($found -notcontains ($RemountCmd -split ' ')[0]) { Write-Log "remount not reachable from WSL; dropped NAS mounts can't be repaired automatically." 'Yellow' }
 
 # ---------------------------------------------------------------- find sources
@@ -1497,7 +1553,7 @@ if ([IO.File]::Exists($srcPath)) {
         $_.Extension -eq '.mkv' -and
         -not $_.FullName.StartsWith($dstRoot + $sep, [StringComparison]::OrdinalIgnoreCase) -and
         -not $_.FullName.StartsWith($workRoot + $sep, [StringComparison]::OrdinalIgnoreCase) -and
-        $_.Name -notmatch ' - p7 source\.mkv$| - p8\.1\.mkv$| - source\.mkv$|\.partial\.mkv$'
+        $_.Name -notmatch ' - p7 source\.mkv$| - p8\.1\.mkv$| - baked\.mkv$| - source\.mkv$|\.partial\.mkv$'
     } | Sort-Object FullName)
 }
 Write-Log "Found $($files.Count) .mkv file(s)." 'Cyan'
@@ -2074,12 +2130,18 @@ function Request-Finalize($t, $rows, [string]$sugg) {
 }
 
 # A local file to take the audio from when there's no plain local copy: a Dolby Vision title's
-# converted 8.1 copy (same audio and subtitle tracks as the source). Not for 1080p copies, whose
-# reference has no audio. '' = use the source.
+# converted 8.1 copy (same audio and subtitle tracks as the source), or for a baked one (video
+# only) its profile 7 copy. Not for 1080p copies, whose reference has no audio: their parent's
+# profile 7 copy. '' = use the source.
 function Get-AudioSourceCopy($t) {
     if ($t.IsDerived) {
         $pc = Get-ParentP7Copy $t
         if ($pc -and [IO.File]::Exists($pc)) { return $pc }
+        return ''
+    }
+    if ([IO.File]::Exists((Get-WorkFile $t ' - baked.mkv'))) {
+        $pc = Get-WorkFile $t ' - p7 source.mkv'
+        if ([IO.File]::Exists($pc)) { return $pc }
         return ''
     }
     $p81 = Get-WorkFile $t ' - p8.1.mkv'
@@ -2096,14 +2158,14 @@ function Get-ParentP7Copy($t) {
     ''
 }
 
-# A Dolby Vision 7 title's converted copy (and any leftover p7 copy), or a 1080p copy's SDR
+# A Dolby Vision 7 title's converted or baked copy (and its p7 copy), or a 1080p copy's SDR
 # reference: deleted once the title is finished.
 function Get-DoviWorkFiles($t) {
     if ($t.IsDerived) {
         $ref = if ($t.Prep) { [string]$t.Prep.WorkSrc } else { Join-Path $t.WorkDir "$($t.ParentBase) - 1080p ref.mkv" }
         return @(@($ref, (Get-ParentP7Copy $t)) | Where-Object { $_ -and [IO.File]::Exists($_) })
     }
-    @(' - p8.1.mkv', ' - p7 source.mkv' | ForEach-Object { Get-WorkFile $t $_ } | Where-Object { [IO.File]::Exists($_) })
+    @(' - p8.1.mkv', ' - baked.mkv', ' - p7 source.mkv' | ForEach-Object { Get-WorkFile $t $_ } | Where-Object { [IO.File]::Exists($_) })
 }
 
 # A title kept as Dolby Vision 7: its untouched local copy gets the audio and becomes
@@ -2136,6 +2198,8 @@ function Request-FinalizeP7($t, [string]$p7copy, [string]$why) {
 # -UseSourceFallback: finish a title that has no passing variant with its source instead.
 function Request-FinalizeSource($t, $rows) {
     $p81 = Get-WorkFile $t ' - p8.1.mkv'
+    $bk = Get-WorkFile $t ' - baked.mkv'
+    if ([IO.File]::Exists($bk)) { $p81 = $bk }   # baked: "the source" is the baked file (video only)
     if ($t.IsDerived -and $t.Prep) { $p81 = [string]$t.Prep.WorkSrc }   # 1080p copy: its SDR reference is "the source"
     $doc = [ordered]@{
         Title = $t.Rel; Source = $t.File; Variant = 'source'; FromSource = $true
@@ -2209,9 +2273,9 @@ function Start-Prep($t) {
         Helpers = $Helpers.ToString(); EnvPath = $env:PATH; RunId = $runId
         SourceFile = $t.File; BaseName = $t.Base; TitleDir = $t.TitleDir; LogPath = $t.LogPath
         StatusFile = $prepStatusFile; TempDir = $tempDir; Info = $t.Info; Wsl = $wsl
-        CropDetect = $CropDetect; CropMode = $CropMode; MinFreeDoviGB = $MinFreeDoviGB; LocalCopy = [bool]$LocalCopy; WorkDir = $t.WorkDir; DoviOvershootNits = $DoviOvershootNits
+        CropDetect = $CropDetect; CropMode = $CropMode; MinFreeDoviGB = $MinFreeDoviGB; LocalCopy = [bool]$LocalCopy; WorkDir = $t.WorkDir
         NVEncC = $NVEncC; Derived = [bool]$t.IsDerived; ParentBase = $t.ParentBase; CropHw = [bool]($t.IsDerived -and $t.CropHw); RefSources = @($t.RefSources); SourcePeak = $t.SourcePeak
-        ConvertDoVi = $ConvertDolbyVision
+        ConvertDoVi = $ConvertDolbyVision; DoviTool = $DoviTool; VsPipe = $VsPipe
     }
     $job = Start-Job -ScriptBlock $PrepWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 6 -Compress)
     $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'prep'; Title = $t; Task = $null; Slot = -1; Start = Get-Date; StatusFile = $prepStatusFile }
@@ -2249,7 +2313,8 @@ function Start-Variant($t, $task, [int]$slot, [string]$kind) {
     $cfg = @{
         Helpers = $Helpers.ToString(); EnvPath = $env:PATH; RunId = $runId
         BaseName = $t.Base; TitleDir = $t.TitleDir; LogPath = $t.LogPath; StatusFile = $statusFile; TempDir = $tempDir
-        Info = $t.Info; WorkSrc = $t.Prep.WorkSrc; IsDv81 = $t.Prep.IsDv81; Crop = $t.Prep.Crop
+        Info = $(if ($t.Prep.PSObject.Properties['EncodeInfo'] -and $t.Prep.EncodeInfo) { $t.Prep.EncodeInfo } else { $t.Info })
+        WorkSrc = $t.Prep.WorkSrc; IsDv81 = $t.Prep.IsDv81; Crop = $t.Prep.Crop
         Variant = $task.Spec; Index = $task.Index; Count = @($t.Tasks).Count; Label = (Get-TaskLabel $t $task)
         Decoder = $Decoder; NVEncC = $NVEncC; Wsl = $wsl; SkipVmaf = [bool]$SkipVmaf; EncodeVideo = $EncodeVideo
     }
@@ -2335,7 +2400,7 @@ function Get-NextPrepTitle {
         $info = $t.Info
         if ($SkipVC1 -and $info.Codec -eq 'vc1') { Add-Skip $t 'VC-1 source (-SkipVC1)' 'Skipped'; continue }
         if ($info.Dv -ne 'None' -and $info.Dv -ne 'P7' -and $info.Dv -ne 'P8.1') { Add-Skip $t "unsupported Dolby Vision: $($info.Dv) [$($info.DvDetail)]" 'Skipped'; continue }
-        if ($info.Dv -eq 'P7' -and -not $doviAvailable) { Add-Skip $t 'Dolby Vision 7 but dovi_convert is unavailable'; continue }
+        if ($info.Dv -eq 'P7' -and $doviMissing) { Add-Skip $t "Dolby Vision 7 but $doviMissing unavailable"; continue }
         $isP7 = ($info.Dv -eq 'P7')
         # Dolby Vision 7: at most -MaxDoviTitles hold work files at once (this one waits its turn).
         if ($isP7) {
@@ -2352,8 +2417,8 @@ function Get-NextPrepTitle {
         # What it still needs to copy into the work folder (nothing if a complete copy is there).
         $needGB = 0; $workNeed = 0; $workWhy = ''
         if ($isP7) {
-            $p81 = Get-WorkFile $t ' - p8.1.mkv'; $p7c = Get-WorkFile $t ' - p7 source.mkv'
-            if (-not [IO.File]::Exists($p81) -and -not [IO.File]::Exists($p7c)) { $workNeed = $MinFreeDoviGB; $workWhy = "$MinFreeDoviGB GB (-MinFreeDoviGB) to download and convert Dolby Vision 7" }
+            $p81 = Get-WorkFile $t ' - p8.1.mkv'; $p7c = Get-WorkFile $t ' - p7 source.mkv'; $bkd = Get-WorkFile $t ' - baked.mkv'
+            if (-not [IO.File]::Exists($p81) -and -not [IO.File]::Exists($p7c) -and -not [IO.File]::Exists($bkd)) { $workNeed = $MinFreeDoviGB; $workWhy = "$MinFreeDoviGB GB (-MinFreeDoviGB) to download and convert or bake Dolby Vision 7" }
         } elseif ($LocalCopy -and -not $t.IsDerived) {
             $srcLen = (Get-Item -LiteralPath $t.File).Length
             $lc = Get-WorkFile $t ' - source.mkv'
@@ -2423,6 +2488,7 @@ function Format-DoviNote($ex) {
     switch ([string]$d.Decision) {
         'convert'           { 'profile 7 converted to 8.1' + $(if ($d.Verdict) { " (inspect: $($d.Verdict))" }) }
         'convert-overshoot' { [string]$d.Note }
+        'bake'              { 'profile 7 ' + $(if ($d.Note) { [string]$d.Note } else { 'FEL baked into 8.1' }) }
         'keep-p7'           { if ($ex.Derived) { "1080p SDR copy of a title kept as profile 7 ($($d.Note))" } else { "kept as profile 7 ($($d.Note)); a 1080p SDR copy is made alongside" } }
         default             { '' }
     }
@@ -2954,7 +3020,9 @@ try {
             $st = [IO.File]::ReadAllText($r.StatusFile) | ConvertFrom-Json
             if ($st.Pid) {
                 $p = Get-Process -Id $st.Pid -ErrorAction SilentlyContinue
-                if ($p -and $p.Id -ne $PID -and $p.ProcessName -match '^(NVEncC64|NVEncC|wsl|powershell|pwsh)$') { Stop-Process -Id $st.Pid -Force -ErrorAction SilentlyContinue }
+                if ($p -and $p.Id -ne $PID -and $p.ProcessName -match '^(NVEncC64|NVEncC|wsl|powershell|pwsh|dovi_tool|mkvmerge)$') { Stop-Process -Id $st.Pid -Force -ErrorAction SilentlyContinue }
+                # (a bake's cmd.exe pipe: ffmpeg | dovi_tool, or vspipe | NVEncC; the whole tree)
+                elseif ($p -and $p.ProcessName -eq 'cmd') { & taskkill.exe /PID $st.Pid /T /F 2>&1 | Out-Null }
             }
         } catch { }
         Stop-Job -Job $r.Job -ErrorAction SilentlyContinue
