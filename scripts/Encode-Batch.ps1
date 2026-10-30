@@ -220,9 +220,10 @@ param(
         @{ Cqp = 28; Aq = 8 },
         @{ Cqp = 26; Aq = 8 },
         @{ Cqp = 24; Aq = 8 },
-        @{ Cqp = 22; Aq = 4 },
+        @{ Cqp = 23; Aq = 8 },
         @{ Cqp = 22; Aq = 8 },
-        @{ Cqp = 20; Aq = 8 }
+        @{ Cqp = 20; Aq = 8 },
+        @{ Cqp = 18; Aq = 8 }
     ),
 
     # Fixed mode: give this to encode exactly these variants for every title (no search).
@@ -555,7 +556,8 @@ $BatchHelpers = {
     #   - Start rungs first (all at once, so both encoder slots can take one).
     #   - Some pass: finished if one is within CloseEnoughPct points of TargetPct. Else if the
     #     smallest passer is still above TargetPct, try the next smaller rung; if the biggest
-    #     passer is below TargetPct, try the next bigger one, unless a passer under TargetPct
+    #     passer is below TargetPct, try the next bigger untried one (past stronger rungs that
+    #     failed the bar, not past one over the cap), unless a passer under TargetPct
     #     meets the top bar (TopMean/TopP1/TopMin). If passers sit on both sides of TargetPct with
     #     untried rungs between them, try the middle one of those. Otherwise finished.
     #   - None pass: passes the bar but over the cap -> try smaller; fails the bar -> try bigger.
@@ -584,7 +586,17 @@ $BatchHelpers = {
             if (($null -eq $loPct -or $loPct -gt $TargetPct) -and (& $open ($lo - 1))) { return $lo - 1 }
             # Under TargetPct but over the top bar: good enough, don't climb for size.
             $topHit = @($ok | Where-Object { Test-TopBar $Tried[$_] $TargetPct $TopMean $TopP1 $TopMin }).Count
-            if ($null -ne $hiPct -and $hiPct -lt $TargetPct -and -not $topHit -and (& $open ($hi + 1))) { return $hi + 1 }
+            # Stepping up goes past a stronger rung that failed the bar (it happens: e.g. cqp22 aq4's
+            # min under cqp24 aq8's), to the next untried one; it stops at a rung over the size cap
+            # (or one ruled out by the skip rules).
+            if ($null -ne $hiPct -and $hiPct -lt $TargetPct -and -not $topHit) {
+                for ($i = $hi + 1; $i -lt $Count; $i++) {
+                    if ($Skip.ContainsKey($i)) { break }
+                    if (-not $Tried.ContainsKey($i)) { return $i }
+                    $c = Get-VariantClass $Tried[$i] $MinMean $MinP1 $MinMin $MaxPct
+                    if ($c -eq 'overcap' -or $c -eq 'fail+overcap') { break }
+                }
+            }
             # Passers either side of TargetPct with untried rungs between them (e.g. start rungs
             # 11.9% and 25.7% with one between): one in between will very likely pass too, at a
             # size between theirs, so try it. The middle one first.
@@ -1966,7 +1978,10 @@ function Get-StepWhy([hashtable]$Tried, [int]$i) {
     $f = { param($k) '{0} {1:0.#}%' -f $specs[$k].Name, $Tried[$k].Pct }
     if ($lo.Count -and $hi.Count) { return "between two passers either side of $TargetPct%: $(& $f $lo[0]) and $(& $f $hi[0])" }
     if ($hi.Count) { return "$(& $f $hi[0]) passes, over $TargetPct%: one smaller" }
-    if ($lo.Count) { return "$(& $f $lo[0]) passes, under $TargetPct%: one bigger" }
+    if ($lo.Count) {
+        $past = @(for ($k = $lo[0] + 1; $k -lt $i; $k++) { if ($Tried.ContainsKey($k) -and $null -ne $Tried[$k]) { $specs[$k].Name } })
+        return "$(& $f $lo[0]) passes, under $TargetPct%: one bigger$(if ($past.Count) { " (past $($past -join ', '), which failed the bar)" })"
+    }
     ''
 }
 
