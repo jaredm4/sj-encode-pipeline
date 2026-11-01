@@ -134,7 +134,8 @@
     both OCR'd from their shared source).
 
     Work is a queue, not one thread per title:
-      - Prep (one title at a time, no encoder slot used): probe with ffprobe (and mediainfo when
+      - Prep (one title at a time, no encoder slot used; up to -DoviThreads Dolby Vision 7 titles
+        at once): probe with ffprobe (and mediainfo when
         installed); skip Dolby Vision other than 7 / 8.1 (and VC-1 with -SkipVC1 $true). For profile 7:
         see "Dolby Vision 7" below (Convert-DolbyVision.ps1). Then CropDetect -Plumbing for the crop.
       - Encodes (up to -Threads at once, GPU; Encode-Video.ps1 runs NVEncC): each free slot takes the next encode of the oldest
@@ -269,6 +270,14 @@ param(
     # At most this many Dolby Vision 7 titles hold files in -WorkDir at once (downloading,
     # converting, or encoding from the converted copy). Others wait their turn.
     [ValidateRange(1, 4)][int]$MaxDoviTitles = 2,
+    # How many Dolby Vision 7 preps (copy, inspect, convert or bake) may run at once. Prep is
+    # otherwise one title at a time, and a bake holds it for an hour or more. With 2+, while
+    # every running prep is a Dolby Vision 7 one, the next Dolby Vision 7 title is prepped
+    # alongside (only those: other titles still prep one at a time), even one that would
+    # otherwise wait for its folder's first pick. The disk checks are the same (-MinFreeDoviGB,
+    # the wait for room to bake), and -MaxDoviTitles still caps the titles holding work files
+    # (raised to -DoviThreads if it's lower).
+    [ValidateRange(1, 4)][int]$DoviThreads = 1,
 
     # VMAF bar a variant must meet to pass.
     [double]$MinMean = 93.5,
@@ -329,6 +338,10 @@ param(
     # or names on PATH. Without them, Dolby Vision 7 titles are skipped.
     [string]$DoviTool = (Join-Path $HOME 'Documents\dovi_tool\dovi_tool'),
     [string]$VsPipe = (Join-Path $HOME 'Documents\vapoursynth-portable\vspipe'),
+    # Decoder threads per layer for a bake (ffms2; -1 = all logical CPUs). The base layer's decode
+    # sets the bake's speed, so the default uses every core; lower it to leave the CPU some room
+    # for the encodes and scoring running alongside.
+    [ValidateRange(-1, 64)][int]$BakeThreads = -1,
     # -NoAudio: no audio step (you add it by hand later); the title's local copy of its source is
     # kept for that (not deleted at the end), and listed at the end of the run.
     [switch]$NoAudio,
@@ -903,7 +916,7 @@ $PrepBody = {
         if ($Cfg.Info.Dv -eq 'P7') {
             $p = Get-WorkerScriptCommon $status
             $p.Source = [string]$Cfg.SourceFile; $p.WorkDir = $workDir; $p.DecisionDir = $titleDir; $p.Basename = $base
-            $p.DoviTool = [string]$Cfg.DoviTool; $p.VsPipe = [string]$Cfg.VsPipe; $p.NVEncC = [string]$Cfg.NVEncC
+            $p.DoviTool = [string]$Cfg.DoviTool; $p.VsPipe = [string]$Cfg.VsPipe; $p.NVEncC = [string]$Cfg.NVEncC; $p.BakeThreads = [int]$Cfg.BakeThreads
             $p.WslDistro = [string]$wsl.Distro; $p.WslMountRoot = [string]$wsl.MountRoot; $p.DoviConvertCmd = [string]$wsl.DoviConvertCmd; $p.RemountCmd = [string]$wsl.RemountCmd
             $dv = Invoke-WorkerScript $Cfg.ConvertDoVi $p
             switch ($dv.Status) {
@@ -1399,6 +1412,10 @@ foreach ($s in $specs) { Write-Log ("{0} '{1}': {2}" -f $(if ($fixedMode) { 'Var
 Write-Log "Bar: mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; top bar (under $TargetPct%, good enough): mean >= $TopMean, p1 >= $TopP1, min >= $TopMin$(if ($CloseEnoughPct -gt 0) { "; a passer within $CloseEnoughPct points of $TargetPct% ends the search" })"
 
 Write-Log ("Slots: {0} encode (GPU){1}" -f $Threads, $(if ($SkipVmaf) { ', VMAF off' } else { ", $VmafThreads VMAF (GPU)" }))
+if ($DoviThreads -gt 1) {
+    if ($MaxDoviTitles -lt $DoviThreads) { $MaxDoviTitles = $DoviThreads }
+    Write-Log "Dolby Vision 7: up to $DoviThreads preps (copy / inspect / convert / bake) at once; at most $MaxDoviTitles titles holding work files (-MaxDoviTitles)"
+}
 
 foreach ($tool in 'ffprobe', 'ffmpeg') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool not found on PATH (needed for probing and CropDetect)." }
@@ -2278,6 +2295,10 @@ function Complete-Title($t) {
 
 function Start-Prep($t) {
     $t.State = 'prepping'; $t.Start = Get-Date
+    # A prep slot of its own (status file, progress bar): more than one with -DoviThreads.
+    $used = @($running.Values | Where-Object { $_.Kind -eq 'prep' } | ForEach-Object { $_.Slot })
+    $slot = 0; while ($used -contains $slot) { $slot++ }
+    $prepStatusFile = Join-Path $tempDir $(if ($slot) { "prep$slot.json" } else { 'prep.json' })
     Remove-Item -LiteralPath $prepStatusFile -Force -ErrorAction SilentlyContinue
     $cfg = @{
         Helpers = $Helpers.ToString(); EnvPath = $env:PATH; RunId = $runId
@@ -2285,10 +2306,10 @@ function Start-Prep($t) {
         StatusFile = $prepStatusFile; TempDir = $tempDir; Info = $t.Info; Wsl = $wsl
         CropDetect = $CropDetect; CropMode = $CropMode; MinFreeDoviGB = $MinFreeDoviGB; LocalCopy = [bool]$LocalCopy; WorkDir = $t.WorkDir
         NVEncC = $NVEncC; Derived = [bool]$t.IsDerived; ParentBase = $t.ParentBase; CropHw = [bool]($t.IsDerived -and $t.CropHw); RefSources = @($t.RefSources); SourcePeak = $t.SourcePeak
-        ConvertDoVi = $ConvertDolbyVision; DoviTool = $DoviTool; VsPipe = $VsPipe
+        ConvertDoVi = $ConvertDolbyVision; DoviTool = $DoviTool; VsPipe = $VsPipe; BakeThreads = $BakeThreads
     }
     $job = Start-Job -ScriptBlock $PrepWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 6 -Compress)
-    $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'prep'; Title = $t; Task = $null; Slot = -1; Start = Get-Date; StatusFile = $prepStatusFile }
+    $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'prep'; Title = $t; Task = $null; Slot = $slot; Start = Get-Date; StatusFile = $prepStatusFile }
 }
 
 function Start-Finalize($t) {
@@ -2343,7 +2364,8 @@ function Start-Variant($t, $task, [int]$slot, [string]$kind) {
 
 # Picks the next title to prepare, skipping (without starting a job) titles that are finished,
 # unsupported, or that the disk can't take. Returns $null when nothing should be prepped now.
-function Get-NextPrepTitle {
+# -DoviOnly: only a Dolby Vision 7 title (the extra prep slots of -DoviThreads).
+function Get-NextPrepTitle([switch]$DoviOnly) {
     foreach ($t in $titleList) {
         if ($t.State -ne 'queued') { continue }
         if ($fixedMode) {
@@ -2386,11 +2408,25 @@ function Get-NextPrepTitle {
                 continue
             }
         }
+        # -DoviThreads 2+: a Dolby Vision 7 title is prepped (converted / baked: the long part, needed
+        # whatever the folder's pick) without waiting for its folder's pick or a search slot;
+        # -MaxDoviTitles and the disk checks below still apply.
+        $isDoviTitle = $false
+        if ($DoviOnly -or $DoviThreads -gt 1) {
+            if (-not $t.IsDerived -and -not $t.Info) { try { $t.Info = Get-SourceInfo $t.File } catch { } }
+            $isDoviTitle = [bool](-not $t.IsDerived -and $t.Info -and $t.Info.Dv -eq 'P7')
+            if ($DoviOnly -and -not $isDoviTitle) { continue }
+            # A folder-mate still being inspected: wait for its decision (if it's the folder's first
+            # title and an FEL, this one is baked without its own slow inspect).
+            if ($DoviOnly -and @($running.Values | Where-Object { $_.Kind -eq 'prep' -and $_.Title.TitleDir -eq $t.TitleDir -and
+                    -not [IO.File]::Exists((Join-Path $_.Title.TitleDir "$($_.Title.Base).dovi.json")) }).Count) { continue }
+        }
         # The cap (-Threads + 2) only limits searches from scratch. A title whose folder already has
         # a pick is cheap and goes first (titles are taken in order, so e.g. the rest of Season 01
         # before anything from Season 02+). A title that would only wait for a folder-mate's pick
         # is prepped one ahead per folder, so it can start the moment the pick lands.
         if (-not $fixedMode -and $folderSeed.ContainsKey($t.Folder)) { }
+        elseif ($isDoviTitle) { }
         elseif (Get-WaitingOn $t) {
             if (@($titleList | Where-Object { $_.Folder -eq $t.Folder -and ($_.State -eq 'prepping' -or $_.State -eq 'ready') -and -not @($_.Tasks).Count }).Count) { continue }
         } elseif (@($titleList | Where-Object { Test-Searching $_ }).Count -ge $maxActive) { continue }
@@ -2830,7 +2866,7 @@ try {
             $t = $r.Title
 
             if ($r.Kind -eq 'prep') {
-                Write-Progress -Id 99 -Activity "Preparing $($t.Rel)" -Completed
+                Write-Progress -Id (99 - $r.Slot) -Activity "Preparing $($t.Rel)" -Completed
                 if (-not $res) { $res = [pscustomobject]@{ Status = 'Failed'; Reason = $why } }
                 if ($res.Status -eq 'KeepP7') {
                     # Kept as Dolby Vision 7: finish the copy as "- 2160p" (audio only) and add the 1080p SDR title.
@@ -2975,25 +3011,38 @@ try {
         if (-not $prepRunning -and -not $stopDispatch -and ($idleSlot -or -not $waiting)) {
             $t = Get-NextPrepTitle
             if ($t) { Start-Prep $t }
+        } elseif ($prepRunning -and $prepRunning -lt $DoviThreads -and -not $stopDispatch -and
+                  -not @($running.Values | Where-Object { $_.Kind -eq 'prep' -and -not ($_.Title.Info -and $_.Title.Info.Dv -eq 'P7') }).Count) {
+            # -DoviThreads: every running prep is a (long) Dolby Vision 7 one: the next Dolby
+            # Vision 7 title alongside, whatever the encoders are doing (it's hours of work).
+            $t = Get-NextPrepTitle -DoviOnly
+            if ($t) { Start-Prep $t }
         }
 
         # A Dolby Vision 7 prep waiting for room to convert, with nothing else running that could
         # ever free it (checked after handing out work, so a title between encodes isn't missed): give up on that title instead of waiting forever.
+        # (with -DoviThreads: when everything running is a prep waiting for space, all of them)
         $pr = @($running.Values | Where-Object { $_.Kind -eq 'prep' })
-        if ($pr.Count -and $running.Count -eq 1 -and -not @($titleList | Where-Object { Test-FinalizeReady $_ }).Count) {
+        $prWait = @($pr | Where-Object {
             $st = $null
-            try { if ([IO.File]::Exists($pr[0].StatusFile)) { $st = [IO.File]::ReadAllText($pr[0].StatusFile) | ConvertFrom-Json } } catch { }
-            if ($st -and $st.Step -like 'waiting for space*') {
-                $t = $pr[0].Title
-                Stop-Job -Job $pr[0].Job -ErrorAction SilentlyContinue; Remove-Job -Job $pr[0].Job -Force -ErrorAction SilentlyContinue
-                $running.Remove($pr[0].Job.Id)
-                Write-Progress -Id 99 -Activity "Preparing $($t.Rel)" -Completed
+            try { if ([IO.File]::Exists($_.StatusFile)) { $st = [IO.File]::ReadAllText($_.StatusFile) | ConvertFrom-Json } } catch { }
+            $st -and $st.Step -like 'waiting for space*' })
+        if ($prWait.Count -and $running.Count -eq $prWait.Count -and -not @($titleList | Where-Object { Test-FinalizeReady $_ }).Count) {
+          foreach ($pw in $prWait) {
+            $st = $null
+            try { $st = [IO.File]::ReadAllText($pw.StatusFile) | ConvertFrom-Json } catch { $st = [pscustomobject]@{ Step = 'waiting for space' } }
+            if ($st) {
+                $t = $pw.Title
+                Stop-Job -Job $pw.Job -ErrorAction SilentlyContinue; Remove-Job -Job $pw.Job -Force -ErrorAction SilentlyContinue
+                $running.Remove($pw.Job.Id)
+                Write-Progress -Id (99 - $pw.Slot) -Activity "Preparing $($t.Rel)" -Completed
                 $t.State = 'failed'; $t.Reason = "not enough space on the work drive to convert, and nothing left running to free any ($($st.Step)); the local copy is kept"
                 Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  PREP: Failed - {1}`r`n" -f (Get-Date), $t.Reason)
                 $results.Add([pscustomobject]@{ Title = $t.Rel; Status = 'Failed'; Reason = $t.Reason; Suggested = $null; Variants = @()
                                                 Seconds = [int]((Get-Date) - $t.Start).TotalSeconds; LogPath = $t.LogPath })
                 Write-Log "TITLE $($t.Rel): Failed - $($t.Reason)" 'Red'
             }
+          }
         }
 
         # ---- progress display: one bar per encoder slot, one for prep
@@ -3013,7 +3062,7 @@ try {
             if ($r.Kind -eq 'finalize') {
                 Write-Progress -Id 21 -Activity ("FINISH {0} :: {1}" -f $r.Title.Rel, $r.Title.FinalDoc.Variant) -Status $text -PercentComplete -1
             } elseif ($r.Kind -eq 'prep') {
-                Write-Progress -Id 99 -Activity "Preparing $($r.Title.Rel)" -Status $text -PercentComplete $pct
+                Write-Progress -Id (99 - $r.Slot) -Activity "Preparing $($r.Title.Rel)" -Status $text -PercentComplete $pct
             } else {
                 $pid0 = if ($r.Kind -eq 'encode') { $r.Slot + 1 } else { $r.Slot + 11 }
                 Write-Progress -Id $pid0 -Activity ("{0} {1} :: {2} ({3})" -f $r.Label.Trim(), $r.Title.Rel, $r.Task.Spec.Name, (Get-TaskLabel $r.Title $r.Task)) -Status $text -PercentComplete $pct

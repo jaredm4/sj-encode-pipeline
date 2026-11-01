@@ -65,6 +65,10 @@
     path, or on PATH. Default: vspipe.
 .PARAMETER MkvMerge
     Convert: mkvmerge.exe, for baking. Default: on PATH, else C:\Program Files\MKVToolNix.
+.PARAMETER BakeThreads
+    Convert: decoder threads for each layer when baking (ffms2 threads=; -1 = all logical CPUs).
+    The base layer's decode sets the bake's pace: on an 8-core / 16-thread CPU, 4 gave ~38 fps,
+    -1 ~56 fps (all cores busy). Default: -1.
 .PARAMETER BakeCqp
     Convert: the baked encode's quality (NVEncC --cqp). Default: 12 (near-lossless).
 .PARAMETER SdrReference
@@ -125,6 +129,7 @@ param(
     [Parameter(ParameterSetName = 'Convert')][string]$VsPipe = 'vspipe',
     [Parameter(ParameterSetName = 'Convert')][string]$MkvMerge = 'mkvmerge',
     [Parameter(ParameterSetName = 'Convert')][int]$BakeCqp = 12,
+    [Parameter(ParameterSetName = 'Convert')][ValidateRange(-1, 64)][int]$BakeThreads = -1,
     [Parameter(ParameterSetName = 'SdrReference', Mandatory)][switch]$SdrReference,
     [Parameter(ParameterSetName = 'SdrReference', Mandatory)][string]$Output,
     [Parameter(ParameterSetName = 'SdrReference')][string]$Crop = '',
@@ -165,6 +170,7 @@ if (-not $DoviTool) { $DoviTool = 'dovi_tool' }
 if (-not $VsPipe) { $VsPipe = 'vspipe' }
 if (-not $MkvMerge) { $MkvMerge = 'mkvmerge' }
 if ($BakeCqp -le 0) { $BakeCqp = 12 }
+if ($BakeThreads -eq 0) { $BakeThreads = -1 }
 
 $wsl = @{ Distro = $WslDistro; MountRoot = $WslMountRoot; DoviConvertCmd = $DoviConvertCmd; RemountCmd = $RemountCmd }
 $tmp = $TempDir
@@ -315,8 +321,10 @@ function Invoke-Bake([string]$p7copy, [string]$baked) {
 import vapoursynth as vs
 core = vs.core
 # felbaker and ffms2 come from VapourSynth's plugin autoloading.
-bl = core.ffms2.Source($(& $py $bl), threads=4)
-el = core.ffms2.Source($(& $py $el), threads=4)
+# (the base layer's 2160p decode is the bottleneck: ffms2 reads in order, so its decoder
+# threads set the pace; -1 = every logical CPU)
+bl = core.ffms2.Source($(& $py $bl), threads=$BakeThreads)
+el = core.ffms2.Source($(& $py $el), threads=$BakeThreads)
 if bl.num_frames != el.num_frames or bl.num_frames != $($frames):
     raise vs.Error(f'frame counts differ: base layer {bl.num_frames}, enhancement layer {el.num_frames}, RPU $($frames)')
 # felbaker's recommended path: VapourSynth's resizer for the enhancement layer and the chroma.
@@ -347,7 +355,7 @@ out.set_output()
         $enc += @('-o', $hevc)
         $line = '{0} -c y4m {1} - | {2} {3}' -f (Format-ShellArg $vsPipe), (Format-ShellArg $vpyFile), (Format-ShellArg $NVEncC), (($enc | ForEach-Object { Format-ShellArg $_ }) -join ' ')
         Step 'bake: baking and encoding (vspipe | NVEncC)'
-        Write-Log ("Baking {0} frames into 8.1 (CQP {1}; HDR10: master-display {2}, max-cll {3})" -f $frames, $BakeCqp, $(if ($info.MasterDisplay) { $info.MasterDisplay } else { 'none' }), $(if ($maxCll) { $maxCll } else { 'none' }))
+        Write-Log ("Baking {0} frames into 8.1 (decoder threads {4}, CQP {1}; HDR10: master-display {2}, max-cll {3})" -f $frames, $BakeCqp, $(if ($info.MasterDisplay) { $info.MasterDisplay } else { 'none' }), $(if ($maxCll) { $maxCll } else { 'none' }), $(if ($BakeThreads -lt 0) { 'all' } else { $BakeThreads }))
         $t0 = Get-Date
         $r = Invoke-ShellLines -Lines @($line) -WorkingDir $vsDir -TempDir $tmp -StatusBase $status -ProgressFrames $frames
         $secs = [Math]::Max(1.0, ((Get-Date) - $t0).TotalSeconds)
