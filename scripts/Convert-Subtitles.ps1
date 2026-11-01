@@ -22,7 +22,8 @@
       4. Written to -Dest, named "<name>" = -Basename (the finished video's name, without .mkv):
            <name>.en.srt                  the main subtitles
            <name>.en.forced.default.srt   forced subtitles (only forced ones are marked default)
-           <name>.en.Commentary.srt       a commentary track ("<name>.en.Commentary 2.srt", ... for more)
+           <name>.en.Commentary1.srt      a commentary track ("<name>.en.Commentary2.srt", ... for more,
+                                          in track order, like Add-BluRayAudio's audio "Commentary1", ...)
          Every cue is moved by -OffsetMs (Encode-Batch passes Add-BluRayAudio's SyncMs, the
          shift it gave the audio to match the encode). With no offset the files are exactly
          what seconv wrote. Older "<name>.en*.srt" files from an earlier run are replaced.
@@ -526,18 +527,19 @@ function Get-SrtSuffix([string]$Role, [int]$N = 1) {
     switch ($Role) {
         'main'       { return ".$FileLang.srt" }
         'forced'     { return ".$FileLang.forced.default.srt" }
-        'commentary' { if ($N -le 1) { return ".$FileLang.Commentary.srt" } else { return ".$FileLang.Commentary $N.srt" } }
+        'commentary' { return ".$FileLang.Commentary$([Math]::Max(1, $N)).srt" }
     }
     return ''
 }
 
-# Earlier outputs for this name (".en.srt", ".en.forced.default.srt", ".en.Commentary*.srt").
+# Earlier outputs for this name (".en.srt", ".en.forced.default.srt", ".en.Commentary*.srt",
+# including the older un-numbered ".en.Commentary.srt" / ".en.Commentary 2.srt").
 function Get-OldOutputs([string]$Dir, [string]$Base) {
     if (-not [IO.Directory]::Exists($Dir)) { return @() }
     @([IO.Directory]::GetFiles($Dir, "*.srt") | Where-Object {
         $n = [IO.Path]::GetFileName($_)
         $n.StartsWith("$Base.", [StringComparison]::OrdinalIgnoreCase) -and
-            $n.Substring($Base.Length) -match "^\.$FileLang(\.forced\.default|\.Commentary( \d+)?)?\.srt$"
+            $n.Substring($Base.Length) -match "^\.$FileLang(\.forced\.default|\.Commentary( ?\d+)?)?\.srt$"
     })
 }
 

@@ -14,7 +14,8 @@
           <name>.mkv                   the finished encode, with audio (ladder mode, see below)
           <name>.en.srt                its subtitles (Convert-Subtitles): main, and if found
           <name>.en.forced.default.srt   forced (always marked default) and
-          <name>.en.Commentary.srt       commentary ("<name>.en.Commentary 2.srt", ...)
+          <name>.en.Commentary1.srt      commentary ("<name>.en.Commentary2.srt", ...: in track order,
+                                       like the audio's "Commentary1", ...)
           <name>.mks                   every source subtitle track, unchanged (backup), until the folder is done
           subtitles.zip                all of the folder's subtitle backups, once every title in it is done
           _subtitles review\<name>\    every English track's .srt, when the subtitles need your review
@@ -195,7 +196,9 @@
         noted in the reports. Its "% of source" is relative to that reference.
     The decision is saved in "<name>.dovi.json". A season stays one format: once a title in a
     folder is kept as profile 7, the folder's later Dolby Vision 7 titles are too (titles already
-    finished, or already converted and in progress, stay 8.1; check the reports for those).
+    finished, or already converted and in progress, stay 8.1; check the reports for those). And
+    when a folder's first Dolby Vision 7 title is baked (an FEL), its later ones are baked without
+    a dovi_convert inspect (it's slow). An MEL first, or an FEL later on, changes nothing.
 
 .PARAMETER Ladder
     Rungs for the search, weakest/smallest first. Same keys as -Variants.
@@ -332,6 +335,11 @@ param(
     # Passed to Add-BluRayAudio: a new default track from the main track (AC-3 5.1 / AAC) instead
     # of copying the TrueHD's AC-3 core or an existing same mix (e.g. a core under 448 kbps).
     [switch]$NewDefaultTrack,
+    # Passed to Add-BluRayAudio as -PassthruCommentaries None: no commentary detection, so no
+    # commentary audio tracks are kept (for a series whose stereo tracks get mistaken for
+    # commentary). Commentary subtitles are still made (Convert-Subtitles tells them apart by
+    # their text, not the audio).
+    [switch]$SkipCommentaries,
     [switch]$KeepVariants,
 
     # ...then .srt subtitles with Convert-Subtitles (OCR of the English tracks with seconv and
@@ -890,7 +898,8 @@ $PrepBody = {
         #                                  only) and adds a 1080p SDR title for it
         # The decision is saved as "<name>.dovi.json" in Dest. Once any title in a folder is kept as
         # profile 7, the folder's later profile 7 titles follow (a season stays one format); ones
-        # already finished as 8.1 are left alone.
+        # already finished as 8.1 are left alone. When the folder's first title was baked (an FEL),
+        # the later ones are baked too, without an inspect.
         if ($Cfg.Info.Dv -eq 'P7') {
             $p = Get-WorkerScriptCommon $status
             $p.Source = [string]$Cfg.SourceFile; $p.WorkDir = $workDir; $p.DecisionDir = $titleDir; $p.Basename = $base
@@ -1168,6 +1177,7 @@ $FinalizeBody = {
             # A 1080p copy (of a title kept as Dolby Vision 7) gets the default track only: its
             # 2160p file next to it has the masters and commentary.
             if ($Cfg.IsDerived) { $startArgs += @('-PassthruMasters', 'None', '-PassthruCommentaries', 'None') }
+            elseif ($Cfg.PSObject.Properties['SkipCommentaries'] -and $Cfg.SkipCommentaries) { $startArgs += @('-PassthruCommentaries', 'None') }
             if ($Cfg.PSObject.Properties['NewDefaultTrack'] -and $Cfg.NewDefaultTrack) { $startArgs += '-NewDefaultTrack' }
             $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Cfg.AddAudio, '-Source', $audioSrc, '-Dest', $winner, '-Replace',
                    '-LogPath', $audioLog, '-Plumbing') + $startArgs
@@ -1454,7 +1464,7 @@ if ($finishing -and -not $NoSubtitles) {
 Write-Log "Crop: $CropMode ($(switch ($CropMode) { 'Strict' { 'solid black bars only' } 'Suggested' { 'black bars, plus soft edges beside them' } 'Full' { 'black bars and all soft edges' } }); a hand-edited <name>.crop.json is used as is)"
 if (-not $fixedMode) {
     Write-Log ("Finishing: {0}" -f $(if (-not $finishing) { 'off (-NoAudio -KeepVariants)' } else {
-        (@($(if (-not $NoAudio) { "audio with $AddBluRayAudio" }), $(if (-not $NoSubtitles) { "subtitles with $ConvertSubtitles" }),
+        (@($(if (-not $NoAudio) { "audio with $AddBluRayAudio$(if ($SkipCommentaries) { ' (no commentary tracks: -SkipCommentaries)' })" }), $(if (-not $NoSubtitles) { "subtitles with $ConvertSubtitles" }),
            'move the pick up to the mirrored folder', $(if (-not $KeepVariants) { 'delete the other variants' })) | Where-Object { $_ }) -join ', ' }))
 }
 
@@ -2299,7 +2309,7 @@ function Start-Finalize($t) {
         Doc = $t.FinalDoc; FinalJson = $t.FinalJson
         VariantDirs = @(Get-VariantDirs $t) + @($(if ($t.FinalDoc.PSObject.Properties['FromSource'] -and $t.FinalDoc.FromSource) { Split-Path -Parent $t.FinalDoc.Winner }))
         AddAudio = $AddBluRayAudio; Exe = (Get-Process -Id $PID).Path; NoAudio = [bool]$NoAudio; KeepVariants = [bool]$KeepVariants
-        IsDerived = [bool]$t.IsDerived; NewDefaultTrack = [bool]$NewDefaultTrack; ConvertSubs = $ConvertSubtitles; NoSubtitles = [bool]$NoSubtitles; SeConv = $SeConv; SubRules = $SubtitleRules
+        IsDerived = [bool]$t.IsDerived; NewDefaultTrack = [bool]$NewDefaultTrack; SkipCommentaries = [bool]$SkipCommentaries; ConvertSubs = $ConvertSubtitles; NoSubtitles = [bool]$NoSubtitles; SeConv = $SeConv; SubRules = $SubtitleRules
     }
     $job = Start-Job -ScriptBlock $FinalizeWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 8 -Compress)
     $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'finalize'; Title = $t; Task = $null; Slot = -1; Start = Get-Date; StatusFile = $statusFile; Label = 'FINISH' }
@@ -2648,7 +2658,7 @@ function Write-BatchReport([string]$Dir, $Titles, [bool]$Touched) {
         $md.Add('> **Action needed.** These titles'' subtitle tracks couldn''t be told apart with confidence (or failed). The best guess')
         $md.Add('> is in place next to the video. Every English track''s .srt (shifted like the finished file) is in the review folder,')
         $md.Add('> named with its track number and guessed role: copy the right ones over `<name>.en.srt`, `<name>.en.forced.default.srt`')
-        $md.Add('> or `<name>.en.Commentary.srt` (delete any that shouldn''t be there), then delete the review folder.')
+        $md.Add('> or `<name>.en.Commentary1.srt` (delete any that shouldn''t be there), then delete the review folder.')
         $md.Add('> A Dolby Vision 7 title and its 1080p copy are OCR''d from the same source, so they usually both need the same fix.')
         $md.Add('')
         foreach ($o in $toReview) {

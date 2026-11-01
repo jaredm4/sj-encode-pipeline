@@ -30,7 +30,9 @@
           (Status KeepP7, P7Copy).
       The decision is saved in "<name>.dovi.json" in -DecisionDir. A season stays one format: when
       another title's .dovi.json in -DecisionDir says keep-p7, this one is kept as profile 7 too,
-      without inspecting it. A converted or baked copy from an earlier run is reused (and a kept
+      without inspecting it; otherwise, when the folder's first title (in name order) was baked
+      (an FEL), this one is baked without inspecting it (inspect is slow). An MEL first, or an
+      FEL later on, changes nothing: the rest are inspected. A converted or baked copy from an earlier run is reused (and a kept
       title's old one is deleted). Before converting it waits until -WorkDir has room for it
       (about twice the copy's size; a bake, about 2.2 times plus 20 GB), re-checking every 30 s.
 
@@ -382,7 +384,8 @@ out.set_output()
 #                                as "<name> - 2160p.mkv" (audio only) and adds a 1080p SDR title
 # The decision is saved as "<name>.dovi.json" in -DecisionDir. Once any title there is kept as
 # profile 7, its later profile 7 titles follow (a season stays one format); ones already
-# finished as 8.1 are left alone.
+# finished as 8.1 are left alone. When the folder's first title was baked (an FEL), the later
+# ones are baked too without being inspected.
 function Invoke-Convert {
     [void][IO.Directory]::CreateDirectory($workDir)
     $p81 = Get-WorkFile ' - p8.1.mkv'
@@ -402,12 +405,25 @@ function Invoke-Convert {
     }
     $own = if ([IO.File]::Exists($decFile)) { & $readJson $decFile } else { $null }
     $keepWhy = ''
+    $followBake = ''
     if ([IO.Directory]::Exists($titleDir)) {
-        foreach ($f in @([IO.Directory]::GetFiles($titleDir, '*.dovi.json') | Where-Object { $_ -ne $decFile })) {
+        $others = @([IO.Directory]::GetFiles($titleDir, '*.dovi.json') | Where-Object { $_ -ne $decFile })
+        foreach ($f in $others) {
             $o = & $readJson $f
             if ($o -and $o.Decision -eq 'keep-p7') {
                 $keepWhy = "the rest of the season follows $([IO.Path]::GetFileName($f) -replace '\.dovi\.json$', ''): $($o.Note)"
                 break
+            }
+        }
+        # The folder's FIRST profile 7 title (in name order, as Encode-Batch takes them) was an
+        # FEL: the rest are baked without an inspect (it's slow; a season is all FEL or all MEL in
+        # practice, and baking an MEL loses nothing). Only the first one counts: an MEL first, or
+        # an FEL later on, changes nothing. Kept as profile 7 (above) still wins.
+        $names = @(@($others | ForEach-Object { [IO.Path]::GetFileName($_) -replace '\.dovi\.json$', '' }) + $base | Sort-Object)
+        if ($names.Count -gt 1 -and $names[0] -ne $base) {
+            $o = & $readJson (Join-Path $titleDir "$($names[0]).dovi.json")
+            if ($o -and $o.Decision -eq 'bake') {
+                $followBake = "FEL baked into 8.1 (the season follows its first title, $($names[0]): $(if ($o.Verdict) { $o.Verdict } else { 'FEL' }); not inspected)"
             }
         }
     }
@@ -445,6 +461,10 @@ function Invoke-Convert {
             # (an interrupted bake: inspect already decided)
             $mode = 'bake'; $doviNote = [string]$own.Note
             Write-Log "Dolby Vision 7: baking, as decided before ($doviNote)"
+        } elseif ($followBake) {
+            $mode = 'bake'; $doviNote = $followBake
+            Write-Log "Dolby Vision 7: $followBake"
+            & $saveDecision 'bake' $doviNote 0 0 ''
         } else {
             Step 'dovi_convert inspect'
             $r = Invoke-Wsl -Wsl $wsl -TempDir $tmp -NeedPaths @($copyW) -StatusBase $status `

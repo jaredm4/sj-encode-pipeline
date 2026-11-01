@@ -166,7 +166,8 @@
     with an apostrophe):
       -PassthruCommentaries 2,3 -PassthruTitles "Director's Commentary","Cast Commentary"
     Only works with track numbers (not with None, and not in batch mode).
-    Default: "Commentary" for every kept track.
+    Default: "Commentary1", "Commentary2", ... in the order given (automatic: in the source's
+    order), matching Convert-Subtitles' "<name>.en.Commentary1.srt", ...
 .PARAMETER PassthruMasters
     Auto (the default): keep every lossless master. None: keep no masters, only the default
     track (and any commentary), e.g. for a 1080p copy whose 2160p file has the masters
@@ -1026,13 +1027,15 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             if ($pp -in $keepPos) { throw "-PassthruCommentaries: audio track $pp is already kept as a master." }
             if ($pp -eq $compat.SrcPos -or $pp -eq $pick.Pos) { throw "-PassthruCommentaries: audio track $pp is the main or default track." }
             $passTracks.Add($audio[$pp])
-            if ($PassthruTitles.Count -gt 0) { $passTitles.Add($PassthruTitles[$k]) } else { $passTitles.Add('Commentary') }
+            if ($PassthruTitles.Count -gt 0) { $passTitles.Add($PassthruTitles[$k]) } else { $passTitles.Add("Commentary$($k + 1)") }
         }
     } elseif ($script:PassMode -eq 'Auto') {
         foreach ($cand in $toCompare) {
             if ($cand.Channels -le 2 -and $verdicts[$cand.Pos].Kind -eq 'commentary' -and $cand.Pos -ne $compat.SrcPos) {
                 $passTracks.Add($cand)
-                $passTitles.Add('Commentary')
+                # Numbered in the source's order (Commentary1, Commentary2, ...), like
+                # Convert-Subtitles' commentary .srt files, so the two line up.
+                $passTitles.Add("Commentary$($passTracks.Count)")
             }
         }
     }
