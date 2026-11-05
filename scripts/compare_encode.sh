@@ -424,6 +424,28 @@ probe_shift() {
   echo "$best_shift $best_score $second"
 }
 
+# probe_shift_from_start <seconds> <shift>...: like probe_shift, but decoding both files from
+# their very first frame (no seek) and scoring a 20s window <seconds> in, for the given shifts
+# only. That's how the whole-file score decodes; in a few files (VC-1 especially) seeking lands
+# one frame off from it, and when the opening is static or dark a window at 0s can't tell the
+# shifts apart. Costs decoding <seconds> of both files per shift. Prints "<best> <score> <second>".
+probe_shift_from_start() {
+  local at="$1"; shift
+  local k s score best_shift="" best_score=-1 second=-1 results="" dt rt
+  k=$(awk -v t="$at" -v fps="$FPS" 'BEGIN { n = split(fps, p, "/"); f = (n == 2 && p[2] + 0 > 0) ? p[1] / p[2] : p[1] + 0; printf "%d", t * f }')
+  for s in "$@"; do
+    if [ "$s" -ge 0 ]; then dt="trim=start_frame=$(( k + s )),setpts=PTS-STARTPTS,"; rt="trim=start_frame=${k},setpts=PTS-STARTPTS,"
+    else                    dt="trim=start_frame=${k},setpts=PTS-STARTPTS,"; rt="trim=start_frame=$(( k - s )),setpts=PTS-STARTPTS,"; fi
+    score=$(run_score "$dt" "$rt" 0 $(( at + 20 )) 4 2>&1 | grep -o 'VMAF score: [0-9.]*' | awk '{print $3}')
+    [ -z "$score" ] && score=0
+    results="${results}${s}:${score} "
+    if awk -v sc="$score" -v best="$best_score" 'BEGIN{exit !(sc>best)}'; then second=$best_score; best_score=$score; best_shift=$s
+    elif awk -v sc="$score" -v b="$second" 'BEGIN{exit !(sc>b)}'; then second=$score; fi
+  done
+  echo "  shift scores from the start, ${at}s in (no seek): ${results}-> best shift ${best_shift} (score ${best_score})" >&2
+  echo "$best_shift $best_score $second"
+}
+
 # Given a frame-shift integer, echoes "<enc_trim>|<ref_trim>" filter-chain fragments (either
 # may be empty) that compensate for it. Read back with: IFS='|' read -r DT RT. (A space as the
 # separator loses an empty first field, which put a negative shift's trim on the wrong file.)
@@ -606,21 +628,41 @@ score_pair() {
     if [ "$S10" = "$S50" ] && [ "$S50" = "$S90" ]; then
       echo "  -> consistent shift (${S10}) at all three points; applying it across the whole file."
       CHOSEN=$S10
-      # Where the encode starts in the original, for syncing its audio (Encode-Batch reads this).
-      echo "Start: the encode's first frame is the original's frame $(( ${LEADN:-0} - CHOSEN )) (measured)"
       # The whole-file score decodes from the very first frame, without seeking. A few sources
       # (VC-1 especially) come out one frame different that way than after a seek, so check the
       # shift at the start too and score with it, when the start can tell shifts apart (a clear
-      # winner; a static or dark opening can't).
+      # winner). A static or dark opening can't: then the two candidates are compared decoding
+      # from the start (no seek) a few minutes in, where there's picture to compare.
       read -r S0 SC0 SC0b <<< "$(probe_shift 0)"
       if [ "$S0" != "$CHOSEN" ]; then
         if awk -v a="$SC0" -v b="$SC0b" 'BEGIN { exit !(a >= 70 && a - b >= 10) }'; then
           echo "  -> from the very start it lines up at shift ${S0} (score ${SC0}); decoding from the start differs from seeking in this file, so the whole file is scored with ${S0}."
           CHOSEN=$S0
         else
-          echo "  -> the start suggests shift ${S0}, but too weakly to tell (score ${SC0}, next best ${SC0b}); keeping ${CHOSEN}."
+          local AT=$(( P10 < 600 ? P10 : 600 ))
+          # The candidates: the seek-measured shift and its neighbours (a weak start's pick is
+          # noise; VC-1's from-the-start shift is usually one more than after a seek), plus that
+          # pick if it's further away.
+          local CANDS=("$CHOSEN" $(( CHOSEN + 1 )) $(( CHOSEN - 1 )))
+          [ "$S0" -gt $(( CHOSEN + 1 )) ] || [ "$S0" -lt $(( CHOSEN - 1 )) ] && CANDS+=("$S0")
+          echo "  -> the start suggests shift ${S0}, but too weakly to tell (score ${SC0}, next best ${SC0b}); comparing shifts ${CANDS[*]} decoding from the start, ${AT}s in ..."
+          read -r SD SCD SCDb <<< "$(probe_shift_from_start "$AT" "${CANDS[@]}")"
+          if [ -n "$SD" ] && awk -v a="$SCD" -v b="$SCDb" 'BEGIN { exit !(a >= 70 && a - b >= 10) }'; then
+            if [ "$SD" != "$CHOSEN" ]; then
+              echo "  -> decoding from the start it lines up at shift ${SD} (score ${SCD}); the whole file is scored with ${SD}."
+            else
+              echo "  -> decoding from the start it lines up at shift ${SD} too (score ${SCD}); keeping it."
+            fi
+            CHOSEN=$SD
+          else
+            echo "  WARNING: decoding from the start didn't settle it either (score ${SCD}, next best ${SCDb}); keeping ${CHOSEN}. If the score below is very low, the shift is likely wrong."
+          fi
         fi
       fi
+      # Where the encode starts in the original, for syncing its audio (Encode-Batch reads this):
+      # from the shift the whole file is scored with, as that's how a player (and the encoder)
+      # decodes it, from the start.
+      echo "Start: the encode's first frame is the original's frame $(( ${LEADN:-0} - CHOSEN )) (measured)"
     else
       echo "  WARNING: alignment differs across the file (10%=${S10}, 50%=${S50}, 90%=${S90})."
       echo "           This means drift starts somewhere between these points, or one of them is a"
@@ -798,3 +840,4 @@ if [ "$BATCH" -eq 1 ]; then
 else
   exit "$status"
 fi
+
