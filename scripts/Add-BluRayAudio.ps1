@@ -182,6 +182,12 @@
     more, AAC for stereo or mono), instead of copying the TrueHD's AC-3 core or an existing
     track that's the same mix. E.g. for a disc whose AC-3 core is under 448 kbps (normally an
     error). Works in single and batch mode. Default: off.
+    A new AC-3 made from a TrueHD that has an AC-3 core gets the core's playback metadata
+    (dialogue level, downmix levels and mode: they're in the AC-3 stream itself, not the
+    container), so it plays at the same loudness as the core and the TrueHD. Without it,
+    ffmpeg writes its defaults (dialogue level -31, i.e. no attenuation: typically several dB
+    louder than the disc's tracks). The core's dynamic range compression values can't be
+    carried over (ffmpeg's AC-3 encoder doesn't write them).
 .PARAMETER AacBitrate
     AAC bitrate in kbps for a new default track made from a stereo source.
     Mono sources are capped at 256 (AAC's per-channel limit).
@@ -521,7 +527,67 @@ function New-OutputTrack([string]$From, [int]$SrcPos, [string]$Codec, [int]$Kbps
         From = $From; SrcPos = $SrcPos; Codec = $Codec; Kbps = $Kbps; Ac = $Ac
         Title = $Title; Note = $Note; Layout = $Layout
         IsDefault = $false; IsCommentary = $false; TempFile = ''; KeepTag = ''; TagsFile = ''
+        EncArgs = @()
     }
+}
+
+# An AC-3 track's playback metadata, from its first frame's header (BSI): what MediaInfo
+# shows as Dialog Normalization, cmixlev, surmixlev, dmixmod, ltrt/loro levels. Returns
+# ffmpeg AC-3 encoder options that write the same values, plus a summary; $null if it can't
+# be read. Reads about a second of the track (ffmpeg -c copy to a temp .ac3).
+function Get-Ac3Metadata([string]$File, [int]$Pos) {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('abr-' + [guid]::NewGuid().ToString('N') + '.ac3')
+    try {
+        & $script:ffmpeg -v error -nostdin -i $File -map "0:a:$Pos" -c copy -t 1 -f ac3 -y $tmp 2>$null | Out-Null
+        if (-not [IO.File]::Exists($tmp)) { return $null }
+        $b = [IO.File]::ReadAllBytes($tmp)
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    $start = -1
+    for ($i = 0; $i -lt $b.Length - 16; $i++) { if ($b[$i] -eq 0x0B -and $b[$i + 1] -eq 0x77) { $start = $i; break } }
+    if ($start -lt 0) { return $null }
+    $st = @{ Pos = ($start + 2) * 8 }
+    $bits = { param([int]$n) $v = 0; for ($k = 0; $k -lt $n; $k++) { $p = $st.Pos; $v = ($v -shl 1) -bor (($b[[int][Math]::Floor($p / 8)] -shr (7 - ($p % 8))) -band 1); $st.Pos++ }; $v }
+    [void](& $bits 16)                     # crc1
+    [void](& $bits 8)                      # fscod, frmsizecod
+    $bsid = & $bits 5
+    if ($bsid -gt 8) { return $null }      # (E-AC-3 or not AC-3)
+    [void](& $bits 3)                      # bsmod
+    $acmod = & $bits 3
+    $cmix = -1; $smix = -1
+    if (($acmod -band 1) -and $acmod -ne 1) { $cmix = & $bits 2 }
+    if ($acmod -band 4) { $smix = & $bits 2 }
+    if ($acmod -eq 2) { [void](& $bits 2) }    # dsurmod
+    [void](& $bits 1)                      # lfeon
+    $dialnorm = & $bits 5
+    if (& $bits 1) { [void](& $bits 8) }   # compr (DRC: can't be written by ffmpeg)
+    if (& $bits 1) { [void](& $bits 8) }   # langcod
+    if (& $bits 1) { [void](& $bits 7) }   # mixlevel, roomtyp
+    if ($acmod -eq 0) {
+        [void](& $bits 5); if (& $bits 1) { [void](& $bits 8) }; if (& $bits 1) { [void](& $bits 8) }; if (& $bits 1) { [void](& $bits 7) }
+    }
+    [void](& $bits 2)                      # copyrightb, origbs
+    $x = $null
+    if ($bsid -eq 6 -and (& $bits 1)) {    # alternate BSI: extended downmix info
+        $x = @{ Mode = (& $bits 2); LtRtC = (& $bits 3); LtRtS = (& $bits 3); LoRoC = (& $bits 3); LoRoS = (& $bits 3) }
+    }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $cTab = @(0.707, 0.595, 0.5)                                   # cmixlev: -3, -4.5, -6 dB
+    $sTab = @(0.707, 0.5, 0.0)                                     # surmixlev: -3, -6 dB, off
+    $xTab = @(1.414, 1.189, 1.0, 0.841, 0.707, 0.595, 0.5, 0.0)    # extended: +3 .. -6 dB, off
+    $dbTab = @('+3', '+1.5', '0', '-1.5', '-3', '-4.5', '-6', 'off')
+    $a = @('-dialnorm', "-$(if ($dialnorm -eq 0) { 31 } else { $dialnorm })")
+    $sum = @("dialnorm -$(if ($dialnorm -eq 0) { 31 } else { $dialnorm }) dB")
+    if ($cmix -ge 0 -and $cmix -le 2) { $a += @('-center_mixlev', $cTab[$cmix].ToString($inv)); $sum += "center mix $(@('-3', '-4.5', '-6')[$cmix]) dB" }
+    if ($smix -ge 0 -and $smix -le 2) { $a += @('-surround_mixlev', $sTab[$smix].ToString($inv)); $sum += "surround mix $(@('-3 dB', '-6 dB', 'off')[$smix])" }
+    if ($x) {
+        $a += @('-dmix_mode', "$($x.Mode)")
+        # (codes 0-2 are reserved for the surround levels: left to ffmpeg's default)
+        $a += @('-ltrt_cmixlev', $xTab[$x.LtRtC].ToString($inv), '-loro_cmixlev', $xTab[$x.LoRoC].ToString($inv))
+        if ($x.LtRtS -ge 3) { $a += @('-ltrt_surmixlev', $xTab[$x.LtRtS].ToString($inv)) }
+        if ($x.LoRoS -ge 3) { $a += @('-loro_surmixlev', $xTab[$x.LoRoS].ToString($inv)) }
+        $sum += "downmix mode $(@('not indicated', 'Lt/Rt', 'Lo/Ro', 'Pro Logic II')[$x.Mode]), Lt/Rt $($dbTab[$x.LtRtC])/$($dbTab[$x.LtRtS]) dB, Lo/Ro $($dbTab[$x.LoRoC])/$($dbTab[$x.LoRoS]) dB"
+    }
+    [pscustomobject]@{ Args = $a; Summary = ($sum -join ', ') }
 }
 
 # e.g. "audio 3: Dolby Digital 2.0, 192 kbps, 'Stereo'"
@@ -1000,6 +1066,20 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $outCh = [Math]::Min($pick.Channels, 6)
             $compat = New-OutputTrack 'encode' $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel $outCh)" `
                 "new, encoded from $srcLabel at $Ac3Bitrate kbps" "ac3 $outCh"
+            # From a TrueHD with an AC-3 core: the core's dialogue level and downmix metadata,
+            # so the new track plays at the same loudness (see -NewDefaultTrack).
+            if ($isTrueHdMain) {
+                $core = @($audio | Where-Object {
+                    $_.Codec -eq 'ac3' -and $_.Pos -ne $pick.Pos -and $pick.SourceId -and $_.SourceId -eq $pick.SourceId }) | Select-Object -First 1
+                if (-not $core -and ($pick.Pos + 1) -lt $audio.Count -and $audio[$pick.Pos + 1].Codec -eq 'ac3') { $core = $audio[$pick.Pos + 1] }
+                if ($core) {
+                    $meta = Get-Ac3Metadata $SourceFile $core.Pos
+                    if ($meta) {
+                        $compat.EncArgs = $meta.Args
+                        $compat.Note += "; the AC-3 core's metadata (audio $($core.Pos): $($meta.Summary))"
+                    } else { Write-Warning "Couldn't read the AC-3 core's metadata (audio $($core.Pos)); the new track gets ffmpeg's defaults (dialogue level -31)." }
+                }
+            }
         }
     }
     $compat.IsDefault = $true
@@ -1218,6 +1298,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             '-c:a', $o.Codec))
         if ($o.Kbps -gt 0) { $enc.AddRange([string[]]@('-b:a', "$($o.Kbps)k")) }
         if ($o.Ac -gt 0) { $enc.AddRange([string[]]@('-ac', "$($o.Ac)")) }
+        if (@($o.EncArgs).Count) { $enc.AddRange([string[]]@($o.EncArgs)) }
         if ($o.Codec -eq 'libopus') {
             # Opus surround only accepts the standard layouts, but Blu-ray audio is often
             # labelled "5.1(side)". channelmap relabels the same channels in the same order
