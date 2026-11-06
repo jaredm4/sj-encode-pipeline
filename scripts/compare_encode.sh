@@ -175,6 +175,30 @@ case "$VMAF_CUDA" in
 esac
 
 TS="setpts=N/(${FPS})/TB"
+# REF_CFR: put the ORIGINAL's frames on a constant grid (fps filter: a frame repeated
+# over a timestamp gap, dropped where frames come too fast) before pairing them by order, the
+# way NVEncC's --avsync cfr made the encode. For originals with irregular timestamps (a DVD's
+# cell gaps, a section at another rate): without it the pairs slip a frame at each irregularity.
+#   auto (default): off, but in --full mode, when the shift differs across the file, the check
+#                   is redone with it on, and used if that makes the shift consistent
+#   1: always on;  0: never
+# The grid is the rate the ENCODE's frames actually run at (it's constant: the encoder made it so):
+# its frame count over its duration, snapped to a standard rate. Not FPS, which comes from the
+# original and can be its container's nominal rate (30000/1001 for a DVD whose film frames run at
+# 24000/1001), nor the encode's own label (NVEncC's MKVs say 24/1 for 23.976 frames). Counting
+# reads the encode's whole file (no decode), so it's only done when the grid is needed.
+REF_CFR=${REF_CFR:-auto}
+RFPS=""
+grid_fps() {
+  local n d
+  n=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null | head -1)
+  d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null | head -1)
+  awk -v n="$n" -v d="$d" -v fb="$FPS" 'BEGIN {
+    if (n + 0 <= 0 || d + 0 <= 0) { print fb; exit }
+    r = n / d; m = split("24000/1001 24/1 25/1 30000/1001 30/1 48/1 50/1 60000/1001 60/1", c, " ")
+    for (i = 1; i <= m; i++) { split(c[i], p, "/"); v = p[1] / p[2]; if (r > v * 0.9995 && r < v * 1.0005) { print c[i]; exit } }
+    printf "%d/1000\n", r * 1000 + 0.5 }'
+}
 
 # duration in whole seconds, read via ffmpeg
 dur() {
@@ -316,7 +340,7 @@ run_score() {
   "$FFMPEG" -hide_banner -nostats -nostdin \
     -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
     -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
-    -lavfi "[0:v:0]${dt}${DSCALE}${TS},format=yuv420p10le[d];[1:v:0]${rt}${RCROP}${TS},format=yuv420p10le[r];[d][r]libvmaf=${opts}" \
+    -lavfi "[0:v:0]${dt}${DSCALE}${TS},format=yuv420p10le[d];[1:v:0]${RFPS}${rt}${RCROP}${TS},format=yuv420p10le[r];[d][r]libvmaf=${opts}" \
     -f null -
 }
 
@@ -337,7 +361,7 @@ run_score_cuda() {
     -init_hw_device "cuda=vmafgpu:${CUDA_DEVICE}" -filter_hw_device vmafgpu \
     -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
     -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
-    -lavfi "[0:v:0]${dt}${DSCALE}${TS},${up}[d];[1:v:0]${rt}${RCROP}${TS},${up}[r];[d][r]libvmaf_cuda=${opts}" \
+    -lavfi "[0:v:0]${dt}${DSCALE}${TS},${up}[d];[1:v:0]${RFPS}${rt}${RCROP}${TS},${up}[r];[d][r]libvmaf_cuda=${opts}" \
     -f null -
   local rc=$?
   [ $rc -eq 0 ] && [ -n "$json" ] && [ ! -s "$json" ] && rc=1
@@ -357,7 +381,7 @@ run_score_mixed() {
     -init_hw_device "cuda=vmafgpu:${CUDA_DEVICE}" -filter_hw_device vmafgpu \
     "${DGPU[@]}" -hwaccel_device vmafgpu -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
     -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
-    -lavfi "[0:v:0]${dt}${DGPU_SCALE}${TS},scale_cuda=format=${CUDA_FMT}[d];[1:v:0]${rt}${RCROP}${TS},${up}[r];[d][r]libvmaf_cuda=${opts}" \
+    -lavfi "[0:v:0]${dt}${DGPU_SCALE}${TS},scale_cuda=format=${CUDA_FMT}[d];[1:v:0]${RFPS}${rt}${RCROP}${TS},${up}[r];[d][r]libvmaf_cuda=${opts}" \
     -f null -
   local rc=$?
   [ $rc -eq 0 ] && [ -n "$json" ] && [ ! -s "$json" ] && rc=1
@@ -375,7 +399,7 @@ run_score_gpudec() {
   "$FFMPEG_CUDA" -hide_banner -nostats -nostdin \
     "${DGPU[@]}" -ss "$(seek_pos "$ENC_VREL" "$off")" -t "$len" -i "$ENC" \
     "${RGPU[@]}" -ss "$(seek_pos "$ORIG_VREL" "$off")" -t "$len" -i "$ORIG" -an -sn \
-    -lavfi "[0:v:0]${dt}${DGPU_SCALE}${TS},scale_cuda=format=${CUDA_FMT}[d];[1:v:0]${rt}${TS},scale_cuda=format=${CUDA_FMT}[r];[d][r]libvmaf_cuda=${opts}" \
+    -lavfi "[0:v:0]${dt}${DGPU_SCALE}${TS},scale_cuda=format=${CUDA_FMT}[d];[1:v:0]${RFPS}${rt}${TS},scale_cuda=format=${CUDA_FMT}[r];[d][r]libvmaf_cuda=${opts}" \
     -f null -
   local rc=$?
   [ $rc -eq 0 ] && [ -n "$json" ] && [ ! -s "$json" ] && rc=1
@@ -432,7 +456,9 @@ probe_shift() {
 probe_shift_from_start() {
   local at="$1"; shift
   local k s score best_shift="" best_score=-1 second=-1 results="" dt rt
-  k=$(awk -v t="$at" -v fps="$FPS" 'BEGIN { n = split(fps, p, "/"); f = (n == 2 && p[2] + 0 > 0) ? p[1] / p[2] : p[1] + 0; printf "%d", t * f }')
+  # (the frame count to skip, from the rate the frames really run at: FPS can be a DVD's nominal
+  # 30000/1001 for 24000/1001 frames, which would skip past the window)
+  k=$(awk -v t="$at" -v fps="${REALFPS:-$FPS}" 'BEGIN { n = split(fps, p, "/"); f = (n == 2 && p[2] + 0 > 0) ? p[1] / p[2] : p[1] + 0; printf "%d", t * f }')
   for s in "$@"; do
     if [ "$s" -ge 0 ]; then dt="trim=start_frame=$(( k + s )),setpts=PTS-STARTPTS,"; rt="trim=start_frame=${k},setpts=PTS-STARTPTS,"
     else                    dt="trim=start_frame=${k},setpts=PTS-STARTPTS,"; rt="trim=start_frame=$(( k - s )),setpts=PTS-STARTPTS,"; fi
@@ -445,6 +471,11 @@ probe_shift_from_start() {
   echo "  shift scores from the start, ${at}s in (no seek): ${results}-> best shift ${best_shift} (score ${best_score})" >&2
   echo "$best_shift $best_score $second"
 }
+
+# clear_win <best> <next best>: whether a from-the-start check picked a shift clearly. A score of
+# 90+ that's 5+ ahead, or 70+ that's 10+ ahead. (Busy, detailed picture separates shifts by 30-50
+# points; flat animation only by ~8-10, as a neighbouring frame looks much the same.)
+clear_win() { awk -v a="$1" -v b="$2" 'BEGIN { exit !((a >= 90 && a - b >= 5) || (a >= 70 && a - b >= 10)) }'; }
 
 # Given a frame-shift integer, echoes "<enc_trim>|<ref_trim>" filter-chain fragments (either
 # may be empty) that compensate for it. Read back with: IFS='|' read -r DT RT. (A space as the
@@ -475,6 +506,10 @@ summary_row() {
 # enclosing scope. Prints the full report to stdout; appends one row to SUMMARY_FILE (if
 # set) on both success and failure. Returns 0 on success, 1 if nothing could be scored.
 score_pair() {
+  # (per pair: a constant grid found for one pair in folder mode isn't carried to the next)
+  local GRID=""
+  REALFPS=""   # the encode's measured frame rate, once something needs it (grid_fps)
+  RFPS=""; if [ "$REF_CFR" = "1" ]; then GRID=$(grid_fps "$ENC"); REALFPS=$GRID; RFPS="fps=${GRID},"; echo "REF_CFR=1: the original's frames are put on a constant ${GRID} grid (the encode's frame rate)."; fi
   local ORIG="$1" ENC="$2"
   local DO DE DIFF SO SE OW OH EW EH DSCALE RCROP MODEL GPUDEC DGPU_SCALE GPUDEC_WHY ga
   local DGPU=() RGPU=()
@@ -624,7 +659,29 @@ score_pair() {
     read -r S50 SC50 _ <<< "$(probe_shift "$P50")"
     read -r S90 SC90 _ <<< "$(probe_shift "$P90")"
     echo "  10%: shift ${S10} (score ${SC10})   50%: shift ${S50} (score ${SC50})   90%: shift ${S90} (score ${SC90})"
+    if ! { [ "$S10" = "$S50" ] && [ "$S50" = "$S90" ]; } && [ "$REF_CFR" = "auto" ] && [ -z "$RFPS" ]; then
+      [ -z "$REALFPS" ] && REALFPS=$(grid_fps "$ENC")
+      GRID=$REALFPS
+      echo "  -> the shift differs across the file. The original may have irregular timestamps (gaps, or a section at another rate) that the encoder evened out (--avsync cfr); re-checking with the original's frames put on a constant ${GRID} grid (the encode's frame rate) ..."
+      RFPS="fps=${GRID},"
+      read -r T10 TC10 _ <<< "$(probe_shift "$P10")"
+      read -r T50 TC50 _ <<< "$(probe_shift "$P50")"
+      read -r T90 TC90 _ <<< "$(probe_shift "$P90")"
+      echo "  10%: shift ${T10} (score ${TC10})   50%: shift ${T50} (score ${TC50})   90%: shift ${T90} (score ${TC90})   (constant grid)"
+      # Used only if it lines up as well as the original's own timestamps did where those lined
+      # up (a wrong grid can look consistent while matching badly everywhere).
+      if [ "$T10" = "$T50" ] && [ "$T50" = "$T90" ] && awk -v a="$TC10" -v b="$TC50" -v c="$TC90" -v x="$SC10" -v y="$SC50" -v z="$SC90" 'BEGIN {
+           lo = a; if (b < lo) lo = b; if (c < lo) lo = c; best = x; if (y > best) best = y; if (z > best) best = z
+           exit !(lo >= best - 5) }'; then
+        echo "  -> consistent on a constant grid: the original's timestamps are irregular, so it's scored that way (REF_CFR)."
+        S10=$T10; SC10=$TC10; S50=$T50; SC50=$TC50; S90=$T90; SC90=$TC90
+      else
+        echo "  -> no better on a constant grid; back to the original's own timestamps."
+        RFPS=""
+      fi
+    fi
 
+    local BOUNDS=() SEGSH=()
     if [ "$S10" = "$S50" ] && [ "$S50" = "$S90" ]; then
       echo "  -> consistent shift (${S10}) at all three points; applying it across the whole file."
       CHOSEN=$S10
@@ -646,8 +703,9 @@ score_pair() {
           local CANDS=("$CHOSEN" $(( CHOSEN + 1 )) $(( CHOSEN - 1 )))
           [ "$S0" -gt $(( CHOSEN + 1 )) ] || [ "$S0" -lt $(( CHOSEN - 1 )) ] && CANDS+=("$S0")
           echo "  -> the start suggests shift ${S0}, but too weakly to tell (score ${SC0}, next best ${SC0b}); comparing shifts ${CANDS[*]} decoding from the start, ${AT}s in ..."
+          [ -z "$REALFPS" ] && REALFPS=$(grid_fps "$ENC")
           read -r SD SCD SCDb <<< "$(probe_shift_from_start "$AT" "${CANDS[@]}")"
-          if [ -n "$SD" ] && awk -v a="$SCD" -v b="$SCDb" 'BEGIN { exit !(a >= 70 && a - b >= 10) }'; then
+          if [ -n "$SD" ] && clear_win "$SCD" "$SCDb"; then
             if [ "$SD" != "$CHOSEN" ]; then
               echo "  -> decoding from the start it lines up at shift ${SD} (score ${SCD}); the whole file is scored with ${SD}."
             else
@@ -664,18 +722,74 @@ score_pair() {
       # decodes it, from the start.
       echo "Start: the encode's first frame is the original's frame $(( ${LEADN:-0} - CHOSEN )) (measured)"
     else
-      echo "  WARNING: alignment differs across the file (10%=${S10}, 50%=${S50}, 90%=${S90})."
-      echo "           This means drift starts somewhere between these points, or one of them is a"
-      echo "           genuine content mismatch. Using the midpoint's shift (${S50}) for the whole-"
-      echo "           file score, but treat this result with real caution -- run without --full and"
-      echo "           sample offsets between these three points to find where it actually changes."
-      CHOSEN=$S50
+      # Drift: the encode gained or lost a frame somewhere (a frame the encoder repeated or
+      # dropped). Find each place the shift changes (halving the gap between two checks that
+      # disagree, down to ~20s) and score each part of the file with its own shift.
+      echo "  -> alignment differs across the file (10%=${S10}, 50%=${S50}, 90%=${S90}): the encode gains or loses a frame somewhere. Finding where, to score each part with its own shift ..."
+      local PTS=("$P10" "$P50" "$P90") SHS=("$S10" "$S50" "$S90") ok=1 i lo hi mid SM a b
+      SEGSH=("$S10")
+      for i in 0 1; do
+        a=${SHS[$i]}; b=${SHS[$((i + 1))]}
+        [ "$a" = "$b" ] && continue
+        lo=${PTS[$i]}; hi=${PTS[$((i + 1))]}
+        while [ $(( hi - lo )) -gt 20 ]; do
+          mid=$(( (lo + hi) / 2 ))
+          read -r SM _ _ <<< "$(probe_shift "$mid")"
+          if [ "$SM" = "$a" ]; then lo=$mid
+          elif [ "$SM" = "$b" ]; then hi=$mid
+          else ok=0; echo "  -> at ${mid}s the shift is ${SM}, neither ${a} nor ${b}: more than one change here."; break; fi
+        done
+        [ "$ok" -eq 1 ] || break
+        BOUNDS+=($(( (lo + hi) / 2 ))); SEGSH+=("$b")
+        echo "  -> the shift changes from ${a} to ${b} between ${lo}s and ${hi}s; from $(( (lo + hi) / 2 ))s on it's scored with ${b}."
+      done
+      if [ "$ok" -ne 1 ]; then
+        echo "  WARNING: alignment differs across the file (10%=${S10}, 50%=${S50}, 90%=${S90}), and"
+        echo "           where it changes couldn't be pinned down. Using the midpoint's shift (${S50})"
+        echo "           for the whole-file score, but treat this result with real caution -- run without"
+        echo "           --full and sample offsets between these three points to find where it changes."
+        BOUNDS=(); SEGSH=("$S50")
+      fi
     fi
-    IFS='|' read -r DT RT <<< "$(trim_for_shift "$CHOSEN")"
-
-    echo -n "Scoring the entire file (${DO}s) ... "
-    run_score "$DT" "$RT" 0 "$DO" "$SUB" "$WORK/clip_0.json" 2>>"$WORK/errors.log"
-    if [ -s "$WORK/clip_0.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
+    if [ ${#BOUNDS[@]} -eq 0 ]; then
+      [ ${#SEGSH[@]} -gt 0 ] && CHOSEN=${SEGSH[0]}
+      IFS='|' read -r DT RT <<< "$(trim_for_shift "$CHOSEN")"
+      echo -n "Scoring the entire file (${DO}s) ... "
+      run_score "$DT" "$RT" 0 "$DO" "$SUB" "$WORK/clip_0.json" 2>>"$WORK/errors.log"
+      if [ -s "$WORK/clip_0.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
+    else
+      # Each part from its start to the next change; pooled below like clips. The later parts
+      # are scored after a seek, which is how their shifts were measured. The first is scored
+      # from the very start, and some files (VC-1, some MPEG-2) line up a frame differently that
+      # way than after a seek, so its shift is checked decoding from the start (no seek), like
+      # the start check above.
+      local AT1=$(( BOUNDS[0] - 22 )); [ "$AT1" -gt "$P10" ] && AT1=$P10
+      if [ "$AT1" -ge 1 ]; then
+        local C0=${SEGSH[0]} FS FSC FSCb
+        echo "  -> checking the first part's shift decoding from the start (no seek), ${AT1}s in ..."
+        [ -z "$REALFPS" ] && REALFPS=$(grid_fps "$ENC")
+        read -r FS FSC FSCb <<< "$(probe_shift_from_start "$AT1" "$C0" $(( C0 + 1 )) $(( C0 - 1 )))"
+        if [ -n "$FS" ] && clear_win "$FSC" "$FSCb"; then
+          if [ "$FS" != "$C0" ]; then echo "  -> decoding from the start it lines up at shift ${FS} (score ${FSC}), not ${C0}: the first part is scored with ${FS}."; SEGSH[0]=$FS
+          else echo "  -> decoding from the start it lines up at shift ${FS} too (score ${FSC})."; fi
+        else
+          if awk -v a="${FSC:-0}" 'BEGIN { exit !(a + 0 <= 0) }'; then
+            echo "  WARNING: the check decoding from the start failed (no scores; see $WORK/errors.log); keeping ${C0} for the first part. If its score below is very low, it's likely wrong."
+          else
+            echo "  WARNING: decoding from the start didn't settle the first part's shift (score ${FSC:-?}, next best ${FSCb:-?}); keeping ${C0}. If the first part's score below is very low, it's likely wrong."
+          fi
+        fi
+      fi
+      local starts=(0 "${BOUNDS[@]}") k st en
+      for k in "${!starts[@]}"; do
+        st=${starts[$k]}
+        if [ $(( k + 1 )) -lt ${#starts[@]} ]; then en=${starts[$((k + 1))]}; else en=$DO; fi
+        IFS='|' read -r DT RT <<< "$(trim_for_shift "${SEGSH[$k]}")"
+        echo -n "Scoring ${st}s-${en}s with shift ${SEGSH[$k]} ... "
+        run_score "$DT" "$RT" "$st" $(( en - st )) "$SUB" "$WORK/clip_${st}.json" 2>>"$WORK/errors.log"
+        if [ -s "$WORK/clip_${st}.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
+      done
+    fi
   else
     local SHIFTS=() SH SC
     for off in "${OFFS[@]}"; do
