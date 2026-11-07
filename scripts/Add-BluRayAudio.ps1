@@ -184,7 +184,8 @@
     error). Works in single and batch mode. Default: off.
     A new AC-3 made from a TrueHD that has an AC-3 core gets the core's playback metadata
     (dialogue level, downmix levels and mode: they're in the AC-3 stream itself, not the
-    container), so it plays at the same loudness as the core and the TrueHD. Without it,
+    container), so it plays at the same loudness as the core and the TrueHD. With no core, it
+    gets the TrueHD's own dialogue level (what eac3to shows as dialnorm) instead. Without it,
     ffmpeg writes its defaults (dialogue level -31, i.e. no attenuation: typically several dB
     louder than the disc's tracks). The core's dynamic range compression values can't be
     carried over (ffmpeg's AC-3 encoder doesn't write them).
@@ -195,6 +196,12 @@
 .PARAMETER Ac3Bitrate
     AC-3 (Dolby Digital) bitrate in kbps for a new 5.1 default track.
     Allowed: 384, 448, 512, 576, 640 (640 is AC-3's maximum). Default: 640.
+.PARAMETER DialNorm
+    The dialogue level (dB) written on a new AC-3 track, for when there's no AC-3 core to copy
+    it from (e.g. the core was dropped from the source MKV): players turn an AC-3 down by -31 minus
+    this, so -27 plays 4 dB quieter than -31. Find the disc's value with eac3to: its track list
+    shows "dialnorm: -27dB" for TrueHD and AC-3 tracks. Overrides the core's when both exist.
+    Allowed: -31 to -1. Default: the core's, else -31 (ffmpeg's default: no attenuation).
 .PARAMETER AudioLanguage
     ISO 639-2 three-letter language tag written on every audio track.
     Default: eng.
@@ -271,6 +278,7 @@ param(
     [string]$DestFilter = '*',
     [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
+    [ValidateRange(-31, -1)][int]$DialNorm = -31,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
     [switch]$Replace,
     [int]$SourceStartFrames = -1,
@@ -531,6 +539,35 @@ function New-OutputTrack([string]$From, [int]$SrcPos, [string]$Codec, [int]$Kbps
     }
 }
 
+# A TrueHD track's dialogue levels, from its first major sync's channel_meaning(): one per
+# presentation (2ch, 6ch, 8ch), in dB (-1 to -63), or 0 where it isn't set (stored 0 = -31,
+# no adjustment). This is what eac3to shows as "dialnorm". Reads about a second of the track.
+# Layout (Dolby TrueHD high-level bitstream description; the truehd crate): format_sync
+# 0xF8726FBA, format_info 32, signature 0xB752, flags 16, reserved 16, rate 16, substream
+# fields 16, then channel_meaning: heavy DRC gain 6, 3 control flags + 1 reserved, DRC gain 7,
+# 2ch dialogue norm 6, 2ch mix 6, 6ch dialogue norm 5, 6ch mix 6, 6ch format 5, 8ch dialogue norm 5.
+function Read-TrueHdDialNorm([byte[]]$b) {
+    for ($i = 0; $i -lt $b.Length - 26; $i++) {
+        if ($b[$i] -ne 0xF8 -or $b[$i + 1] -ne 0x72 -or $b[$i + 2] -ne 0x6F -or $b[$i + 3] -ne 0xBA) { continue }
+        if ($b[$i + 8] -ne 0xB7 -or $b[$i + 9] -ne 0x52) { continue }   # signature
+        $base = ($i + 18) * 8
+        $get = { param([int]$off, [int]$n) $v = 0; for ($k = 0; $k -lt $n; $k++) { $p = $base + $off + $k; $v = ($v -shl 1) -bor (($b[[int][Math]::Floor($p / 8)] -shr (7 - ($p % 8))) -band 1) }; $v }
+        return [pscustomobject]@{ D2 = -(& $get 17 6); D6 = -(& $get 29 5); D8 = -(& $get 45 5) }
+    }
+    $null
+}
+function Get-TrueHdDialNorm([string]$File, [int]$Pos) {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('abr-' + [guid]::NewGuid().ToString('N') + '.thd')
+    try {
+        # (-v quiet and 'Continue': under 'Stop', Windows PowerShell turns any line ffmpeg writes to
+        # stderr, such as the raw TrueHD muxer's harmless timestamp warnings, into an error)
+        $ErrorActionPreference = 'Continue'
+        & $script:ffmpeg -v quiet -nostdin -i $File -map "0:a:$Pos" -c copy -t 1 -f truehd -y $tmp 2>$null | Out-Null
+        if (-not [IO.File]::Exists($tmp)) { return $null }
+        Read-TrueHdDialNorm ([IO.File]::ReadAllBytes($tmp))
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+
 # An AC-3 track's playback metadata, from its first frame's header (BSI): what MediaInfo
 # shows as Dialog Normalization, cmixlev, surmixlev, dmixmod, ltrt/loro levels. Returns
 # ffmpeg AC-3 encoder options that write the same values, plus a summary; $null if it can't
@@ -538,7 +575,8 @@ function New-OutputTrack([string]$From, [int]$SrcPos, [string]$Codec, [int]$Kbps
 function Get-Ac3Metadata([string]$File, [int]$Pos) {
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('abr-' + [guid]::NewGuid().ToString('N') + '.ac3')
     try {
-        & $script:ffmpeg -v error -nostdin -i $File -map "0:a:$Pos" -c copy -t 1 -f ac3 -y $tmp 2>$null | Out-Null
+        $ErrorActionPreference = 'Continue'   # (see Get-TrueHdDialNorm)
+        & $script:ffmpeg -v quiet -nostdin -i $File -map "0:a:$Pos" -c copy -t 1 -f ac3 -y $tmp 2>$null | Out-Null
         if (-not [IO.File]::Exists($tmp)) { return $null }
         $b = [IO.File]::ReadAllBytes($tmp)
     } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
@@ -1066,18 +1104,33 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $outCh = [Math]::Min($pick.Channels, 6)
             $compat = New-OutputTrack 'encode' $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel $outCh)" `
                 "new, encoded from $srcLabel at $Ac3Bitrate kbps" "ac3 $outCh"
+            if ($script:DialNormGiven) { $compat.Note += "; dialnorm $DialNorm dB (-DialNorm)" }
             # From a TrueHD with an AC-3 core: the core's dialogue level and downmix metadata,
             # so the new track plays at the same loudness (see -NewDefaultTrack).
             if ($isTrueHdMain) {
                 $core = @($audio | Where-Object {
                     $_.Codec -eq 'ac3' -and $_.Pos -ne $pick.Pos -and $pick.SourceId -and $_.SourceId -eq $pick.SourceId }) | Select-Object -First 1
                 if (-not $core -and ($pick.Pos + 1) -lt $audio.Count -and $audio[$pick.Pos + 1].Codec -eq 'ac3') { $core = $audio[$pick.Pos + 1] }
+                $meta = $null
                 if ($core) {
                     $meta = Get-Ac3Metadata $SourceFile $core.Pos
                     if ($meta) {
                         $compat.EncArgs = $meta.Args
-                        $compat.Note += "; the AC-3 core's metadata (audio $($core.Pos): $($meta.Summary))"
-                    } else { Write-Warning "Couldn't read the AC-3 core's metadata (audio $($core.Pos)); the new track gets ffmpeg's defaults (dialogue level -31)." }
+                        $compat.Note += "; the AC-3 core's metadata (audio $($core.Pos): $($meta.Summary)$(if ($script:DialNormGiven) { '; its dialnorm replaced by -DialNorm' }))"
+                    } else { Write-Warning "Couldn't read the AC-3 core's metadata (audio $($core.Pos))." }
+                }
+                # No core (or unreadable): the TrueHD's own dialogue level, from the presentation
+                # matching the new track (6ch for 5.1; else 8ch, 2ch). Downmix levels stay ffmpeg's.
+                if (-not $meta -and -not $script:DialNormGiven) {
+                    $tdn = Get-TrueHdDialNorm $SourceFile $pick.Pos
+                    $dn = 0
+                    if ($tdn) { foreach ($v in $tdn.D6, $tdn.D8, $tdn.D2) { if ($v -lt 0 -and $v -ge -31) { $dn = $v; break } } }
+                    if ($dn -lt 0) {
+                        $compat.EncArgs = @('-dialnorm', "$dn")
+                        $compat.Note += "; the TrueHD's dialogue level ($dn dB; no AC-3 core)"
+                    } else {
+                        Write-Warning "No AC-3 core, and $(if ($tdn) { 'the TrueHD sets no dialogue level' } else { "the TrueHD's dialogue level couldn't be read" }): the new track gets -31 (no attenuation). Pass -DialNorm to set it (eac3to shows it as dialnorm)."
+                    }
                 }
             }
         }
@@ -1298,7 +1351,14 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             '-c:a', $o.Codec))
         if ($o.Kbps -gt 0) { $enc.AddRange([string[]]@('-b:a', "$($o.Kbps)k")) }
         if ($o.Ac -gt 0) { $enc.AddRange([string[]]@('-ac', "$($o.Ac)")) }
-        if (@($o.EncArgs).Count) { $enc.AddRange([string[]]@($o.EncArgs)) }
+        $ea = @($o.EncArgs)
+        if ($o.Codec -eq 'ac3' -and $script:DialNormGiven) {
+            # -DialNorm: replaces the core's value (or ffmpeg's -31)
+            $keep = New-Object System.Collections.Generic.List[string]
+            for ($j = 0; $j -lt $ea.Count; $j++) { if ($ea[$j] -eq '-dialnorm') { $j++; continue }; $keep.Add([string]$ea[$j]) }
+            $ea = @('-dialnorm', "$DialNorm") + $keep.ToArray()
+        }
+        if ($ea.Count) { $enc.AddRange([string[]]$ea) }
         if ($o.Codec -eq 'libopus') {
             # Opus surround only accepts the standard layouts, but Blu-ray audio is often
             # labelled "5.1(side)". channelmap relabels the same channels in the same order
@@ -1624,6 +1684,7 @@ function Write-PlumbingResult([string]$Status, [string]$Message, [string]$Output
     [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 6 -Compress))
 }
 
+$script:DialNormGiven = $PSBoundParameters.ContainsKey('DialNorm')
 $script:PlanTracks = @()
 $script:PlanDropped = @()
 $script:PlanSyncMs = 0
