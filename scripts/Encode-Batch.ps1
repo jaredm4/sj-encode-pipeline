@@ -84,6 +84,9 @@
         that set the pick already tried it (and lost), it's skipped if this title's result at the
         pick is about the same (-SimilarPct, -SimilarVmaf). E.g. E01: cqp22 17%, cqp20 25% -> picks
         cqp22; E02 at cqp22 17.5% doesn't re-try cqp20. The skip is noted in the title's log.
+        Not when that rung only just failed for the other title (every failing mean / p1 / min
+        within -NearMissPct of its bar): a near miss there could pass here. The folder's pick and
+        reference follow its most recently finished title, not just its first.
 
     Pass and suggestion (sizes are each variant's video stream as % of the source's video stream,
     measured by compare_encode, so audio tracks don't count on either side):
@@ -305,6 +308,9 @@ param(
     # more than SimilarVmaf on mean/p1/min. 0 turns it off.
     [double]$SimilarPct = 3,
     [double]$SimilarVmaf = 1,
+    # ...except when the other title's result at that rung only just failed: every metric it
+    # missed (mean / p1 / min) within this % of its bar (e.g. 1: a 75 min bar, 74.25+). 0: always skip.
+    [double]$NearMissPct = 1,
 
     # Don't try a rung that would very likely be pointless:
     #   SkipMarginPct: a passing rung's mean, p1 or min clears its bar by less than this % (e.g.
@@ -376,6 +382,12 @@ param(
     # ignored (a signed-off folder gets its report too). E.g. for finished folders moved to the NAS:
     # -Source the Blu-ray tree, -Dest the mirrored tree they were moved to.
     [switch]$ReportsOnly,
+    # With -ReportsOnly: a title not finished by Encode-Batch whose "<name>.mkv" is in its Dest
+    # folder counts as finished by hand (e.g. one you encoded yourself after nothing passed): its
+    # <name>.final.json is written (Variant "manual"), so the folder's report and zip can be made.
+    # It's listed as "Finished by hand", with whatever variants were scored. Titles without that
+    # file still hold the folder back.
+    [switch]$MarkFinished,
 
     # Copy each source to -WorkDir (as "<name> - source.mkv") during prep, so the encodes, VMAF
     # scoring, CropDetect and Add-BluRayAudio all read it locally instead of from the NAS.
@@ -501,7 +513,7 @@ $BatchHelpers = {
                 $r.Model = $Matches[1]
             } elseif ($l -match "^Start: the encode's first frame is the original's frame (-?\d+)") {
                 $r.StartFrame = [int]$Matches[1]
-            } elseif ($l -match 'WARNING: (alignment differs|no shift|durations differ|the best shift .* search limit)') {
+            } elseif ($l -match 'WARNING: (alignment differs|no shift|durations differ|the best shift .* search limit|the whole-file score has)') {
                 $r.Warning = $true
             }
         }
@@ -701,7 +713,7 @@ $BatchHelpers = {
     # the neighbour would very likely lose again. Returns the reason, or '' to encode it.
     function Get-KnownRungReason {
         param($Ref, [hashtable]$Tried, [int]$Rung, [string[]]$Names, [double]$MinMean, [double]$MinP1, [double]$MinMin,
-            [double]$MaxPct = 65, [double]$SimilarPct = 3, [double]$SimilarVmaf = 1)
+            [double]$MaxPct = 65, [double]$SimilarPct = 3, [double]$SimilarVmaf = 1, [double]$NearMissPct = 1)
         if ($SimilarPct -le 0 -or -not $Ref -or [Math]::Abs($Rung - $Ref.Pick) -ne 1) { return '' }
         $p = [int]$Ref.Pick
         $mine = $Tried[$p]; $theirs = $Ref.Rows[$p]; $theirsN = $Ref.Rows[$Rung]
@@ -712,6 +724,13 @@ $BatchHelpers = {
         if ($null -eq $mine.Pct -or $null -eq $theirs.Pct -or [Math]::Abs($mine.Pct - $theirs.Pct) -gt $SimilarPct) { return '' }
         if ($Rung -lt $p) {
             foreach ($k in 'Mean', 'P1', 'Min') { if ($mine.$k -gt $theirs.$k + $SimilarVmaf) { return '' } }
+            # Their weaker rung only just failed on quality (and fit the size cap): could pass here.
+            if ($NearMissPct -gt 0 -and $null -ne $theirsN.Pct -and $theirsN.Pct -le $MaxPct) {
+                $missed = @(foreach ($m in @(@('Mean', $MinMean), @('P1', $MinP1), @('Min', $MinMin))) {
+                    $bar = [double]$m[1]
+                    if ($bar -gt 0 -and [double]$theirsN.($m[0]) -lt $bar) { ($bar - [double]$theirsN.($m[0])) / $bar * 100 } })
+                if ($missed.Count -and -not @($missed | Where-Object { $_ -gt $NearMissPct }).Count) { return '' }
+            }
         }
         $nTheirs = if ($null -ne $theirsN.Pct) { '{0:0.#}%' -f $theirsN.Pct } else { 'n/a' }
         "skipped {0}: {1} was {2:0.#}% at {3} (this title {4:0.#}%) and its {0} ({5}, {6:0.00}/{7:0.00}/{8:0.00}) lost to {3}" -f `
@@ -1954,7 +1973,7 @@ function Get-LadderStepFor([hashtable]$Tried, $Start, [string]$Folder, [string]$
             if ($why) { $Skipped[$i] = $why; continue }
         }
         if (-not $ref) { return $i }
-        $why = Get-KnownRungReason -Ref $ref -Tried $Tried -Rung $i -Names $specNames -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -SimilarPct $SimilarPct -SimilarVmaf $SimilarVmaf
+        $why = Get-KnownRungReason -Ref $ref -Tried $Tried -Rung $i -Names $specNames -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -SimilarPct $SimilarPct -SimilarVmaf $SimilarVmaf -NearMissPct $NearMissPct
         if (-not $why) { return $i }
         $Skipped[$i] = $why
     }
@@ -2614,7 +2633,7 @@ function Get-TitleOutcome($t) {
     $o.Extras = Get-TitleExtras $t $fd
     $rj = Read-JsonFile (Join-Path $t.TitleDir "$($t.Base).results.json")
     if ($fd -and $fd.State -eq 'done') {
-        $o.Outcome = switch ([string]$fd.Variant) { 'source' { 'Finished with the source' } 'p7 original' { 'Kept as Dolby Vision 7' } default { 'Finished' } }
+        $o.Outcome = switch ([string]$fd.Variant) { 'source' { 'Finished with the source' } 'p7 original' { 'Kept as Dolby Vision 7' } 'manual' { 'Finished by hand' } default { 'Finished' } }
         $o.Pick = [string]$fd.Variant; $o.Final = [string]$fd.Final; $o.Rows = @($fd.Variants); $o.Resolved = $true
     } else {
         if ($rj) { $o.Rows = @($rj.Variants) }
@@ -2674,8 +2693,9 @@ function Write-BatchReport([string]$Dir, $Titles, [bool]$Touched) {
     $md.Add("- **Updated:** $(Get-Date -Format 'yyyy-MM-dd HH:mm') (run $runId)")
     $md.Add("- **Mode:** $(if ($fixedMode) { 'fixed variants' } else { "ladder search ($(($specs | ForEach-Object { $_.Name }) -join ', '))" })")
     $md.Add("- **Bar:** mean >= $MinMean, p1 >= $MinP1, min >= $MinMin, video <= $MaxPct% of the source's; target $TargetPct%; top bar mean >= $TopMean, p1 >= $TopP1, min >= $TopMin.")
-    $md.Add(("- **Titles:** {0} total: {1} finished, {2} finished with the source, {3} kept as Dolby Vision 7, {4} nothing passed (original kept), {5} skipped" -f
-        $outs.Count, (& $count 'Finished'), (& $count 'Finished with the source'), (& $count 'Kept as Dolby Vision 7'), (& $count 'No variant passed'), (& $count 'Skipped')))
+    $md.Add(("- **Titles:** {0} total: {1} finished, {2} finished with the source, {3} kept as Dolby Vision 7, {4} nothing passed (original kept), {5} skipped{6}" -f
+        $outs.Count, (& $count 'Finished'), (& $count 'Finished with the source'), (& $count 'Kept as Dolby Vision 7'), (& $count 'No variant passed'), (& $count 'Skipped'),
+        $(if (& $count 'Finished by hand') { ", $(& $count 'Finished by hand') finished by hand" })))
     if ($nSized) {
         $md.Add(("- **Video:** {0} finished title(s): sources {1:N1} GB -> {2:N1} GB ({3:N0}% of the source, {4:N1} GB saved)" -f
             $nSized, $srcGB, $finGB, (100 * $finGB / [Math]::Max([double]0.001, $srcGB)), ($srcGB - $finGB)))
@@ -2713,6 +2733,7 @@ function Write-BatchReport([string]$Dir, $Titles, [bool]$Touched) {
         $line = switch -Wildcard ($o.Outcome) {
             'Finished'                 { "Finished: $($o.Pick) -> ``$($o.Final)``" }
             'Finished with the source' { "Finished with the source (no variant passed) -> ``$($o.Final)``" }
+            'Finished by hand'         { "Finished by hand (marked with -MarkFinished) -> ``$($o.Final)``" }
             'Kept as Dolby Vision 7'   { "Kept as Dolby Vision 7 (audio only) -> ``$($o.Final)``" }
             default                    { "$($o.Outcome)$(if ($o.Detail) { ": $($o.Detail)" })" }
         }
@@ -2800,9 +2821,25 @@ if ($ReportsOnly) {
     foreach ($grp in @(Get-ReportGroups)) {
         if (-not [IO.Directory]::Exists($grp.Dir)) { $missing++; continue }
         $open = @($grp.Titles | Where-Object { $fd = Read-JsonFile $_.FinalJson; -not ($fd -and $fd.State -eq 'done') })
+        if ($open.Count -and $MarkFinished) {
+            foreach ($t in $open) {
+                $fin = Join-Path $grp.Dir "$($t.Base).mkv"
+                if (-not [IO.File]::Exists($fin)) { continue }
+                $rj = Read-JsonFile (Join-Path $t.TitleDir "$($t.Base).results.json")
+                $doc = [ordered]@{
+                    Title = $t.Rel; Source = $t.File; Variant = 'manual'; Final = $fin; State = 'done'
+                    Note = 'finished by hand (-MarkFinished)'; Time = (Get-Date).ToString('s')
+                    Variants = $(if ($rj -and $rj.Variants) { @($rj.Variants) } else { @() })
+                }
+                [IO.File]::WriteAllText($t.FinalJson, ($doc | ConvertTo-Json -Depth 6), $script:Utf8)
+                Write-Log ("MARKED {0}: finished by hand ({1})" -f $t.Rel, $fin) 'Cyan'
+            }
+            $open = @($grp.Titles | Where-Object { $fd = Read-JsonFile $_.FinalJson; -not ($fd -and $fd.State -eq 'done') })
+        }
         if ($open.Count) {
             $left++
-            Write-Log ("REPORT {0}: {1} of {2} title(s) not finished there ({3}); left alone" -f $grp.Dir, $open.Count, @($grp.Titles).Count, (($open | ForEach-Object { $_.Base }) -join '; ')) 'DarkYellow'
+            Write-Log ("REPORT {0}: {1} of {2} title(s) not finished there ({3}); left alone{4}" -f $grp.Dir, $open.Count, @($grp.Titles).Count, (($open | ForEach-Object { $_.Base }) -join '; '),
+                $(if (-not $MarkFinished) { ' (add -MarkFinished to count ones you finished by hand)' } else { ' (no "<name>.mkv" in the folder for those)' })) 'DarkYellow'
             continue
         }
         try {
