@@ -189,6 +189,22 @@
     ffmpeg writes its defaults (dialogue level -31, i.e. no attenuation: typically several dB
     louder than the disc's tracks). The core's dynamic range compression values can't be
     carried over (ffmpeg's AC-3 encoder doesn't write them).
+.PARAMETER LossyPerMaster
+    A lossy track for EVERY lossless master, not just the main one: e.g. a disc with a Japanese
+    TrueHD 5.1 and an English TrueHD 2.0 gets an AC-3 5.1 and an AAC 2.0, so viewers can switch
+    between the two mixes. Each is made like the default track: the master's own AC-3 core
+    copied when it's good enough, else a new track encoded from the master: AC-3 (with the
+    core's dialogue level and downmix settings, or the TrueHD's own dialogue level) for surround
+    and for a stereo TrueHD (-Ac3StereoBitrate, so it plays at the same loudness as the rest:
+    ffmpeg's AAC can't carry a dialogue level); AAC for other stereo masters. A core under
+    -CoreMinKbps (or missing) is re-encoded instead of being an error. The lossy tracks come
+    first, the main master's first (see -FewestChannelsFirst), and that one is the default.
+    The masters are still kept unless -PassthruMasters None. A master's own lossy core isn't
+    also kept as a commentary. Works in single and batch mode.
+.PARAMETER FewestChannelsFirst
+    Order the lossy tracks from fewest channels to most, so the one with the fewest (e.g. the
+    stereo mix) comes first and is the default. Mainly with -LossyPerMaster; without it there's
+    only one lossy track. Works in single and batch mode.
 .PARAMETER AacBitrate
     AAC bitrate in kbps for a new default track made from a stereo source.
     Mono sources are capped at 256 (AAC's per-channel limit).
@@ -196,6 +212,9 @@
 .PARAMETER Ac3Bitrate
     AC-3 (Dolby Digital) bitrate in kbps for a new 5.1 default track.
     Allowed: 384, 448, 512, 576, 640 (640 is AC-3's maximum). Default: 640.
+.PARAMETER Ac3StereoBitrate
+    Bitrate (kbps) of a new AC-3 2.0 track: with -LossyPerMaster, a stereo TrueHD master's lossy
+    track. Default: 320
 .PARAMETER DialNorm
     The dialogue level (dB) written on a new AC-3 track, for when there's no AC-3 core to copy
     it from (e.g. the core was dropped from the source MKV): players turn an AC-3 down by -31 minus
@@ -275,9 +294,12 @@ param(
     [string[]]$PassthruTitles = @(),
     [ValidateSet('Auto', 'None')][string]$PassthruMasters = 'Auto',
     [switch]$NewDefaultTrack,
+    [switch]$LossyPerMaster,
+    [switch]$FewestChannelsFirst,
     [string]$DestFilter = '*',
     [ValidateRange(96, 576)][int]$AacBitrate = 512,
     [ValidateSet(384, 448, 512, 576, 640)][int]$Ac3Bitrate = 640,
+    [ValidateSet(192, 224, 256, 320, 384, 448, 512, 576, 640)][int]$Ac3StereoBitrate = 320,
     [ValidateRange(-31, -1)][int]$DialNorm = -31,
     [ValidatePattern('^[a-z]{3}$')][string]$AudioLanguage = 'eng',
     [switch]$Replace,
@@ -565,7 +587,7 @@ function Get-TrueHdDialNorm([string]$File, [int]$Pos) {
         & $script:ffmpeg -v quiet -nostdin -i $File -map "0:a:$Pos" -c copy -t 1 -f truehd -y $tmp 2>$null | Out-Null
         if (-not [IO.File]::Exists($tmp)) { return $null }
         Read-TrueHdDialNorm ([IO.File]::ReadAllBytes($tmp))
-    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue -WhatIf:$false }
 }
 
 # An AC-3 track's playback metadata, from its first frame's header (BSI): what MediaInfo
@@ -579,7 +601,7 @@ function Get-Ac3Metadata([string]$File, [int]$Pos) {
         & $script:ffmpeg -v quiet -nostdin -i $File -map "0:a:$Pos" -c copy -t 1 -f ac3 -y $tmp 2>$null | Out-Null
         if (-not [IO.File]::Exists($tmp)) { return $null }
         $b = [IO.File]::ReadAllBytes($tmp)
-    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue -WhatIf:$false }
     $start = -1
     for ($i = 0; $i -lt $b.Length - 16; $i++) { if ($b[$i] -eq 0x0B -and $b[$i + 1] -eq 0x77) { $start = $i; break } }
     if ($start -lt 0) { return $null }
@@ -1051,6 +1073,13 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     }
 
     # ------------------------------------------------ default (compatibility) track
+    # The lossy track made for a master (the main track; with -LossyPerMaster, each master).
+    # (-IsMain:$false for another master: the "same mix" checks compare with the main track, so
+    # they say nothing about it. Its lossy track is its AC-3 core, or a new encode.)
+    function New-CompatTrack($pick, [bool]$IsMain = $true) {
+    $srcLabel = "$($pick.Name) $(Get-ChannelLabel $pick.Channels)"
+    $isTrueHdMain = ($pick.Lossless -and $pick.Codec -eq 'truehd' -and $pick.Channels -ge 6)
+    $pickMaster = ($pick.Lossless -or $pick.Keep)
     $copyable = $pick.Codec -in @('ac3', 'eac3', 'aac')
     $compat = $null
 
@@ -1068,22 +1097,29 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $core = $audio[$pick.Pos + 1]
             $how = 'the AC-3 right after the TrueHD'
         }
-        if (-not $core) {
+        # (-LossyPerMaster: a missing or too-small core is re-encoded instead of being an error)
+        if (-not $core -and -not $LossyPerMaster) {
             throw "The TrueHD master (audio $($pick.Pos)) has no AC-3 core track. The source MKV is probably missing tracks (or use -NewDefaultTrack to encode a new AC-3 from the TrueHD)."
         }
-        if ($core.BitRate -gt 0 -and $core.BitRate -lt $CoreMinKbps * 1000) {
-            throw ("The TrueHD's AC-3 core (audio {0}) is {1} kbps, below {2}. The source MKV is probably missing tracks (or use -NewDefaultTrack to encode a new AC-3 from the TrueHD)." -f
-                $core.Pos, [math]::Round($core.BitRate / 1000), $CoreMinKbps)
+        if ($core -and $core.BitRate -gt 0 -and $core.BitRate -lt $CoreMinKbps * 1000) {
+            if (-not $LossyPerMaster) {
+                throw ("The TrueHD's AC-3 core (audio {0}) is {1} kbps, below {2}. The source MKV is probably missing tracks (or use -NewDefaultTrack to encode a new AC-3 from the TrueHD)." -f
+                    $core.Pos, [math]::Round($core.BitRate / 1000), $CoreMinKbps)
+            }
+            Write-Host ("  audio {0}'s AC-3 core (audio {1}) is {2} kbps, below {3}: a new one is encoded (-LossyPerMaster)" -f $pick.Pos, $core.Pos, [math]::Round($core.BitRate / 1000), $CoreMinKbps)
+            $core = $null
         }
-        $compat = New-OutputTrack 'source' $core.Pos 'copy' 0 0 "$($core.Name) $(Get-ChannelLabel $core.Channels)" `
-            "audio $($core.Pos): the TrueHD's AC-3 core ($how), copied" "ac3 $($core.Channels)"
-    } elseif ($pickMaster -and $pick.Channels -ge 6) {
+        if ($core) {
+            $compat = New-OutputTrack 'source' $core.Pos 'copy' 0 0 "$($core.Name) $(Get-ChannelLabel $core.Channels)" `
+                "audio $($core.Pos): the TrueHD's AC-3 core ($how), copied" "ac3 $($core.Channels)"
+        }
+    } elseif ($IsMain -and $pickMaster -and $pick.Channels -ge 6) {
         $same = Select-SameMix @($audio | Where-Object { $_.Codec -eq 'ac3' -and $_.Channels -eq 6 })
         if ($same) {
             $compat = New-OutputTrack 'source' $same.Pos 'copy' 0 0 "$($same.Name) $(Get-ChannelLabel $same.Channels)" `
                 "audio $($same.Pos): existing AC-3, same mix as the main track, copied" "ac3 6"
         }
-    } elseif ($pickMaster -and $pick.Channels -le 2) {
+    } elseif ($IsMain -and $pickMaster -and $pick.Channels -le 2) {
         $same = Select-SameMix @($audio | Where-Object {
             -not $_.Lossless -and -not $_.Keep -and $_.Codec -ne 'dts' -and $_.Channels -eq $pick.Channels })
         if ($same) {
@@ -1092,8 +1128,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         }
     }
 
+    # -LossyPerMaster: a stereo TrueHD master gets AC-3 2.0, not AAC: AC-3 carries a dialogue
+    # level (copied from its core, or read from the TrueHD), so it plays at the same loudness as
+    # the other tracks; ffmpeg's AAC can't carry one.
+    $stereoAc3 = ($LossyPerMaster -and $pick.Lossless -and $pick.Codec -eq 'truehd' -and $pick.Channels -eq 2)
     if (-not $compat) {
-        if ($pick.Channels -le 2) {
+        if ($pick.Channels -le 2 -and -not $stereoAc3) {
             $kbps = $AacBitrate
             if ($pick.Channels -eq 1) { $kbps = [Math]::Min($AacBitrate, 256) }
             $compat = New-OutputTrack 'encode' $pick.Pos 'aac' $kbps 0 "AAC $(Get-ChannelLabel $pick.Channels)" `
@@ -1102,12 +1142,13 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $ac = 0
             if ($pick.Channels -gt 6) { $ac = 6 }
             $outCh = [Math]::Min($pick.Channels, 6)
-            $compat = New-OutputTrack 'encode' $pick.Pos 'ac3' $Ac3Bitrate $ac "Dolby Digital $(Get-ChannelLabel $outCh)" `
-                "new, encoded from $srcLabel at $Ac3Bitrate kbps" "ac3 $outCh"
+            $kb = $(if ($outCh -le 2) { $Ac3StereoBitrate } else { $Ac3Bitrate })
+            $compat = New-OutputTrack 'encode' $pick.Pos 'ac3' $kb $ac "Dolby Digital $(Get-ChannelLabel $outCh)" `
+                "new, encoded from $srcLabel at $kb kbps" "ac3 $outCh"
             if ($script:DialNormGiven) { $compat.Note += "; dialnorm $DialNorm dB (-DialNorm)" }
             # From a TrueHD with an AC-3 core: the core's dialogue level and downmix metadata,
             # so the new track plays at the same loudness (see -NewDefaultTrack).
-            if ($isTrueHdMain) {
+            if ($isTrueHdMain -or $stereoAc3) {
                 $core = @($audio | Where-Object {
                     $_.Codec -eq 'ac3' -and $_.Pos -ne $pick.Pos -and $pick.SourceId -and $_.SourceId -eq $pick.SourceId }) | Select-Object -First 1
                 if (-not $core -and ($pick.Pos + 1) -lt $audio.Count -and $audio[$pick.Pos + 1].Codec -eq 'ac3') { $core = $audio[$pick.Pos + 1] }
@@ -1124,7 +1165,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
                 if (-not $meta -and -not $script:DialNormGiven) {
                     $tdn = Get-TrueHdDialNorm $SourceFile $pick.Pos
                     $dn = 0
-                    if ($tdn) { foreach ($v in $tdn.D6, $tdn.D8, $tdn.D2) { if ($v -lt 0 -and $v -ge -31) { $dn = $v; break } } }
+                    $order = $(if ($outCh -le 2) { @($tdn.D2, $tdn.D6, $tdn.D8) } else { @($tdn.D6, $tdn.D8, $tdn.D2) })
+                    if ($tdn) { foreach ($v in $order) { if ($v -lt 0 -and $v -ge -31) { $dn = $v; break } } }
                     if ($dn -lt 0) {
                         $compat.EncArgs = @('-dialnorm', "$dn")
                         $compat.Note += "; the TrueHD's dialogue level ($dn dB; no AC-3 core)"
@@ -1135,7 +1177,28 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             }
         }
     }
+    $compat
+    }
+    $compat = New-CompatTrack $pick
+    # -LossyPerMaster: one for each other master too. -FewestChannelsFirst: stereo before
+    # surround. The first one is the default.
+    $compats = @($compat)
+    if ($LossyPerMaster) {
+        foreach ($m in @($masters | Where-Object { $_.Pos -ne $pick.Pos })) {
+            Write-Host "Lossy track for master audio $($m.Pos) ($($m.Name) $(Get-ChannelLabel $m.Channels)) (-LossyPerMaster):"
+            $compats += New-CompatTrack $m $false
+        }
+    }
+    if ($FewestChannelsFirst -and $compats.Count -gt 1) {
+        $i = 0
+        $compats = @($compats | ForEach-Object { [pscustomobject]@{ T = $_; Ch = [int](($_.Layout -split ' ')[1]); I = $i++ } } |
+            Sort-Object Ch, I | ForEach-Object { $_.T })
+    }
+    foreach ($c in $compats) { $c.IsDefault = $false }
+    $compat = $compats[0]
     $compat.IsDefault = $true
+    # The lossy cores of the masters that got their own lossy track: not commentary candidates.
+    $compatSrcIds = @(if ($LossyPerMaster) { $masters | Where-Object { $_.SourceId } | ForEach-Object { $_.SourceId } })
 
     # Kept as masters: every lossless track, main one first. With no lossless track, a
     # main track that had to be converted (e.g. lossy DTS) is kept as-is instead.
@@ -1164,7 +1227,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         }
     } elseif ($script:PassMode -eq 'Auto') {
         foreach ($cand in $toCompare) {
-            if ($cand.Channels -le 2 -and $verdicts[$cand.Pos].Kind -eq 'commentary' -and $cand.Pos -ne $compat.SrcPos) {
+            if ($cand.Channels -le 2 -and $verdicts[$cand.Pos].Kind -eq 'commentary' -and $cand.Pos -notin @($compats | ForEach-Object { $_.SrcPos }) -and
+                -not ($cand.SourceId -and $cand.SourceId -in $compatSrcIds)) {
                 $passTracks.Add($cand)
                 # Numbered in the source's order (Commentary1, Commentary2, ...), like
                 # Convert-Subtitles' commentary .srt files, so the two line up.
@@ -1209,7 +1273,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 
     # ------------------------------------------------ plan the output audio
     $outputs = [Collections.Generic.List[object]]::new()
-    $outputs.Add($compat)
+    foreach ($c in $compats) { $outputs.Add($c) }
     for ($k = 0; $k -lt $passTracks.Count; $k++) {
         $pt = $passTracks[$k]
         $track = New-OutputTrack 'source' $pt.Pos 'copy' 0 0 $passTitles[$k] `
@@ -1242,7 +1306,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
 
     # e.g. "Dolby Digital 5.1 (from DTS-HD MA 5.1), Commentary, DTS-HD MA 5.1"
     $trackLabel = (@($outputs | ForEach-Object {
-        if ($_.From -eq 'encode' -and $_.SrcPos -eq $pick.Pos) { "$($_.Title) (from $srcLabel)" } else { $_.Title }
+        if ($_.From -eq 'encode' -and -not $_.IsCommentary -and ($_.SrcPos -eq $pick.Pos -or $_ -in $compats)) { "$($_.Title) (from $($audio[$_.SrcPos].Name) $(Get-ChannelLabel $audio[$_.SrcPos].Channels))" } else { $_.Title }
     })) -join ', '
 
     # For -Plumbing: the planned tracks with their roles, and what was dropped and why.
@@ -1250,7 +1314,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $o = $outputs[$i]
         $s = $audio[$o.SrcPos]
         $role = 'master'
-        if ($o.IsDefault) { $role = 'default' } elseif ($o.IsCommentary) { $role = 'commentary' }
+        if ($o.IsDefault) { $role = 'default' } elseif ($o.IsCommentary) { $role = 'commentary' } elseif ($o -in $compats) { $role = 'alternate' }
         $srcName = "$($s.Name) $(Get-ChannelLabel $s.Channels)"
         $outCh = [int](($o.Layout -split ' ')[1])
         $kb = $o.Kbps
@@ -1293,6 +1357,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $v = $verdicts[$cand.Pos]
         $fate = 'dropped'
         if ($cand.Pos -eq $compat.SrcPos -and $compat.From -eq 'source') { $fate = "used as the default track" }
+        elseif (@($compats | Where-Object { $_.SrcPos -eq $cand.Pos -and $_.From -eq 'source' }).Count) { $fate = "used as a lossy track (-LossyPerMaster)" }
         elseif ($cand.Pos -in $passPos) { $fate = "$keptWord as commentary" }
         $reportLines.Add(("{0} -> {1} (louder {2:N1}%, quieter {3:N1}%, louder per clip {4}, median {5:N1}%) -> {6}" -f
             (Get-TrackDesc $cand), $v.Kind, $v.Louder, $v.Quieter, $v.Clips, $v.Median, $fate))
