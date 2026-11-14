@@ -83,14 +83,26 @@ Storage is (no longer) cheap. Simple as that. I also have not seen a good reason
 Netflix says a score difference of 6 is noticeable by your eyes. That would mean 94 is a better target Mean. I may do that in the future but 93.5 has suited me well. And again, it's just a bar, the encode has to be _greater_ than that. They usually are 94+.
 
 ### Compatibility
-1. Audio is re-organized so an AC3 5.1 track is always available and is the default (unless the masters are \<6 channels).
-    1. Dolby TrueHD w/ Atmos and DTS:X Masters are preserved as-is (because object based audio encoding is problematic for the moment without a Dolby license $$$).
-    1. Lossless (LPCM, etc) 5.1 masters are encoded to Opus.
-    1. Stereo masters will be encoded to AC3 or AAC depending on the source (Dolby tracks carry dialog normalization metadata and converting them to AAC loses that).
-    1. Non-masters are scanned to determine if they are commentary tracks (I've seen roughly 98% success rate here), and encoded appropriately if needed.
-    1. Any other track not deemed a master or commentary is dropped. This includes tracks for the visually impaired.
+1. Audio is re-organized so an AC3 5.1 track is always available and is the default (unless the masters are \<6 channels). Stereo-only masters will get either AC3 2.0 or AAC depending on if they are Dolby or other (DTS, LPCM, etc). See the Audio section below for more details.
 1. Dolby Vision profile 7.6 are converted or baked to profile 8.1 depending on if they are MEL or either FEL.
 1. Jellyfin support. This primarily means file naming is expected to match what they want, but also the generated subtitles are external files. It'll use the filenames you feed into it, but subtitles will has suffixes based on what Jellyfin expects.
+
+### Audio
+The logic at the moment flows something like this (may change in the future, see `Add-BluRayAudio.ps1` for most up-to-date practice):
+
+Every audio track is inspected to determine what type of a track it is.
+- Masters are defined by greatest number of channels and lossless-ness. But not all masters are lossless nor multi-channel.
+  - Dolby TrueHD w/ Atmos and DTS:X Masters are preserved as-is (because object-based audio encoding is problematic for the moment without a Dolby license $$$).
+  - Dolby TrueHD masters have an AC3 core that is used as the new default track (for compatibility). If that core is \<448 kbps, it is re-encoded from the master at 640 kbps (for 5.1). Dialog normalization metadata is left intact (copied).
+  - Non-Dolby masters get a new AC3 track encoded for the default (again for compatibility).
+  - DTS:HD (non-X) is left as-is for now, but may change in the future to Opus for space savings.
+  - Stereo masters will get encoded to AAC (for compatibility) and set as the default track if no multi-channel master exists.
+  - Any other lossless format (LPCM, etc) is also encoded to Opus as the "higher quality" track for devices that support Opus.
+  - Multiple lossless masters are all kept (rare, but I've seen it), encoded or not based on the rules above.
+  - Lossy masters are generally kept as is, but an AC3 track may be added (transcoded) if needed.
+- Non-masters/lossy tracks are checked to determine what they are.
+  - If a track is deemed to be a commentary track, it is kept and numbered sequentially for now (as it cannot determine what type of commentary it is).
+  - Tracks not thought to be commentary tracks and also not a solo lossy master is discarded (not copied).
 
 ### Limitations
 
@@ -100,6 +112,7 @@ Netflix says a score difference of 6 is noticeable by your eyes. That would mean
 ## TODO
 
 1. Incorporate a local AI model to increase reliability in determining what a subtitle file is (main track, forced track, commentary, closed captioning, etc)
+1. Incorporate another or the same local AI to determine what type of commentary track a track is- whether Director's or Filmmaker, actor(s), etc. If subtitles exist for the commentary tracks, they will need to be named the same.
 1. Go full Linux. This will happen when I finally ditch windows. Soon™
 
 ## What's here
