@@ -30,7 +30,7 @@ I couldn't find a tool that did everything that was needed. I previously looked 
 
 [Handbrake](https://handbrake.fr/) and [FastFlix](https://github.com/cdgriffith/FastFlix) aren't really made for encoding batches when the content can vary file to file. Both are very limiting in terms of choosing audio tracks and the logic around that. So, I solved it myself here (see `Add-BluRayAudio.ps1`). They also don't do subtitles, and you'd still need Subtitle Edit in some fashion.
 
-Credit where it is due, FastFlix helped me solve one component of how to do Dolby Vision with NVENC using [Rigaya's NVEnc](https://github.com/rigaya/NVEnc). Still needed to convert the profile first though, which FastFlix/Rigaya can't do. This pipeline can though!
+Credit where it is due, FastFlix helped me solve one component of how to do Dolby Vision with NVENC using [Rigaya's NVEncC](https://github.com/rigaya/NVEnc). Still needed to convert the profile first though, which FastFlix/Rigaya can't do. This pipeline can though!
 
 ## Why NVENC and not software encoding?
 
