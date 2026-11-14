@@ -309,6 +309,14 @@ param(
     [switch]$Force
 )
 
+# Defaults from the settings file (encode-settings.ini) for parameters not given, and paths
+# as typed or tab-completed: Shared.ps1, next to this script.
+if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
+. (Join-Path $PSScriptRoot 'Shared.ps1')
+$script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
+$Source = Resolve-InputPath $Source; $Dest = Resolve-InputPath $Dest; $LogPath = Resolve-InputPath $LogPath
+
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $script:Cmdlet = $PSCmdlet
@@ -1402,7 +1410,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
     # ------------------------------------------------ build the commands
     $tempDir = [IO.Path]::GetTempPath()
     # All new tracks come from ONE ffmpeg run with one output per track, so the source
-    # (often on the NAS) is read once, however many tracks are encoded.
+    # (often on a network drive) is read once, however many tracks are encoded.
     $encodeCmds = [Collections.Generic.List[object]]::new()
     $enc = [Collections.Generic.List[string]]::new()
     # -copyts keeps the source track's start time, so a track that starts late stays in sync.

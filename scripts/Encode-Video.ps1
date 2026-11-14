@@ -63,7 +63,7 @@
       Output     the encode
 
 .EXAMPLE
-    .\Encode-Video.ps1 -Source 'S:\Sources\Movie.mkv' -Output 'D:\enc\Movie.mkv' -EncoderArgs '--cqp','24','--aq','--aq-strength','8' -Crop '0,140,0,140'
+    .\Encode-Video.ps1 -Source 'S:\Sources\Movie.mkv' -Output 'E:\Encodes\Movie.mkv' -EncoderArgs '--cqp','24','--aq','--aq-strength','8' -Crop '0,140,0,140'
 #>
 [CmdletBinding()]
 param(
@@ -83,6 +83,15 @@ param(
     [hashtable]$Status = @{},
     [switch]$Plumbing
 )
+
+# Defaults from the settings file (encode-settings.ini) for parameters not given, and paths
+# as typed or tab-completed: Shared.ps1, next to this script.
+if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
+. (Join-Path $PSScriptRoot 'Shared.ps1')
+$script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
+foreach ($n in 'Source', 'Output', 'VmafFile', 'TempDir', 'LogPath', 'StatusFile') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly)) }
+foreach ($n in 'NVEncC') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly) -Program) }
 
 # 'Continue', not 'Stop': in Windows PowerShell, 2>&1 on a native program raises terminating
 # errors under 'Stop'. Failures are checked explicitly.

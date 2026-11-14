@@ -104,6 +104,33 @@
 
 set -u
 
+# Settings file: the [compare_encode] section of the shared encode-settings.ini (the same file
+# the PowerShell scripts read). Found at $ENCODE_SETTINGS (Encode-Batch passes it on; a Windows
+# path works too), else next to this script (symlinks followed). Only the keys below are read,
+# and an environment variable that's already set wins. Same names as the env overrides above.
+load_settings() {
+  local f="${ENCODE_SETTINGS:-}" line key val section="" keys=" FFMPEG FFMPEG_CUDA CLIP SUB THREADS MODEL MODEL_4K_MIN_WIDTH SIZE_SCOPE VMAF_CUDA CUDA_FMT CUDA_DEVICE CUDA_DECODE REF_CFR SHIFT_MAX PROBE_LEN "
+  if [ -z "$f" ]; then
+    f="$(dirname "$(readlink -f "$0")")/encode-settings.ini"
+  elif [[ "$f" =~ ^[A-Za-z]:[\\/] ]] && command -v wslpath >/dev/null 2>&1; then
+    f=$(wslpath -u "$f")
+  fi
+  [ -r "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ''|'#'*|';'*) continue ;; esac
+    if [[ "$line" =~ ^\[[[:space:]]*([^]]*[^][:space:]])[[:space:]]*\]$ ]]; then section=${BASH_REMATCH[1]}; continue; fi
+    [ "$section" = "compare_encode" ] || continue
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[2]}
+    if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then val=${BASH_REMATCH[1]}; fi
+    case "$keys" in *" $key "*) ;; *) echo "note: $f: [compare_encode] $key isn't a setting here; ignored" >&2; continue ;; esac
+    if [ -z "${!key+x}" ]; then printf -v "$key" '%s' "$val"; export "${key?}"; fi
+  done < "$f"
+}
+load_settings
+
 FFMPEG=${FFMPEG:-ffmpeg}
 FPS=${FPS:-24000/1001}
 CLIP=${CLIP:-60}
@@ -406,8 +433,8 @@ run_score_gpudec() {
   return $rc
 }
 
-quick() {  # prints mean VMAF or nothing
-  run_score "$1" "$2" "$3" 20 4 2>&1 | grep -o 'VMAF score: [0-9.]*' | awk '{print $3}'
+quick() {  # prints mean VMAF or nothing (a PROBE_LEN-second window, default 20)
+  run_score "$1" "$2" "$3" "${PROBE_LEN:-20}" 4 2>&1 | grep -o 'VMAF score: [0-9.]*' | awk '{print $3}'
 }
 
 # ---- Alignment probing (shared by per-clip mode and --full mode) ----
@@ -472,6 +499,68 @@ probe_shift_from_start() {
   echo "$best_shift $best_score $second"
 }
 
+# full_score_parts: the --full score with the shift(s) settled in score_pair (CHOSEN, or the
+# parts in BOUNDS / SEGSH), into $WORK/clip_<start>.json.
+full_score_parts() {
+  if [ ${#BOUNDS[@]} -eq 0 ]; then
+    IFS='|' read -r DT RT <<< "$(trim_for_shift "$CHOSEN")"
+    echo -n "Scoring the entire file (${DO}s) ... "
+    run_score "$DT" "$RT" 0 "$DO" "$SUB" "$WORK/clip_0.json" 2>>"$WORK/errors.log"
+    if [ -s "$WORK/clip_0.json" ]; then echo "done"; else echo "FAILED (see $WORK/errors.log)"; fi
+  else
+    # Boundaries can be fractions of a second. The few frames right at a change (6 each side)
+    # are left out: exactly where it falls between them isn't known, and one frame scored at the
+    # wrong shift would set the min.
+    local starts=(0 "${BOUNDS[@]}") k st en a b len g
+    g=$(awk -v f="${REALFPS:-$FPS}" 'BEGIN { n = split(f, p, "/"); r = (n == 2) ? p[1] / p[2] : p[1]; printf "%.4f", 6 / r }')
+    for k in "${!starts[@]}"; do
+      st=${starts[$k]}
+      if [ $(( k + 1 )) -lt ${#starts[@]} ]; then en=${starts[$((k + 1))]}; else en=$DO; fi
+      a=$(awk -v s="$st" -v g="$g" -v k="$k" 'BEGIN { printf "%.3f", (k > 0) ? s + g : s }')
+      b=$(awk -v e="$en" -v g="$g" -v last=$(( k + 1 == ${#starts[@]} )) 'BEGIN { printf "%.3f", last ? e : e - g }')
+      len=$(awk -v a="$a" -v b="$b" 'BEGIN { printf "%.3f", b - a }')
+      IFS='|' read -r DT RT <<< "$(trim_for_shift "${SEGSH[$k]}")"
+      echo -n "Scoring ${st}s-${en}s with shift ${SEGSH[$k]} ... "
+      run_score "$DT" "$RT" "$a" "$len" "$SUB" "$WORK/clip_${st%.*}.json" 2>>"$WORK/errors.log"
+      if [ -s "$WORK/clip_${st%.*}.json" ]; then echo "done"; else echo "FAILED (see $WORK/errors.log)"; fi
+    done
+  fi
+}
+
+# low_runs <json> <fps>: the stretches (seconds, "start end" per line) where a whole-file
+# score stays under 20 for 10s or more (gaps of a few sampled frames bridged).
+low_runs() {
+  python3 - "$1" "$2" <<'PYEOF' 2>/dev/null
+import json, sys
+fps = sys.argv[2].split("/"); fps = float(fps[0]) / float(fps[1]) if len(fps) == 2 else float(fps[0])
+fr = json.load(open(sys.argv[1]))["frames"]
+runs, cur, gap = [], None, 0
+for f in fr:
+    n, v = f.get("frameNum", 0), f["metrics"]["vmaf"]
+    if v < 20:
+        if cur is None: cur = [n, n]
+        cur[1] = n; gap = 0
+    elif cur is not None:
+        gap += 1
+        if gap > 3: runs.append(cur); cur = None; gap = 0
+if cur is not None: runs.append(cur)
+step = (fr[1].get("frameNum", 1) - fr[0].get("frameNum", 0)) if len(fr) > 1 else 1
+for a, b in runs:
+    # (the change lies between the last good sample and the first bad one: halfway)
+    if (b - a) / fps >= 10: print(f"{max(0, a - step / 2) / fps:.3f} {(b + step / 2) / fps:.3f}")
+PYEOF
+}
+
+# low_frame_pct <json>...: the percentage of scored frames under 20 (0 if none or no files).
+low_frame_pct() {
+  if [ $# -eq 0 ] || [ ! -s "$1" ]; then echo 0; return; fi
+  python3 - "$@" <<'PYEOF' 2>/dev/null || echo 0
+import json, sys
+v = [f["metrics"]["vmaf"] for p in sys.argv[1:] for f in json.load(open(p))["frames"]]
+print(f"{(sum(1 for x in v if x < 20) / len(v) * 100) if v else 0:.2f}")
+PYEOF
+}
+
 # clear_win <best> <next best>: whether a from-the-start check picked a shift clearly. A score of
 # 90+ that's 5+ ahead, or 70+ that's 10+ ahead. (Busy, detailed picture separates shifts by 30-50
 # points; flat animation only by ~8-10, as a neighbouring frame looks much the same.)
@@ -514,7 +603,7 @@ score_pair() {
   local DO DE DIFF SO SE OW OH EW EH DSCALE RCROP MODEL GPUDEC DGPU_SCALE GPUDEC_WHY ga
   local DGPU=() RGPU=()
   local P10 P50 P90 S10 SC10 S50 SC50 S90 SC90 CHOSEN DT RT off
-  local JSONS PYOUT PLABEL PMEAN PP1 PMIN so se ENC_VREL ORIG_VREL LEADN LEADS
+  local JSONS PYOUT PMEAN PP1 PMIN so se ENC_VREL ORIG_VREL LEADN LEADS
 
   mkdir -p "$WORK"
   rm -f "$WORK"/clip_*.json "$WORK/errors.log" "$WORK/.cuda_fallbacks" "$WORK/.gpudec_fallbacks"
@@ -592,7 +681,11 @@ score_pair() {
   # the ORIGINAL, at that exact offset, and overrides the automatic centered crop above --
   # needed when the crop isn't symmetric (e.g. top 264 / bottom 266), where a centered crop
   # would land a pixel off and quietly lower every score.
-  if [ -n "${REF_CROP:-}" ]; then
+  if [ -n "${REF_CROP:-}" ] && [[ "$REF_CROP" =~ ^${OW}:${OH}(:0:0)?$ ]]; then
+    # The whole frame: nothing to crop. (Cropping anyway would take the GPU's separate cropping
+    # decoder instead of the usual GPU decode, for no reason.)
+    echo "REF_CROP=${REF_CROP}: the original's whole frame, so nothing is cropped."
+  elif [ -n "${REF_CROP:-}" ]; then
     DSCALE=""; RCROP="crop=${REF_CROP},"
     echo "REF_CROP=${REF_CROP}: cropping the original at exactly that position."
     local rcw rch
@@ -619,12 +712,12 @@ score_pair() {
     DGPU=(-hwaccel cuda -hwaccel_output_format cuda); RGPU=(-hwaccel cuda -hwaccel_output_format cuda)
     case "$DSCALE" in
       scale=*) DGPU_SCALE="scale_cuda=w=${OW}:h=${OH}:interp_algo=bicubic," ;;
-      crop=*)  if ga=$(gpu_crop_args "${DSCALE#crop=}" "$EW" "$EH" "$ENC"); then DGPU+=($ga)
+      crop=*)  if ga=$(gpu_crop_args "${DSCALE#crop=}" "$EW" "$EH" "$ENC"); then read -ra ga_arr <<< "$ga"; DGPU+=("${ga_arr[@]}")
                else GPUDEC=0; GPUDEC_WHY="the encode's crop (${DSCALE%,}) can't be done in the GPU decoder"; fi ;;
     esac
     if [ "$GPUDEC" = "1" ]; then
       case "$RCROP" in
-        crop=*)  if ga=$(gpu_crop_args "${RCROP#crop=}" "$OW" "$OH" "$ORIG"); then RGPU+=($ga)
+        crop=*)  if ga=$(gpu_crop_args "${RCROP#crop=}" "$OW" "$OH" "$ORIG"); then read -ra ga_arr <<< "$ga"; RGPU+=("${ga_arr[@]}")
                  else GPUDEC=0; GPUDEC_WHY="the original's crop (${RCROP%,}) can't be done in the GPU decoder"; fi ;;
       esac
     fi
@@ -753,10 +846,6 @@ score_pair() {
     fi
     if [ ${#BOUNDS[@]} -eq 0 ]; then
       [ ${#SEGSH[@]} -gt 0 ] && CHOSEN=${SEGSH[0]}
-      IFS='|' read -r DT RT <<< "$(trim_for_shift "$CHOSEN")"
-      echo -n "Scoring the entire file (${DO}s) ... "
-      run_score "$DT" "$RT" 0 "$DO" "$SUB" "$WORK/clip_0.json" 2>>"$WORK/errors.log"
-      if [ -s "$WORK/clip_0.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
     else
       # Each part from its start to the next change; pooled below like clips. The later parts
       # are scored after a seek, which is how their shifts were measured. The first is scored
@@ -780,15 +869,61 @@ score_pair() {
           fi
         fi
       fi
-      local starts=(0 "${BOUNDS[@]}") k st en
-      for k in "${!starts[@]}"; do
-        st=${starts[$k]}
-        if [ $(( k + 1 )) -lt ${#starts[@]} ]; then en=${starts[$((k + 1))]}; else en=$DO; fi
-        IFS='|' read -r DT RT <<< "$(trim_for_shift "${SEGSH[$k]}")"
-        echo -n "Scoring ${st}s-${en}s with shift ${SEGSH[$k]} ... "
-        run_score "$DT" "$RT" "$st" $(( en - st )) "$SUB" "$WORK/clip_${st}.json" 2>>"$WORK/errors.log"
-        if [ -s "$WORK/clip_${st}.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
-      done
+    fi
+    full_score_parts
+    # Sanity check: every alignment check scored well, so a whole-file score with many frames
+    # near zero means the frames slipped during that long run, not in the file: the GPU's
+    # decoder occasionally loses or repeats a frame partway through (more likely while the GPU
+    # is busy with other work). Rescore once with the original decoded on the CPU.
+    local LOWPCT PROBEMIN
+    PROBEMIN=$(awk -v a="$SC10" -v b="$SC50" -v c="$SC90" 'BEGIN { m = a; if (b < m) m = b; if (c < m) m = c; print m + 0 }')
+    LOWPCT=$(low_frame_pct "$WORK"/clip_*.json)
+    if awk -v l="$LOWPCT" -v p="$PROBEMIN" 'BEGIN { exit !(l > 0.5 && p >= 80) }'; then
+      if [ "$VMAF_CUDA" = "1" ] && [ "$GPUDEC" = "1" ]; then
+        echo "  -> ${LOWPCT}% of frames scored under 20, though every alignment check scored ${PROBEMIN}+: frames slipped during the run (the GPU decoder can lose or repeat a frame under load). Rescoring with the original decoded on the CPU ..."
+        rm -f "$WORK"/clip_*.json
+        GPUDEC=2
+        full_score_parts
+        LOWPCT=$(low_frame_pct "$WORK"/clip_*.json)
+      fi
+      # Still there (so it's in the files, not the decoding): find the stretches that score near
+      # zero, check each one's shift, and if they're shifted, score them with their own shift.
+      if awk -v l="$LOWPCT" 'BEGIN { exit !(l > 0.5) }' && [ ${#BOUNDS[@]} -eq 0 ]; then
+        [ -z "$REALFPS" ] && REALFPS=$(grid_fps "$ENC")
+        local RUNS rs re rmid RSH RSC fixed=0 i2 prev=0
+        local NB=() NS=()
+        RUNS=$(low_runs "$WORK/clip_0.json" "$REALFPS")
+        echo "  -> still ${LOWPCT}% under 20. Near-zero stretches: $(echo "$RUNS" | awk 'NF { printf "%s%ss-%ss", (n++ ? ", " : ""), $1, $2 }')"
+        while read -r rs re; do
+          [ -n "$rs" ] || continue
+          # (a window inside the stretch: from just after its start, up to 20s)
+          rmid=$(awk -v a="$rs" 'BEGIN { printf "%d", a + 1.5 }')
+          read -r RSH RSC _ <<< "$(PROBE_LEN=$(awk -v a="$rs" -v b="$re" 'BEGIN { l = int(b - a - 3); print (l > 20) ? 20 : l }') probe_shift "$rmid")"
+          if [ "$RSH" != "$CHOSEN" ] && awk -v a="$RSC" 'BEGIN { exit !(a >= 80) }'; then
+            echo "  -> ${rs}s-${re}s lines up at shift ${RSH} (score ${RSC}) instead of ${CHOSEN}: scored with ${RSH}."
+            awk -v a="$rs" -v p="$prev" 'BEGIN { exit !(a < p) }' && rs=$prev
+            NB+=("$rs" "$re"); NS+=("$RSH" "$CHOSEN"); prev=$re; fixed=1
+          else
+            echo "  -> ${rs}s-${re}s: the best shift there is ${RSH} (score ${RSC}), so it isn't a frame shift."
+          fi
+        done <<< "$RUNS"
+        if [ "$fixed" -eq 1 ]; then
+          # Parts: CHOSEN up to the first stretch, each stretch with its own shift, CHOSEN after.
+          BOUNDS=(); SEGSH=("$CHOSEN"); prev=0
+          for i2 in "${!NB[@]}"; do
+            awk -v x="${NB[$i2]}" -v p="$prev" -v d="$DO" 'BEGIN { exit !(x > p && x < d) }' || continue
+            BOUNDS+=("${NB[$i2]}"); SEGSH+=("${NS[$i2]}"); prev=${NB[$i2]}
+          done
+          rm -f "$WORK"/clip_*.json
+          full_score_parts
+          LOWPCT=$(low_frame_pct "$WORK"/clip_*.json)
+        fi
+      fi
+      if awk -v l="$LOWPCT" 'BEGIN { exit !(l > 0.5) }'; then
+        echo "  WARNING: the whole-file score has ${LOWPCT}% of frames under 20, though every alignment"
+        echo "           check scored ${PROBEMIN}+: frames slipped somewhere during scoring, so this score"
+        echo "           is likely too low. Rescore it (delete the variant's .vmaf.txt)."
+      fi
     fi
   else
     local SHIFTS=() SH SC
@@ -803,7 +938,7 @@ score_pair() {
       IFS='|' read -r DT RT <<< "$(trim_for_shift "$SH")"
       echo -n "Scoring ${CLIP}s @ ${off}s ... "
       run_score "$DT" "$RT" "$off" "$CLIP" "$SUB" "$WORK/clip_${off}.json" 2>>"$WORK/errors.log"
-      if [ -s "$WORK/clip_${off}.json" ]; then echo done; else echo "FAILED (see $WORK/errors.log)"; fi
+      if [ -s "$WORK/clip_${off}.json" ]; then echo "done"; else echo "FAILED (see $WORK/errors.log)"; fi
     done
     # Every clip agrees on the shift: that's where the encode starts in the original.
     if [ ${#SHIFTS[@]} -ge 2 ] && [ "$(printf '%s\n' "${SHIFTS[@]}" | sort -u | wc -l)" -eq 1 ]; then
@@ -849,7 +984,7 @@ EOF
   if [ -s "$WORK/.cuda_fallbacks" ]; then
     echo "NOTE: GPU scoring failed for $(wc -l < "$WORK/.cuda_fallbacks") step(s), which were redone on the CPU (see the ffmpeg errors in $WORK/errors.log)."
   fi
-  read -r PLABEL PMEAN PP1 PMIN <<< "$(echo "$PYOUT" | grep -E '^[[:space:]]*pooled')"
+  read -r _ PMEAN PP1 PMIN <<< "$(echo "$PYOUT" | grep -E '^[[:space:]]*pooled')"
 
   echo
   if [ "$SIZE_SCOPE" = "video" ]; then
@@ -954,4 +1089,3 @@ if [ "$BATCH" -eq 1 ]; then
 else
   exit "$status"
 fi
-

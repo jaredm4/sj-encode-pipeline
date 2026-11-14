@@ -89,6 +89,14 @@ param(
     [switch]$Plumbing
 )
 
+# Defaults from the settings file (encode-settings.ini) for parameters not given, and paths
+# as typed or tab-completed: Shared.ps1, next to this script.
+if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
+. (Join-Path $PSScriptRoot 'Shared.ps1')
+$script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
+$Source = Resolve-InputPath $Source; $Dest = Resolve-InputPath $Dest; $ReportPath = Resolve-InputPath $ReportPath
+
 if ($Plumbing) {
     if ($Dest) { throw '-Plumbing cannot be combined with -Dest.' }
     $ProgressPreference = 'SilentlyContinue'
@@ -111,30 +119,8 @@ if (-not $ReportPath) {
 
 # ---------------------------------------------------------------- path handling
 # Uses .NET file APIs so [ ] and other wildcard characters in names are treated literally.
-
-function ConvertTo-FullPath {
-    # Tab completion escapes [ ] as `[ `] (meant for wildcard-aware commands), so try the path
-    # exactly as given first, then with that backtick escaping removed.
-    param([string]$Path, [string]$What)
-    $candidates = @($Path)
-    $unescaped = $Path -replace '`(.)', '$1'
-    if ($unescaped -ne $Path) { $candidates += $unescaped }
-
-    $first = $null; $lastError = $null
-    foreach ($c in $candidates) {
-        try {
-            $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($c)
-        } catch {
-            $lastError = $_.Exception.Message
-            continue
-        }
-        if (-not $full) { continue }
-        if (-not $first) { $first = $full }
-        if ([IO.File]::Exists($full) -or [IO.Directory]::Exists($full)) { return $full }
-    }
-    if ($first) { return $first }   # doesn't exist; the caller reports it clearly
-    throw "$What path is invalid: '$Path'. $lastError"
-}
+# A path as typed or tab-completed -> full path (Resolve-InputPath, Shared.ps1).
+function ConvertTo-FullPath([string]$Path, [string]$What) { Resolve-InputPath $Path }
 
 $srcPath = ConvertTo-FullPath $Source 'Source'
 

@@ -1,0 +1,4 @@
+* text=auto
+
+# bash won't run a script with CRLF line endings, even when it's checked out on Windows.
+*.sh text eol=lf

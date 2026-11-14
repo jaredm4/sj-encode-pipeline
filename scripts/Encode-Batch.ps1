@@ -216,18 +216,18 @@
       Name       folder name (default built from the above, e.g. "cqp22 aq4")
 
 .EXAMPLE
-    .\Encode-Batch.ps1 -Source "S:\Sources\Shows\Show (2004) [tmdbid-12345]" -Dest "D:\Encodes"
+    .\Encode-Batch.ps1 -Source "S:\Sources\Shows\Show (2004) [tmdbid-12345]" -Dest "E:\Encodes"
 
 .EXAMPLE
-    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest D:\Encodes `
+    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest E:\Encodes `
         -Ladder @{Cqp=30;Aq=8}, @{Cqp=28;Aq=8}, @{Cqp=26;Aq=8}, @{Cqp=24;Aq=8}, @{Cqp=22;Aq=8}
 
 .EXAMPLE
-    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest D:\Encodes -Threads 1 `
+    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest E:\Encodes -Threads 1 `
         -Variants @{Cqp=22;Aq=4}, @{Cqp=24;Aq=8}, @{Cqp=26;Aq=8}
 
 .EXAMPLE
-    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest D:\Encodes -SkipVC1 $true
+    .\Encode-Batch.ps1 -Source S:\Sources\Movies -Dest E:\Encodes -SkipVC1 $true
 #>
 [CmdletBinding()]
 param(
@@ -342,8 +342,8 @@ param(
     # For baking a Dolby Vision 7 FEL into 8.1: dovi_tool.exe, and VapourSynth's vspipe.exe (or a
     # portable install's vspipe.bat) with the ffms2 and felbaker plugins autoloaded. Full paths,
     # or names on PATH. Without them, Dolby Vision 7 titles are skipped.
-    [string]$DoviTool = (Join-Path $HOME 'Documents\dovi_tool\dovi_tool'),
-    [string]$VsPipe = (Join-Path $HOME 'Documents\vapoursynth-portable\vspipe'),
+    [string]$DoviTool = 'dovi_tool',
+    [string]$VsPipe = 'vspipe',
     # Decoder threads per layer for a bake (ffms2; -1 = all logical CPUs). The base layer's decode
     # sets the bake's speed, so the default uses every core; lower it to leave the CPU some room
     # for the encodes and scoring running alongside.
@@ -363,12 +363,12 @@ param(
 
     # ...then .srt subtitles with Convert-Subtitles (OCR of the English tracks with seconv and
     # PaddleOCR, shifted like the audio; see "Subtitles"). -NoSubtitles skips it. -SeConv and
-    # -SubtitleRules are passed on to it ('' = its defaults: $HOME\Documents\SeConv-Windows-x64\seconv.exe
-    # and $HOME\Documents\SE_Replace_Rules.template).
+    # -SubtitleRules are passed on to it ('' = its defaults: seconv on PATH, and no replace rules;
+    # SeConv and ReplaceRules in the settings file's [All] section set both scripts).
     [string]$ConvertSubtitles = (Join-Path $PSScriptRoot 'Convert-Subtitles.ps1'),
     [switch]$NoSubtitles,
     [string]$SeConv = '',
-    [string]$SubtitleRules = '',
+    [Alias('ReplaceRules')][string]$SubtitleRules = '',
 
     # Ladder mode: a title where no variant passes is finished with its SOURCE instead (copied
     # into place, then audio, subtitles, move up, failed encodes deleted), rather than left
@@ -379,7 +379,7 @@ param(
     # _encode-batch_all.md / .csv from the titles' saved results (loose, or in its "encode logs.zip")
     # and bundle its files into the zip, as at the end of a run. Nothing is encoded, copied or
     # unzipped, folders with a title not finished are left alone, and DONE / SKIP markers are
-    # ignored (a signed-off folder gets its report too). E.g. for finished folders moved to the NAS:
+    # ignored (a signed-off folder gets its report too). E.g. for finished folders moved to a network drive:
     # -Source the Blu-ray tree, -Dest the mirrored tree they were moved to.
     [switch]$ReportsOnly,
     # With -ReportsOnly: a title not finished by Encode-Batch whose "<name>.mkv" is in its Dest
@@ -390,7 +390,7 @@ param(
     [switch]$MarkFinished,
 
     # Copy each source to -WorkDir (as "<name> - source.mkv") during prep, so the encodes, VMAF
-    # scoring, CropDetect and Add-BluRayAudio all read it locally instead of from the NAS.
+    # scoring, CropDetect and Add-BluRayAudio all read it locally instead of from the network drive.
     # Deleted once the title is finished. Default: on with -WorkDir, off without it (the source
     # is taken to be local already and is read in place; it's never modified). Dolby Vision 7
     # titles are always copied either way (their copy is converted). Set it to override.
@@ -412,12 +412,21 @@ param(
     [string]$WslMountRoot = '/mnt',
     [string]$CompareEncodeCmd = 'compare_encode',
     [string]$DoviConvertCmd = 'dovi_convert',
-
-    [string]$RemountCmd = 'remount',
+    # When a drive's files aren't visible in WSL (network drives' mounts there drop from time
+    # to time), it's mounted again as root: wsl -u root mount -t drvfs X: /mnt/x. To run your
+    # own command instead (as your user, e.g. a script that mounts your shares), give it here.
+    [string]$RemountCmd = '',
 
     # Encode only; don't run compare_encode.
     [switch]$SkipVmaf
 )
+
+# Defaults from the settings file (encode-settings.ini) for parameters not given, and paths
+# as typed or tab-completed: Shared.ps1, next to this script.
+if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
+. (Join-Path $PSScriptRoot 'Shared.ps1')
+$script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
 
 $ErrorActionPreference = 'Stop'
 $started = Get-Date
@@ -1091,7 +1100,7 @@ $FinalizeBody = {
     }
     # Audio and subtitles come from a local copy when there is one (the source's local copy, or a
     # Dolby Vision title's converted 8.1 / untouched 7 copy, which keep every audio and subtitle
-    # track); the NAS source otherwise.
+    # track); the (often network) source otherwise.
     function Get-ReadSource {
         if ($doc.PSObject.Properties['SelfSource'] -and $doc.SelfSource -and [IO.File]::Exists($doc.Winner)) { return $doc.Winner }
         if ($doc.LocalCopy -and [IO.File]::Exists($doc.LocalCopy)) { return $doc.LocalCopy }
@@ -1186,7 +1195,7 @@ $FinalizeBody = {
             }
         }
         # No variant passed and the source was copied (or moved) here untouched: it is its own
-        # audio and subtitle source (read here, not from the NAS again). Subtitles first, while it
+        # audio and subtitle source (read here, not from the network again). Subtitles first, while it
         # still has its subtitle tracks (the audio remux has none); its audio needs no shift.
         $selfSource = [bool]($doc.PSObject.Properties['SelfSource'] -and $doc.SelfSource)
         if ($selfSource) { Invoke-SubtitleStep }
@@ -1345,13 +1354,16 @@ $Helpers = [scriptblock]::Create([IO.File]::ReadAllText($commonPath) + "`n" + $B
 # =====================================================================================
 . $Helpers
 
-function Resolve-UserPath([string]$Path) {
-    # Tab completion escapes [ ] with backticks; accept both forms.
-    foreach ($c in @($Path, ($Path -replace '`(.)', '$1'))) {
-        $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($c)
-        if ([IO.File]::Exists($full) -or [IO.Directory]::Exists($full)) { return $full }
-    }
-    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+# A path as typed or tab-completed -> full path (Shared.ps1).
+function Resolve-UserPath([string]$Path) { Resolve-InputPath $Path }
+# A program: a path, or a command on PATH -> its full path; '' if not found.
+function Resolve-Program([string]$name) {
+    if (-not $name) { return '' }
+    $f = Resolve-UserPath $name
+    if ([IO.File]::Exists($f)) { return $f }
+    $c = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return $c.Source }
+    ''
 }
 
 $srcPath = Resolve-UserPath $Source
@@ -1417,6 +1429,10 @@ if (-not $fixedMode -and $SkipVmaf) { throw 'The ladder search needs VMAF scores
 
 # ---------------------------------------------------------------- preflight
 Write-Log "Encode-Batch $runId" 'Cyan'
+if ($env:ENCODE_SETTINGS) {
+    Write-Log "Settings: $env:ENCODE_SETTINGS$(if (-not $script:SettingsUsed.Count) { ' (nothing in it for Encode-Batch)' })"
+    foreach ($setting in $script:SettingsUsed) { Write-Log "  -$($setting.Name) $(@($setting.Value) -join ', ')" }
+}
 Write-Log "Source: $srcPath"
 Write-Log "Dest:   $dstRoot ($(Get-FreeGB $dstRoot) GB free)"
 if ($workRoot -ne $dstRoot) {
@@ -1483,14 +1499,14 @@ if ($finishing -and -not $NoSubtitles) {
     $parseErrors = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($ConvertSubtitles, [ref]$null, [ref]$parseErrors)
     if ($parseErrors) { throw ("{0} has a syntax error at line {1}: {2}" -f $ConvertSubtitles, $parseErrors[0].Extent.StartLineNumber, $parseErrors[0].Message) }
-    $seconvExe = $(if ($SeConv) { Resolve-UserPath $SeConv } else { Join-Path $HOME 'Documents\SeConv-Windows-x64\seconv.exe' })
-    if (-not [IO.File]::Exists($seconvExe)) { throw "seconv.exe not found: $seconvExe (Subtitle Edit's command line; pass -SeConv, or -NoSubtitles)." }
-    if ($SeConv) { $SeConv = $seconvExe }
+    $seconvExe = Resolve-Program $(if ($SeConv) { $SeConv } else { 'seconv' })
+    if (-not $seconvExe) { throw "seconv not found: '$(if ($SeConv) { $SeConv } else { 'seconv' })' (Subtitle Edit's command line; pass -SeConv or set SeConv in the settings file, or use -NoSubtitles)." }
+    $SeConv = $seconvExe
     if ($SubtitleRules) {
         $SubtitleRules = Resolve-UserPath $SubtitleRules
         if (-not [IO.File]::Exists($SubtitleRules)) { throw "-SubtitleRules not found: $SubtitleRules" }
-    } elseif (-not [IO.File]::Exists((Join-Path $HOME 'Documents\SE_Replace_Rules.template'))) {
-        Write-Log "No $(Join-Path $HOME 'Documents\SE_Replace_Rules.template'): subtitles are converted without multiple replace rules (pass -SubtitleRules)" 'Yellow'
+    } else {
+        Write-Log 'Subtitles: no multiple replace rules (-SubtitleRules, or ReplaceRules in the settings file)'
     }
     $mkvx = Get-Command mkvextract -ErrorAction SilentlyContinue
     if (-not $mkvx -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvextract.exe'))) { throw 'mkvextract not found (Convert-Subtitles needs MKVToolNix): add "C:\Program Files\MKVToolNix" to PATH, or use -NoSubtitles.' }
@@ -1507,7 +1523,7 @@ if (-not $fixedMode) {
 $wsl = @{ Distro = $WslDistro; MountRoot = $WslMountRoot; CompareEncodeCmd = $CompareEncodeCmd; DoviConvertCmd = $DoviConvertCmd; RemountCmd = $RemountCmd }
 $doviAvailable = $false
 $checkBody = @(
-    "for c in $(ConvertTo-BashQuoted ($CompareEncodeCmd -split ' ')[0]) $(ConvertTo-BashQuoted ($DoviConvertCmd -split ' ')[0]) $(ConvertTo-BashQuoted ($RemountCmd -split ' ')[0]); do"
+    "for c in $(ConvertTo-BashQuoted ($CompareEncodeCmd -split ' ')[0]) $(ConvertTo-BashQuoted ($DoviConvertCmd -split ' ')[0])$(if ($RemountCmd) { ' ' + (ConvertTo-BashQuoted ($RemountCmd -split ' ')[0]) }); do"
     '  if p=$(command -v "$c"); then echo "FOUND $c $p"; else echo "MISSING $c"; fi'
     'done'
 ) -join "`n"
@@ -1519,23 +1535,28 @@ if (-not $SkipVmaf -and $found -notcontains ($CompareEncodeCmd -split ' ')[0]) {
 }
 $doviAvailable = $found -contains ($DoviConvertCmd -split ' ')[0]
 
-# The NAS mounts in WSL drop regularly. Check now, while you're still at the keyboard, rather
-# than finding out from a log in the morning.
+# Network drives' mounts in WSL drop from time to time. Check now (mounting them again if
+# needed), while you're still at the keyboard, rather than finding out from a log in the morning.
 function Test-WslSees([string[]]$Paths) {
     $body = (@($Paths | ForEach-Object { 'if [ -e {0} ]; then echo "OK {1}"; else echo "MISSING {1}"; fi' -f (ConvertTo-BashQuoted (ConvertTo-WslPath $_ $WslMountRoot)), $_ })) -join "`n"
     @((Invoke-Wsl -Wsl $wsl -TempDir $tempDir -Body $body -Quiet).Lines | Where-Object { $_ -like 'MISSING *' } | ForEach-Object { $_.Substring(8) })
 }
 $mustSee = @($srcPath, $dstRoot)
 $missing = Test-WslSees $mustSee
+if ($missing.Count) {
+    Write-Log "WSL can't see $($missing -join ', '); mounting $(if ($RemountCmd) { "with $RemountCmd" } else { 'the drive(s) again' })"
+    foreach ($l in (Mount-WslDrives -Paths @($missing | ForEach-Object { ConvertTo-WslPath $_ $WslMountRoot }) -Wsl $wsl -TempDir $tempDir -Quiet)) { Write-Log "  $l" }
+    $missing = Test-WslSees $mustSee
+}
 $deadline = (Get-Date).AddSeconds(90)
 while ($missing.Count -and (Get-Date) -lt $deadline) {
     $bar = '!' * 78
     Write-Host ''
     Write-Host $bar -ForegroundColor Red
-    Write-Host '  WSL CAN''T SEE THESE PATHS (NAS mount dropped?):' -ForegroundColor Red
+    Write-Host '  WSL CAN''T SEE THESE PATHS (and mounting them again didn''t help):' -ForegroundColor Red
     foreach ($m in $missing) { Write-Host "    $m" -ForegroundColor Yellow }
     Write-Host '  VMAF scoring and Dolby Vision conversion run inside WSL and will fail.' -ForegroundColor Red
-    Write-Host '  Run "remount" in WSL now, then press Enter to check again.' -ForegroundColor Red
+    Write-Host '  Fix it in WSL now (e.g. sudo mount -t drvfs X: /mnt/x), then press Enter to check again.' -ForegroundColor Red
     Write-Host '  Ctrl+C cancels. Continuing anyway in 90 s.' -ForegroundColor Red
     Write-Host $bar -ForegroundColor Red
     $pressed = $false
@@ -1546,26 +1567,18 @@ while ($missing.Count -and (Get-Date) -lt $deadline) {
     $missing = Test-WslSees $mustSee
     if (-not $missing.Count) { Write-Log 'WSL can see Source and Dest now.' 'Green' }
 }
-if ($missing.Count) { Write-Log "WARNING: WSL still can't see: $($missing -join ', '). Continuing; each WSL step will try $RemountCmd once." 'Red' }
+if ($missing.Count) { Write-Log "WARNING: WSL still can't see: $($missing -join ', '). Continuing; each WSL step will try mounting again once." 'Red' }
 else { Write-Log 'WSL can see Source and Dest.' }
 # Dolby Vision 7 needs dovi_convert (WSL; inspect, and converting an MEL), and for baking an FEL
 # dovi_tool, mkvmerge and vspipe with the ffms2 and felbaker plugins (checked here with a
 # one-frame script, so a missing plugin shows now rather than after a title's copy and inspect).
 $doviMissing = @()
 if (-not $doviAvailable) { $doviMissing += 'dovi_convert (WSL)' }
-function Resolve-Program([string]$name) {
-    if (-not $name) { return '' }
-    $f = Resolve-UserPath $name
-    if ([IO.File]::Exists($f)) { return $f }
-    $c = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($c) { return $c.Source }
-    ''
-}
 $dt = Resolve-Program $DoviTool
-if ($dt) { $DoviTool = $dt } else { $doviMissing += "dovi_tool ('$DoviTool'; pass -DoviTool)" }
+if ($dt) { $DoviTool = $dt } else { $doviMissing += "dovi_tool ('$DoviTool'; pass -DoviTool or set DoviTool in the settings file)" }
 if (-not (Get-Command mkvmerge -ErrorAction SilentlyContinue) -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvmerge.exe'))) { $doviMissing += 'mkvmerge (MKVToolNix)' }
 $vp = Resolve-Program $VsPipe
-if (-not $vp) { $doviMissing += "vspipe ('$VsPipe'; pass -VsPipe)" }
+if (-not $vp) { $doviMissing += "vspipe ('$VsPipe'; pass -VsPipe or set VsPipe in the settings file)" }
 else {
     $VsPipe = $vp
     $chkVpy = Join-Path $tempDir 'plugin-check.vpy'
@@ -1587,7 +1600,7 @@ else {
 $doviMissing = $doviMissing -join ', '
 if ($doviMissing) { Write-Log "Dolby Vision 7 titles will be skipped: missing $doviMissing." 'Yellow' }
 else { Write-Log "Dolby Vision 7: dovi_convert (WSL), dovi_tool $DoviTool, vspipe $VsPipe (ffms2, felbaker)" }
-if ($found -notcontains ($RemountCmd -split ' ')[0]) { Write-Log "remount not reachable from WSL; dropped NAS mounts can't be repaired automatically." 'Yellow' }
+if ($RemountCmd -and $found -notcontains ($RemountCmd -split ' ')[0]) { Write-Log "-RemountCmd '$RemountCmd' isn't reachable from WSL; dropped mounts can't be repaired automatically." 'Yellow' }
 
 # ---------------------------------------------------------------- find sources
 if ([IO.File]::Exists($srcPath)) {
@@ -3126,8 +3139,6 @@ try {
         $what = if ($r.Kind -eq 'prep') { 'prep' } elseif ($r.Kind -eq 'finalize') { 'finishing (resumes next run)' } else { "$($r.Task.Spec.Name) ($($r.Kind))" }
         Write-Log "ABORTED $($r.Title.Rel) :: $what (partial encodes are redone next run)" 'Red'
     }
-    $notStarted = @($titleList | Where-Object { $_.State -eq 'queued' }).Count
-    $unfinished = @($titleList | Where-Object { $_.State -in 'ready', 'prepping' })
 
     # ---------------------------------------------------------------- summary
     # Each folder's complete report once every title in it is settled, and this run's log lines

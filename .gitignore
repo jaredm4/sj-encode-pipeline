@@ -1,0 +1,35 @@
+# Your machine's settings: copy scripts/encode-settings.example.ini to scripts/encode-settings.ini
+encode-settings.ini
+
+# Anything a run writes, in case a run ever points inside the repository. These hold titles
+# and paths from your library: keep them out.
+*.log
+*.json
+*.csv
+*.zip
+_encode-batch_*.md
+CropReport_*.md
+vmaf_compare_*/
+
+# Media and intermediates
+*.mkv
+*.mks
+*.mp4
+*.m2ts
+*.hevc
+*.h265
+*.srt
+*.sup
+*.vpy
+*.bin
+
+# Backups and editor files
+*.bak
+*.bundle
+*.orig
+*~
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

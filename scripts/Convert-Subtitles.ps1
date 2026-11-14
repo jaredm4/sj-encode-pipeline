@@ -73,11 +73,11 @@
 .PARAMETER NoBackup
     Don't write the "<name>.mks" backup.
 .PARAMETER SeConv
-    seconv.exe. Default: "$HOME\Documents\SeConv-Windows-x64\seconv.exe".
+    seconv.exe (Subtitle Edit's command line). Default: seconv on PATH; or set it in the
+    settings file.
 .PARAMETER ReplaceRules
     Subtitle Edit multiple replace rules for seconv --multiple-replace.
-    Default: "$HOME\Documents\SE_Replace_Rules.template" (skipped, with a warning, if missing).
-    Kept out of seconv's folder so upgrading seconv doesn't wipe it.
+    Default: none. Keep the file out of seconv's folder, so upgrading seconv doesn't wipe it.
 .PARAMETER TimeoutMin
     A tool (seconv, mkvmerge, mkvextract) still running after this many minutes is stopped:
     that track fails (the title is flagged for review), or the run fails. Default: 30.
@@ -118,14 +118,23 @@ param(
     [string]$Basename = '',
     [int]$OffsetMs = 0,
     [switch]$NoBackup,
-    [string]$SeConv = (Join-Path $HOME 'Documents\SeConv-Windows-x64\seconv.exe'),
-    [string]$ReplaceRules = (Join-Path $HOME 'Documents\SE_Replace_Rules.template'),
+    [string]$SeConv = 'seconv',
+    [string]$ReplaceRules = '',
     [ValidateRange(1, 1440)][int]$TimeoutMin = 30,
     [string]$WorkDir = '',
     [string]$LogPath = '',
     [switch]$Recurse,
     [switch]$Plumbing
 )
+
+# Defaults from the settings file (encode-settings.ini) for parameters not given, and paths
+# as typed or tab-completed: Shared.ps1, next to this script.
+if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
+. (Join-Path $PSScriptRoot 'Shared.ps1')
+$script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
+foreach ($n in 'Source', 'Dest', 'ReplaceRules', 'WorkDir', 'LogPath') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly)) }
+foreach ($n in 'SeConv') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly) -Program) }
 
 $ErrorActionPreference = 'Stop'
 $script:RulesGiven = $PSBoundParameters.ContainsKey('ReplaceRules')
@@ -635,7 +644,11 @@ function Invoke-Main {
 
     if ($eng.Count -gt 0) {
         $SeConv = [Environment]::ExpandEnvironmentVariables($SeConv)
-        if (-not [IO.File]::Exists($SeConv)) { throw "seconv not found: $SeConv (pass -SeConv)" }
+        if (-not [IO.File]::Exists($SeConv)) {
+            $c = Get-Command $SeConv -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $c) { throw "seconv not found: $SeConv (pass -SeConv, or set SeConv in the settings file)" }
+            $SeConv = $c.Source
+        }
         if ($ReplaceRules -and -not [IO.File]::Exists($ReplaceRules)) {
             if ($script:RulesGiven) { throw "-ReplaceRules not found: $ReplaceRules" }
             Write-Warn "No multiple replace rules ($ReplaceRules not found); converting without them"; $ReplaceRules = ''

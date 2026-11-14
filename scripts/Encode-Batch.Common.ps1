@@ -81,7 +81,7 @@ function Get-FreeGB {
 }
 
 # Copies a file via "<Dest>.partial" (renamed when complete), reporting progress to the status
-# file. Large sequential reads: much faster from a NAS than the encoders' own small reads.
+# file. Large sequential reads: much faster from a network drive than the encoders' own small reads.
 function Copy-FileWithProgress {
     param([string]$Src, [string]$Dst, [hashtable]$StatusBase = @{})
     $part = "$Dst.partial"
@@ -258,8 +258,58 @@ function Invoke-ShellLines {
     }
 }
 
+# Mounts Windows drives in WSL again (drvfs) when a path on them isn't visible there: network
+# drives' mounts in WSL drop from time to time. Run as root (wsl -u root, no password), one at a
+# time (flock), and only for a drive whose path is still missing once it has the lock (another
+# process may have just fixed it). A custom -RemountCmd is run instead, as the user.
+# -Paths: WSL paths under the mount root (e.g. /mnt/x/Movies/...). Returns the output lines.
+function Mount-WslDrives {
+    param(
+        [Parameter(Mandatory)][string[]]$Paths,
+        [Parameter(Mandatory)]$Wsl,
+        [string]$TempDir = [IO.Path]::GetTempPath(),
+        [switch]$Quiet
+    )
+    $root = ([string]$Wsl.MountRoot).TrimEnd('/'); if (-not $root) { $root = '/mnt' }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('set -u')
+    $lines.Add('exec 9>/tmp/encode-batch-mount.lock; flock -w 300 9 || true')
+    if ($Wsl.RemountCmd) {
+        $check = ($Paths | ForEach-Object { "[ -e $(ConvertTo-BashQuoted $_) ]" }) -join ' && '
+        $lines.Add("if ! { $check; }; then echo `"[encode-batch] running $($Wsl.RemountCmd)`"; timeout 180 $($Wsl.RemountCmd) </dev/null; fi")
+        $user = $null
+    } else {
+        $byDrive = [ordered]@{}
+        foreach ($p in $Paths) {
+            if ($p -match ('^' + [regex]::Escape($root) + '/([a-zA-Z])(/|$)')) { $byDrive[$Matches[1].ToLower()] = $p }
+        }
+        if (-not $byDrive.Count) { return @("[encode-batch] not on a Windows drive under ${root}: $($Paths -join ', ')") }
+        foreach ($d in $byDrive.Keys) {
+            $mp = ConvertTo-BashQuoted "$root/$d"; $p = ConvertTo-BashQuoted $byDrive[$d]
+            $lines.Add("if [ ! -e $p ]; then")
+            $lines.Add("  umount -l $mp 2>/dev/null; mkdir -p $mp")
+            $lines.Add("  if mount -t drvfs $($d.ToUpper()): $mp; then echo `"[encode-batch] mounted $($d.ToUpper()): at $root/$d`"; else echo `"[encode-batch] mounting $($d.ToUpper()): at $root/$d failed`"; fi")
+            $lines.Add('fi')
+        }
+        $user = 'root'
+    }
+    $shFile = Join-Path $TempDir ([guid]::NewGuid().ToString('N') + '.sh')
+    [IO.File]::WriteAllText($shFile, ($lines -join "`n") + "`n", $script:Utf8)
+    $a = @()
+    if ($Wsl.Distro) { $a += @('-d', $Wsl.Distro) }
+    if ($user) { $a += @('-u', $user) }
+    $a += @('-e', 'bash', (ConvertTo-WslPath $shFile $Wsl.MountRoot))
+    $env:WSL_UTF8 = '1'
+    try {
+        (Invoke-Logged -Exe 'wsl.exe' -ArgList $a -TempDir $TempDir -Quiet:$Quiet).Lines
+    } finally {
+        Remove-Item -LiteralPath $shFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Runs a bash snippet inside WSL as a login shell. Paths listed in -NeedPaths are checked
-# first; if any are missing the remount command is run once (serialised with flock).
+# first; if any are missing, the drives are mounted again (Mount-WslDrives) and the snippet
+# is run once more. The settings file (ENCODE_SETTINGS) is passed on, for compare_encode.
 function Invoke-Wsl {
     param(
         [Parameter(Mandatory)][string]$Body,
@@ -276,18 +326,15 @@ export NO_COLOR=1
 exec </dev/null
 if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"; fi
 eb_ensure_visible() {
-  local p missing=0
-  for p in "$@"; do [ -e "$p" ] || missing=1; done
-  [ "$missing" -eq 0 ] && return 0
-  echo "[encode-batch] not visible in WSL; running remount"
-  ( flock -w 300 9 || exit 0; timeout 180 __REMOUNT__ </dev/null ) 9>/tmp/encode-batch-remount.lock
-  for p in "$@"; do
-[ -e "$p" ] || { echo "[encode-batch] still not visible in WSL after remount: $p"; return 97; }
-  done
+  local p rc=0
+  for p in "$@"; do [ -e "$p" ] || { echo "[encode-batch] not visible in WSL: $p"; rc=97; }; done
+  return $rc
 }
 '@
-    $prelude = $prelude.Replace('__REMOUNT__', $Wsl.RemountCmd)
     $script = $prelude + "`n"
+    if ($env:ENCODE_SETTINGS -and [IO.File]::Exists($env:ENCODE_SETTINGS)) {
+        try { $script += "export ENCODE_SETTINGS=$(ConvertTo-BashQuoted (ConvertTo-WslPath $env:ENCODE_SETTINGS $Wsl.MountRoot))`n" } catch { }
+    }
     if ($need) { $script += "eb_ensure_visible $need || exit `$?`n" }
     $script += $Body + "`n"
     $shFile = Join-Path $TempDir ([guid]::NewGuid().ToString('N') + '.sh')
@@ -297,7 +344,16 @@ eb_ensure_visible() {
     $a += @('-e', 'bash', '-l', (ConvertTo-WslPath $shFile $Wsl.MountRoot))
     $env:WSL_UTF8 = '1'
     try {
-        Invoke-Logged -Exe 'wsl.exe' -ArgList $a -TempDir $TempDir -StatusBase $StatusBase -Quiet:$Quiet
+        $r = Invoke-Logged -Exe 'wsl.exe' -ArgList $a -TempDir $TempDir -StatusBase $StatusBase -Quiet:$Quiet
+        # 97: a needed path wasn't visible and nothing ran. Mount its drive again, then retry once.
+        if ($r.ExitCode -eq 97 -and $NeedPaths.Count) {
+            $gone = @($r.Lines | Where-Object { $_ -like '`[encode-batch`] not visible in WSL: *' } | ForEach-Object { $_.Substring(35) })
+            if (-not $gone.Count) { $gone = $NeedPaths }
+            $ml = @(Mount-WslDrives -Paths $gone -Wsl $Wsl -TempDir $TempDir -Quiet:$Quiet)
+            $r2 = Invoke-Logged -Exe 'wsl.exe' -ArgList $a -TempDir $TempDir -StatusBase $StatusBase -Quiet:$Quiet
+            $r = [pscustomobject]@{ ExitCode = $r2.ExitCode; Lines = @($r.Lines) + $ml + @($r2.Lines) }
+        }
+        $r
     } finally {
         Remove-Item -LiteralPath $shFile -Force -ErrorAction SilentlyContinue
     }

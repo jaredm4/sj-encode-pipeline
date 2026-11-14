@@ -93,7 +93,8 @@
 .PARAMETER DoviConvertCmd
     dovi_convert's command in WSL (on PATH for a login shell, or a full path). Default: dovi_convert.
 .PARAMETER RemountCmd
-    Run once in WSL when a file isn't visible there (e.g. a dropped NAS mount). Default: remount.
+    Run in WSL when a file isn't visible there (e.g. a dropped network-drive mount). Default:
+    none, and the drive is mounted again as root (wsl -u root mount -t drvfs X: /mnt/x).
 .PARAMETER TempDir
     For the scripts run in WSL and the programs' output. Default: your temp folder.
 .PARAMETER LogPath
@@ -140,7 +141,7 @@ param(
     [string]$WslDistro = '',
     [string]$WslMountRoot = '/mnt',
     [string]$DoviConvertCmd = 'dovi_convert',
-    [string]$RemountCmd = 'remount',
+    [string]$RemountCmd = '',
     [string]$TempDir = [IO.Path]::GetTempPath(),
     [string]$LogPath = '',
     [string]$LogPrefix = '',
@@ -148,6 +149,15 @@ param(
     [hashtable]$Status = @{},
     [switch]$Plumbing
 )
+
+# Defaults from the settings file (encode-settings.ini) for parameters not given, and paths
+# as typed or tab-completed: Shared.ps1, next to this script.
+if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
+. (Join-Path $PSScriptRoot 'Shared.ps1')
+$script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
+foreach ($n in 'Source', 'WorkDir', 'DecisionDir', 'Output', 'TempDir', 'LogPath', 'StatusFile') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly)) }
+foreach ($n in 'DoviTool', 'VsPipe', 'MkvMerge', 'NVEncC') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly) -Program) }
 
 # 'Continue', not 'Stop': in Windows PowerShell, 2>&1 on a native program raises terminating
 # errors under 'Stop'. Failures are checked explicitly.
