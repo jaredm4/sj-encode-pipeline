@@ -90,9 +90,7 @@ Netflix says a score difference of 6 is noticeable by your eyes. That would mean
     1. Non-masters are scanned to determine if they are commentary tracks (I've seen roughly 98% success rate here), and encoded appropriately if needed.
     1. Any other track not deemed a master or commentary is dropped. This includes tracks for the visually impaired.
 1. Dolby Vision profile 7.6 are converted or baked to profile 8.1 depending on if they are MEL or either FEL.
-1. VMAF bar. Each encoding must meet or exceed the configurable bar. By default, it targets 93.5/80/75 scores and needs to be <70% of the stream filesize. If a video cannot be encoded to meet the bar, it skips it and informs you. You can use the original in this instance, and let it continue processing (audio, subtitles, etc)
-    1. Videos that encode really well and meet the bar at sub-20% get encoded with higher quality until they either get close to 20% filesize or pass the secondary upper bar which acts as a max. I consider this max to be similar to "It's already good enough, take the additional space savings"
-1. Jellyfin support. This primarily means file naming is expected to match what they want, but also the generated subtitles are external files.
+1. Jellyfin support. This primarily means file naming is expected to match what they want, but also the generated subtitles are external files. It'll use the filenames you feed into it, but subtitles will has suffixes based on what Jellyfin expects.
 
 ### Limitations
 
