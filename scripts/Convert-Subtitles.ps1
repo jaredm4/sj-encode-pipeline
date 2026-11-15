@@ -15,7 +15,7 @@
            seconv <track> subrip --json --overwrite --ocr-engine:paddle --ocr-language:en
              --encoding:utf-8 --remove-text-for-hi
              --fix-common-errors-rules:all,-FixDialogsOnOneLine,-FixShortLinesAll,-FixShortLinesPixelWidth
-             --multiple-replace:<-ReplaceRules>
+             --multiple-replace:SE_Replace_Rules.template (the file next to this script)
          Picture tracks (Blu-ray PGS; DVD VobSub should work but is untested) are OCR'd; text
          tracks (SRT, ASS) are just converted.
       3. Each track gets a role (see "Which track is which" below).
@@ -75,9 +75,6 @@
 .PARAMETER SeConv
     seconv.exe (Subtitle Edit's command line). Default: seconv on PATH; or set it in the
     settings file.
-.PARAMETER ReplaceRules
-    Subtitle Edit multiple replace rules for seconv --multiple-replace.
-    Default: none. Keep the file out of seconv's folder, so upgrading seconv doesn't wipe it.
 .PARAMETER TimeoutMin
     A tool (seconv, mkvmerge, mkvextract) still running after this many minutes is stopped:
     that track fails (the title is flagged for review), or the run fails. Default: 30.
@@ -119,7 +116,6 @@ param(
     [int]$OffsetMs = 0,
     [switch]$NoBackup,
     [string]$SeConv = 'seconv',
-    [string]$ReplaceRules = '',
     [ValidateRange(1, 1440)][int]$TimeoutMin = 30,
     [string]$WorkDir = '',
     [string]$LogPath = '',
@@ -133,11 +129,12 @@ if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Sha
 . (Join-Path $PSScriptRoot 'Shared.ps1')
 $script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
 foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
-foreach ($n in 'Source', 'Dest', 'ReplaceRules', 'WorkDir', 'LogPath') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly)) }
+foreach ($n in 'Source', 'Dest', 'WorkDir', 'LogPath') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly)) }
 foreach ($n in 'SeConv') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly) -Program) }
 
 $ErrorActionPreference = 'Stop'
-$script:RulesGiven = $PSBoundParameters.ContainsKey('ReplaceRules')
+# Subtitle Edit "multiple replace" rules for the OCR'd text: the file kept next to this script.
+$ReplaceRules = Join-Path $PSScriptRoot 'SE_Replace_Rules.template'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 # ---- Tunables
@@ -649,9 +646,8 @@ function Invoke-Main {
             if (-not $c) { throw "seconv not found: $SeConv (pass -SeConv, or set SeConv in the settings file)" }
             $SeConv = $c.Source
         }
-        if ($ReplaceRules -and -not [IO.File]::Exists($ReplaceRules)) {
-            if ($script:RulesGiven) { throw "-ReplaceRules not found: $ReplaceRules" }
-            Write-Warn "No multiple replace rules ($ReplaceRules not found); converting without them"; $ReplaceRules = ''
+        if (-not [IO.File]::Exists($ReplaceRules)) {
+            Write-Warn "No multiple replace rules ($ReplaceRules not found; it belongs next to this script); converting without them"; $ReplaceRules = ''
         }
 
         $tmpRoot = $(if ($WorkDir) { $WorkDir } else { [IO.Path]::GetTempPath() })

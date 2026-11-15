@@ -125,6 +125,7 @@ Every audio track is inspected to determine what type of a track it is.
 | `Convert-DolbyVision.ps1` | Dolby Vision profile 7 to 8.1: converts an MEL, bakes an FEL's enhancement layer into the picture (VapourSynth + felbaker), keeps titles with no usable metadata as they are. |
 | `Add-BluRayAudio.ps1` | Rebuilds an encode's audio from its source: keeps the lossless masters, adds a compatible default track (the TrueHD's AC-3 core, or a new AC-3 that copies its dialogue level and downmix settings), commentary tracks, Opus/AAC alternatives. |
 | `Convert-Subtitles.ps1` | OCRs English PGS subtitles to SRT with Subtitle Edit's command line, sorting forced, full, SDH and commentary tracks into Jellyfin names. |
+| `SE_Replace_Rules.template` | Subtitle Edit "multiple replace" rules that fix common OCR mistakes. Convert-Subtitles applies the copy next to it; edit it there (in Subtitle Edit: Tools > Multiple replace > Export). |
 | `compare_encode.sh` | VMAF scoring in WSL (GPU via libvmaf_cuda when available), with automatic frame alignment: seek-offset and start-offset detection, and drift detection that bisects and scores in parts. |
 | `Shared.ps1` | Loaded by every PowerShell script: the settings file and path handling. |
 | `Encode-Batch.Common.ps1` | Helpers for Encode-Batch and its workers: logging, running programs and WSL, probing. |

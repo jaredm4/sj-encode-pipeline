@@ -1,0 +1,30 @@
+{
+  "categories": [
+    {
+      "name": "Default",
+      "rules": [
+        {
+          "find": "^\\.(\\w)",
+          "replaceWith": "...$1",
+          "description": "fix beginning elipsis",
+          "isActive": true,
+          "type": "RegularExpression"
+        },
+        {
+          "find": " [SsJ]$",
+          "replaceWith": " \u266A",
+          "description": "failed music notes",
+          "isActive": true,
+          "type": "RegularExpression"
+        },
+        {
+          "find": "^[SsJ] ",
+          "replaceWith": "\u266A ",
+          "description": "failed music notes at start of line",
+          "isActive": true,
+          "type": "RegularExpression"
+        }
+      ]
+    }
+  ]
+}

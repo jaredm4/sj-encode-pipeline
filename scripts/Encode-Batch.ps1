@@ -362,13 +362,13 @@ param(
     [switch]$KeepVariants,
 
     # ...then .srt subtitles with Convert-Subtitles (OCR of the English tracks with seconv and
-    # PaddleOCR, shifted like the audio; see "Subtitles"). -NoSubtitles skips it. -SeConv and
-    # -SubtitleRules are passed on to it ('' = its defaults: seconv on PATH, and no replace rules;
-    # SeConv and ReplaceRules in the settings file's [All] section set both scripts).
+    # PaddleOCR, shifted like the audio; see "Subtitles"). -NoSubtitles skips it. -SeConv
+    # is passed on to it ('' = its default: seconv on PATH; SeConv in the settings file's [All]
+    # section sets both scripts). It uses the replace rules in SE_Replace_Rules.template, next
+    # to it.
     [string]$ConvertSubtitles = (Join-Path $PSScriptRoot 'Convert-Subtitles.ps1'),
     [switch]$NoSubtitles,
     [string]$SeConv = '',
-    [Alias('ReplaceRules')][string]$SubtitleRules = '',
 
     # Ladder mode: a title where no variant passes is finished with its SOURCE instead (copied
     # into place, then audio, subtitles, move up, failed encodes deleted), rather than left
@@ -1160,7 +1160,6 @@ $FinalizeBody = {
                 $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Cfg.ConvertSubs, '-Source', $subSrc, '-Dest', $subDir, '-Basename', $subBase,
                        '-OffsetMs', "$offset", '-LogPath', $subLog, '-Plumbing', '-WorkDir', $tmp)
                 if ($Cfg.SeConv) { $a += @('-SeConv', $Cfg.SeConv) }
-                if ($Cfg.SubRules) { $a += @('-ReplaceRules', $Cfg.SubRules) }
                 Write-Log "> Convert-Subtitles -Source `"$subSrc`" -Dest `"$subDir`" -Basename `"$subBase`" -OffsetMs $offset -LogPath `"$subLog`" -Plumbing"
                 $sub = $null
                 try { $r = Invoke-Logged -Exe $Cfg.Exe -ArgList $a -TempDir $tmp -StatusBase $status -ProgressPattern '^\x00$' -Quiet }
@@ -1502,12 +1501,8 @@ if ($finishing -and -not $NoSubtitles) {
     $seconvExe = Resolve-Program $(if ($SeConv) { $SeConv } else { 'seconv' })
     if (-not $seconvExe) { throw "seconv not found: '$(if ($SeConv) { $SeConv } else { 'seconv' })' (Subtitle Edit's command line; pass -SeConv or set SeConv in the settings file, or use -NoSubtitles)." }
     $SeConv = $seconvExe
-    if ($SubtitleRules) {
-        $SubtitleRules = Resolve-UserPath $SubtitleRules
-        if (-not [IO.File]::Exists($SubtitleRules)) { throw "-SubtitleRules not found: $SubtitleRules" }
-    } else {
-        Write-Log 'Subtitles: no multiple replace rules (-SubtitleRules, or ReplaceRules in the settings file)'
-    }
+    $subRules = Join-Path ([IO.Path]::GetDirectoryName($ConvertSubtitles)) 'SE_Replace_Rules.template'
+    if (-not [IO.File]::Exists($subRules)) { Write-Log "Subtitles: no multiple replace rules ($subRules not found; it belongs next to Convert-Subtitles.ps1); converting without them" 'Yellow' }
     $mkvx = Get-Command mkvextract -ErrorAction SilentlyContinue
     if (-not $mkvx -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvextract.exe'))) { throw 'mkvextract not found (Convert-Subtitles needs MKVToolNix): add "C:\Program Files\MKVToolNix" to PATH, or use -NoSubtitles.' }
     if (-not (Get-Command mkvmerge -ErrorAction SilentlyContinue) -and -not [IO.File]::Exists((Join-Path "$env:ProgramFiles" 'MKVToolNix\mkvmerge.exe'))) { throw 'mkvmerge not found (Convert-Subtitles needs MKVToolNix): add "C:\Program Files\MKVToolNix" to PATH, or use -NoSubtitles.' }
@@ -2362,7 +2357,7 @@ function Start-Finalize($t) {
         Doc = $t.FinalDoc; FinalJson = $t.FinalJson
         VariantDirs = @(Get-VariantDirs $t) + @($(if ($t.FinalDoc.PSObject.Properties['FromSource'] -and $t.FinalDoc.FromSource) { Split-Path -Parent $t.FinalDoc.Winner }))
         AddAudio = $AddBluRayAudio; Exe = (Get-Process -Id $PID).Path; NoAudio = [bool]$NoAudio; KeepVariants = [bool]$KeepVariants
-        IsDerived = [bool]$t.IsDerived; NewDefaultTrack = [bool]$NewDefaultTrack; SkipCommentaries = [bool]$SkipCommentaries; ConvertSubs = $ConvertSubtitles; NoSubtitles = [bool]$NoSubtitles; SeConv = $SeConv; SubRules = $SubtitleRules
+        IsDerived = [bool]$t.IsDerived; NewDefaultTrack = [bool]$NewDefaultTrack; SkipCommentaries = [bool]$SkipCommentaries; ConvertSubs = $ConvertSubtitles; NoSubtitles = [bool]$NoSubtitles; SeConv = $SeConv
     }
     $job = Start-Job -ScriptBlock $FinalizeWorker -ArgumentList ($cfg | ConvertTo-Json -Depth 8 -Compress)
     $running[$job.Id] = [pscustomobject]@{ Job = $job; Kind = 'finalize'; Title = $t; Task = $null; Slot = -1; Start = Get-Date; StatusFile = $statusFile; Label = 'FINISH' }
