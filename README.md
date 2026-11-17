@@ -83,26 +83,47 @@ Storage is (no longer) cheap. Simple as that. I also have not seen a good reason
 Netflix says a score difference of 6 is noticeable by your eyes. That would mean 94 is a better target Mean. I may do that in the future but 93.5 has suited me well. And again, it's just a bar, the encode has to be _greater_ than that. They usually are 94+.
 
 ### Compatibility
-1. Audio is re-organized so an AC3 5.1 track is always available and is the default (unless the masters are \<6 channels). Stereo-only masters will get either AC3 2.0 or AAC depending on if they are Dolby or other (DTS, LPCM, etc). See the Audio section below for more details.
+1. Audio is re-organized so an AC3 5.1 track is always available and is the default (unless the masters are \<6 channels). Stereo-only masters will get either AC3 2.0 or AAC depending on if they are Dolby or other (DTS, LPCM, etc). See the audio matrix in the Audio section below for what happens to each kind of track.
 1. Dolby Vision profile 7.6 are converted or baked to profile 8.1 depending on if they are MEL or either FEL.
 1. Jellyfin support. This primarily means file naming is expected to match what they want, but also the generated subtitles are external files. It'll use the filenames you feed into it, but subtitles will has suffixes based on what Jellyfin expects.
 
 ### Audio
-The logic at the moment flows something like this (may change in the future, see `Add-BluRayAudio.ps1` for most up-to-date practice):
 
-Every audio track is inspected to determine what type of a track it is.
-- Masters are defined by greatest number of channels and lossless-ness. But not all masters are lossless nor multi-channel.
-  - Dolby TrueHD w/ Atmos and DTS:X Masters are preserved as-is (because object-based audio encoding is problematic for the moment without a Dolby license $$$).
-  - Dolby TrueHD masters have an AC3 core that is used as the new default track (for compatibility). If that core is \<448 kbps, it is re-encoded from the master at 640 kbps (for 5.1). Dialog normalization metadata is left intact (copied).
-  - Non-Dolby masters get a new AC3 track encoded for the default (again for compatibility).
-  - DTS:HD (non-X) is left as-is for now, but may change in the future to Opus for space savings.
-  - Stereo masters will get encoded to AAC (for compatibility) and set as the default track if no multi-channel master exists.
-  - Any other lossless format (LPCM, etc) is also encoded to Opus as the "higher quality" track for devices that support Opus.
-  - Multiple lossless masters are all kept (rare, but I've seen it), encoded or not based on the rules above.
-  - Lossy masters are generally kept as is, but an AC3 track may be added (transcoded) if needed.
-- Non-masters/lossy tracks are checked to determine what they are.
-  - If a track is deemed to be a commentary track, it is kept and numbered sequentially for now (as it cannot determine what type of commentary it is).
-  - Tracks not thought to be commentary tracks and also not a solo lossy master is discarded (not copied).
+Every source track is sorted into masters (lossless tracks), lossy tracks and commentaries, and each gets one of the outcomes below. The aim: keep anything that can't be re-encoded without losing something, shrink what can be, and always have a default track every device can play. `Add-BluRayAudio.ps1`'s help has the finer details.
+
+**Masters (lossless tracks)**
+
+| Audio in | Audio out | Why |
+|---|---|---|
+| Dolby TrueHD with Atmos | Kept as is | Atmos is object-based. Nothing (today) can cleanly encode it without a Dolby license. |
+| Dolby TrueHD, no Atmos (any channel count) | Kept as is | TrueHD carries a dialogue level (how much the player turns it down). Opus has nowhere to put it, so an Opus copy would play louder than the other tracks. AC-3 can carry it, but at 640 kbps for 5.1, AC-3 can't be transparent. |
+| DTS-HD MA + DTS:X | Kept as is | Object-based, like Atmos. |
+| DTS-HD MA (no DTS:X) | Opus | Channel-based, and no dialogue level is used. Only when ffprobe 6.1 or later reports plain "DTS-HD MA": older versions call DTS:X "DTS-HD MA" too, so it's kept. |
+| LPCM, FLAC, ALAC | Opus | Channel-based, nothing to lose but bits. |
+| Any of the above in an unusual layout (wide or height channels, 3.0, quad...) | Kept as is | Opus would remap the channels. Only mono, stereo, 5.1, 6.1 and 7.1 are converted. |
+| MLP (DVD-Audio) | Kept as is | TrueHD's predecessor; rare enough not to bother. |
+| Opus made by an earlier run (`ADD_BLURAYAUDIO` tag) | Kept as is | It's already the master; re-encoding would lose quality. |
+
+Opus rates: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1. The Opus track is tagged with what it was made from, since the original isn't kept.
+
+**The default (compatibility) track**, made from the main master (most channels, then highest bitrate):
+
+| Main master | Default track | Why |
+|---|---|---|
+| TrueHD 5.1 or 7.1 | Its AC-3 core, copied* | It's the disc's own track, with the right dialogue level and downmix settings. *A core under 448 kbps (or none) stops the title; re-running with `-NewDefaultTrack` encodes a new AC-3 5.1 at 640 kbps instead, copying the core's (or the TrueHD's) dialogue level and downmix settings. |
+| Other 5.1 or more (DTS-HD MA, LPCM...) | The disc's AC-3 5.1 if it's the same mix, else a new AC-3 5.1 at 640 kbps | AC-3 plays everywhere, and passes through to any receiver. |
+| Stereo or mono | The disc's lossy track with the same channels if it's the same mix, else a new AAC | AAC is the better codec at these channel counts. With `-LossyPerMaster`, a TrueHD 2.0 gets a new AC-3 2.0 (320 kbps) instead, to keep its dialogue level. |
+| No lossless track at all | The best lossy track: AC-3, E-AC-3 or AAC copied; anything else converted to AC-3 5.1 or AAC (and the original kept as the master) | Something every device can play. |
+
+**Everything else**
+
+| Audio in | Audio out | Why |
+|---|---|---|
+| Commentary (a lossy track that doesn't match the main mix) | Kept, titled Commentary1, Commentary2... | Can't tell what kind of commentary it is yet. `-SkipCommentaries` drops them. |
+| A lossless copy of a kept commentary | Dropped | Same audio twice. |
+| Other lossy tracks (the disc's own lower-quality copies of the masters) | Dropped | The masters and the default track cover them. |
+| Every other master, with `-LossyPerMaster` | Also gets its own lossy track (same rules as the default track) | For releases with masters in two languages. |
+| Masters, with `-PassthruMasters None` | Dropped | Lossy tracks only. |
 
 ### Limitations
 
@@ -123,10 +144,11 @@ Every audio track is inspected to determine what type of a track it is.
 | `Encode-Video.ps1` | One NVEncC encode (crop, HDR10 / HDR10+ / Dolby Vision metadata). |
 | `CropDetect.ps1` | Finds black bars (and soft, darkened edges) by sampling frames. |
 | `Convert-DolbyVision.ps1` | Dolby Vision profile 7 to 8.1: converts an MEL, bakes an FEL's enhancement layer into the picture (VapourSynth + felbaker), keeps titles with no usable metadata as they are. |
-| `Add-BluRayAudio.ps1` | Rebuilds an encode's audio from its source: keeps the lossless masters, adds a compatible default track (the TrueHD's AC-3 core, or a new AC-3 that copies its dialogue level and downmix settings), commentary tracks, Opus/AAC alternatives. |
+| `Add-BluRayAudio.ps1` | Rebuilds an encode's audio from its source: keeps the lossless masters, adds a compatible default track (the TrueHD's AC-3 core, or a new AC-3 that copies its dialogue level and downmix settings), stores channel-based masters as Opus, and keeps commentary tracks. |
 | `Convert-Subtitles.ps1` | OCRs English PGS subtitles to SRT with Subtitle Edit's command line, sorting forced, full, SDH and commentary tracks into Jellyfin names. |
 | `SE_Replace_Rules.template` | Subtitle Edit "multiple replace" rules that fix common OCR mistakes. Convert-Subtitles applies the copy next to it; edit it there (in Subtitle Edit: Tools > Multiple replace > Export). |
 | `compare_encode.sh` | VMAF scoring in WSL (GPU via libvmaf_cuda when available), with automatic frame alignment: seek-offset and start-offset detection, and drift detection that bisects and scores in parts. |
+| `Find-OpusSources.ps1` | Audit: lists the Opus tracks in a library and what each was encoded from (track tag, Encode-Batch records, or Add-BluRayAudio logs), to find stereo ones made from TrueHD before that stopped. Reads only. |
 | `Shared.ps1` | Loaded by every PowerShell script: the settings file and path handling. |
 | `Encode-Batch.Common.ps1` | Helpers for Encode-Batch and its workers: logging, running programs and WSL, probing. |
 

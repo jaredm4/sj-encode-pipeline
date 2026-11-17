@@ -76,9 +76,14 @@
        clip settings are at the top of the script, for tuning.
     5. Output track order: default track, then commentary (flagged as commentary),
        then every master (main one first; none with -PassthruMasters None). Everything
-       else is dropped. PCM, FLAC and ALAC masters, and DTS-HD MA / TrueHD masters in
-       stereo or mono (channel-based, no Atmos/DTS:X objects) are stored as Opus to save
+       else is dropped. PCM, FLAC, ALAC and DTS-HD MA masters are stored as Opus to save
        space: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1 ($OpusKbps at the top).
+       Only channel-based audio Opus can hold exactly: DTS-HD MA only when ffprobe reports
+       plain "DTS-HD MA" (DTS:X is object-based, and an ffprobe older than 6.1 can't tell
+       them apart), and only mono, stereo, 5.1, 6.1 or 7.1 (anything else would be remapped).
+       Dolby TrueHD (with Atmos or not, any channel count) and MLP are always kept as they
+       are: Atmos is object-based, and a TrueHD stream carries a dialogue level (how much
+       the player turns it down) that Opus has no place for.
        The original isn't kept, so the Opus track gets a track tag, ADD_BLURAYAUDIO =
        "Keep; from PCM 2.0 master" (Keep, then where it came from). When this script runs
        on a file that has it (e.g. on a finished file against itself), that track is a
@@ -86,8 +91,7 @@
        -PassthruMasters None drops it, like any master). Copied tracks get no tag. A file
        made before the tag existed has none: run it against its Blu-ray source once (the
        missing tag alone makes it redo the file), and its Opus track gets the tag.
-       TrueHD and DTS-HD MA surround masters are always copied unchanged. Chapters come from the
-       source MKV.
+       Every other master is copied unchanged. Chapters come from the source MKV.
        Metadata comes from the file name, using Matroska's tag scheme: bracketed parts
        like " [tmdbid-1234]" are removed and trailing ".tag" parts become " [tag]".
          Episodes: "Show Name (2024) S01E04 Episode Title" -> title "Episode Title", show
@@ -672,6 +676,48 @@ function Get-OpusKbps([int]$Channels) {
     return [Math]::Min(256 * $Channels, 64 * [Math]::Max(1, $Channels))
 }
 
+# Why a lossless master can't be stored as Opus ('' = it can). Opus is for channel-based
+# audio with nothing Opus can't hold:
+#   - TrueHD (and MLP, its predecessor): kept. Atmos is object-based, and a TrueHD stream's
+#     dialogue level (how much the player turns it down) has no place in Opus: the Opus
+#     track would play louder than the disc's other tracks.
+#   - DTS-HD MA: only when ffprobe says plain "DTS-HD MA". DTS:X is object-based, and
+#     ffprobe only tells the two apart from 6.1 on (older ones say "DTS-HD MA" for both).
+#   - PCM, FLAC, ALAC: yes.
+#   - Only mono, stereo, 5.1, 6.1 and 7.1: other layouts (wide or height channels, 3.0,
+#     quad...) would be remapped.
+function Get-OpusBlocker($Track) {
+    if (-not $Track.Lossless) { return 'not lossless' }
+    switch -Regex ($Track.Codec) {
+        '^(pcm_.*|flac|alac)$' { break }
+        '^dts$' {
+            if ($Track.Profile -ne 'DTS-HD MA') { return "$($Track.Name): object-based, or not plain DTS-HD MA" }
+            if (-not $script:FfprobeKnowsDtsX) { return "ffprobe $($script:FfprobeVersion) can't tell DTS:X from DTS-HD MA (6.1 or later can)" }
+            break
+        }
+        '^truehd$' { return "TrueHD: Opus can't carry its dialogue level$(if ($Track.Name -match 'Atmos') { ' (and Atmos is object-based)' })" }
+        '^mlp$' { return 'MLP: kept like TrueHD' }
+        default { return "$($Track.Codec) isn't converted" }
+    }
+    if ($Track.Layout) {
+        if (@('mono', 'stereo', '5.1', '5.1(side)', '6.1', '7.1') -notcontains $Track.Layout) { return "channel layout $($Track.Layout) (Opus would remap it)" }
+    } elseif (@(1, 2, 6, 8) -notcontains $Track.Channels) {
+        return "$($Track.Channels) channels with no layout"
+    }
+    ''
+}
+
+# Whether this ffprobe tells DTS:X from DTS-HD MA (added to FFmpeg in March 2023, released in
+# 6.1): from its version, or for a build from git, its date.
+function Test-FfprobeKnowsDtsX {
+    $script:FfprobeVersion = 'of unknown version'
+    try { $v = [string](& $script:ffprobe -version 2>$null | Select-Object -First 1) } catch { return $false }
+    if ($v -match 'version\s+(\S+)') { $script:FfprobeVersion = $Matches[1] }
+    if ($v -match 'version\s+n?(\d+)\.(\d+)') { return ([version]"$($Matches[1]).$($Matches[2])" -ge [version]'6.1') }
+    if ($v -match '(20\d\d)-?([01]\d)-?([0-3]\d)') { return ([int]"$($Matches[1])$($Matches[2])$($Matches[3])" -ge 20230401) }
+    $false
+}
+
 function New-Result([string]$Status, [string]$Message) {
     return [pscustomobject]@{ Status = $Status; Message = $Message }
 }
@@ -961,6 +1007,8 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             Pos      = $i
             MkvId    = $srcMkvAudioIds[$i]
             Codec    = $codecName
+            Profile  = $codecProfile
+            Layout   = [string](Get-Field $st 'channel_layout')
             Name     = Get-FriendlyName $codecName $codecProfile
             Channels = [int](ConvertTo-Number (Get-Field $st 'channels'))
             BitRate  = $bitrate
@@ -1290,12 +1338,11 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
         $outputs.Add($track)
     }
     foreach ($m in $keep) {
-        # (DTS-HD MA / TrueHD in stereo or mono: no Atmos / DTS:X objects there either.)
-        $channelBased = ($m.Codec -match '^(pcm_.*|flac|alac)$') -or ($m.Lossless -and $m.Channels -le 2 -and $m.Codec -match '^(dts|truehd|mlp)$')
-        if ($channelBased) {
-            # Channel-based lossless (no Atmos/DTS:X objects to keep for a future format):
-            # stored as high-bitrate Opus to save space. The original isn't kept, so the Opus
-            # track gets the Keep tag: a later run (e.g. on this file itself) keeps it as the master.
+        $blocker = if ($m.Keep) { 'Keep tag' } else { Get-OpusBlocker $m }
+        if (-not $blocker) {
+            # Channel-based lossless (no objects or dialogue level to lose): stored as
+            # high-bitrate Opus to save space. The original isn't kept, so the Opus track
+            # gets the Keep tag: a later run (e.g. on this file itself) keeps it as the master.
             $ok = Get-OpusKbps $m.Channels
             $t = New-OutputTrack 'encode' $m.Pos 'libopus' $ok 0 "Opus $(Get-ChannelLabel $m.Channels)" `
                 "audio $($m.Pos): $($m.Name) encoded to Opus at $ok kbps (tagged Keep)" "opus $($m.Channels) keep"
@@ -1306,6 +1353,7 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $layout = "$($m.Codec) $($m.Channels)"
             if ($m.Keep) { $note = "audio $($m.Pos): copied (Keep tag: $($m.Keep))"; $layout += ' keep' }
             elseif (-not $m.Lossless) { $note = "audio $($m.Pos): copied (original lossy track; the default track is a converted copy)" }
+            else { $note = "audio $($m.Pos): copied (not stored as Opus: $blocker)" }
             $outputs.Add((New-OutputTrack 'source' $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note $layout))
         }
     }
@@ -1779,6 +1827,8 @@ trap {
 
 $script:ffmpeg = Get-Tool 'ffmpeg'
 $script:ffprobe = Get-Tool 'ffprobe'
+$script:FfprobeKnowsDtsX = Test-FfprobeKnowsDtsX
+if (-not $script:FfprobeKnowsDtsX) { Write-Host "Note: ffprobe $($script:FfprobeVersion) can't tell DTS:X from DTS-HD MA (6.1 or later can), so DTS-HD MA masters are kept as they are." -ForegroundColor Yellow }
 $script:mkvmerge = Get-Tool 'mkvmerge'
 
 if (-not (Test-Path -LiteralPath $Source)) { throw "Source not found: $Source" }
