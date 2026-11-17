@@ -150,7 +150,7 @@ Every track the pipeline encodes (except commentaries) is named after its source
 | `Convert-Subtitles.ps1` | OCRs English PGS subtitles to SRT with Subtitle Edit's command line, sorting forced, full, SDH and commentary tracks into Jellyfin names. |
 | `SE_Replace_Rules.template` | Subtitle Edit "multiple replace" rules that fix common OCR mistakes. Convert-Subtitles applies the copy next to it; edit it there (in Subtitle Edit: Tools > Multiple replace > Export). |
 | `compare_encode.sh` | VMAF scoring in WSL (GPU via libvmaf_cuda when available), with automatic frame alignment: seek-offset and start-offset detection, and drift detection that bisects and scores in parts. |
-| `Find-OpusSources.ps1` | Audit: lists the Opus tracks in a library and what each was encoded from (track tag, Encode-Batch records, or Add-BluRayAudio logs), to find stereo ones made from TrueHD before that stopped. Reads only. |
+| `Find-OpusSources.ps1` | Audit: lists the Opus tracks in a library and what each was encoded from (track tag, Encode-Batch records, or Add-BluRayAudio logs), to find stereo ones made from TrueHD. With `-Rename`, names the tracks the pipeline encoded after their source ("Opus 5.1 from DTS-HD MA"), in place with mkvpropedit; `-WhatIf` shows the renames first. |
 | `Shared.ps1` | Loaded by every PowerShell script: the settings file and path handling. |
 | `Encode-Batch.Common.ps1` | Helpers for Encode-Batch and its workers: logging, running programs and WSL, probing. |
 
