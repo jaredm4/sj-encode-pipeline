@@ -38,7 +38,11 @@ Search the internet and you'll find countless (aging or repeated) comments of "H
 
 That said, I'm sure NVENC has gotten better over time, and I'm only comparing with my RTX 4090. So I only have a newer version to test with, and I like the results and the speed. 
 
-## Hurr durr VMAF sucks, use x instead
+## Where AV1?
+
+For now, compatibility wins this race. I want to switch too. But not yet.
+
+## "VMAF sucks, use __ instead!"
 
 I have had zero problems with VMAF, nor has the entire publishing industry. There may be ways to improve scoring, but my bar is high enough that even those areas that could be improved are already caught by VMAF. Every single video issue I thought was an encoding issue turned out to exist on the source file or blu-ray. Every single one.
 
