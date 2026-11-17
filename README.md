@@ -104,7 +104,9 @@ Every source track is sorted into masters (lossless tracks), lossy tracks and co
 | MLP (DVD-Audio) | Kept as is | TrueHD's predecessor; rare enough not to bother. |
 | Opus made by an earlier run (`ADD_BLURAYAUDIO` tag) | Kept as is | It's already the master; re-encoding would lose quality. |
 
-Opus rates: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1. The Opus track is tagged with what it was made from, since the original isn't kept.
+Opus rates: 96 kbps per full channel, so 96 kbps mono, 192 stereo, 480 for 5.1 and 672 for 7.1 (the LFE costs next to nothing). The Opus track is tagged with what it was made from, since the original isn't kept.
+
+Every track the pipeline encodes (except commentaries) is named after its source, e.g. "Opus 5.1 from DTS-HD MA" or "Dolby Digital 5.1 from TrueHD Atmos 7.1" (the source's channels only when they differ). Copied tracks keep their plain name, e.g. "Dolby Digital 5.1" for a TrueHD's AC-3 core, so the name also tells you whether a track is the disc's own.
 
 **The default (compatibility) track**, made from the main master (most channels, then highest bitrate):
 

@@ -77,7 +77,7 @@
     5. Output track order: default track, then commentary (flagged as commentary),
        then every master (main one first; none with -PassthruMasters None). Everything
        else is dropped. PCM, FLAC, ALAC and DTS-HD MA masters are stored as Opus to save
-       space: 96 kbps mono, 192 stereo, 384 for 5.1, 672 for 7.1 ($OpusKbps at the top).
+       space: 96 kbps mono, 192 stereo, 480 for 5.1, 672 for 7.1 ($OpusKbps at the top).
        Only channel-based audio Opus can hold exactly: DTS-HD MA only when ffprobe reports
        plain "DTS-HD MA" (DTS:X is object-based, and an ffprobe older than 6.1 can't tell
        them apart), and only mono, stereo, 5.1, 6.1 or 7.1 (anything else would be remapped).
@@ -88,7 +88,12 @@
        "Keep; from PCM 2.0 master" (Keep, then where it came from). When this script runs
        on a file that has it (e.g. on a finished file against itself), that track is a
        master: copied as is, never compared, dropped or converted again (only
-       -PassthruMasters None drops it, like any master). Copied tracks get no tag. A file
+       -PassthruMasters None drops it, like any master). Copied tracks get no tag.
+       Track names: every track this script encodes (except commentaries) is named after
+       what it was made from, e.g. "Opus 5.1 from DTS-HD MA", "Dolby Digital 5.1 from
+       TrueHD Atmos 7.1" (the source's channels only when they differ). Copied tracks keep
+       the plain name ("Dolby Digital 5.1"), except an Opus master with the Keep tag (named
+       from its tag) or a track that already has a name like that (from an earlier run). A file
        made before the tag existed has none: run it against its Blu-ray source once (the
        missing tag alone makes it redo the file), and its Opus track gets the tag.
        Every other master is copied unchanged. Chapters come from the source MKV.
@@ -335,10 +340,11 @@ $NarrationMaxQuieter  = 10    # ...if its quieter share stays below this (nothin
 $SameMixMaxPercent    = 3     # louder and quieter shares both below this: same mix
 $CommentaryCopyMaxPercent = 10  # lossless track vs a kept commentary, both below this: a copy of it
 $CoreMinKbps          = 448   # minimum bitrate for a TrueHD's AC-3 core
-# Opus bitrates (kbps) for channel-based lossless masters (PCM, FLAC, ALAC), which have no
-# object audio to preserve. Xiph's top recommendations x1.5 for headroom (as 128 -> 192
-# for stereo). libopus allows at most 256 kbps per channel.
-$OpusKbps = @{ 1 = 96; 2 = 192; 6 = 384; 8 = 672 }
+# Opus bitrates (kbps) for channel-based lossless masters (PCM, FLAC, ALAC, DTS-HD MA): 96
+# kbps per full channel (the LFE costs next to nothing): Xiph's top recommendation for
+# stereo (128) x1.5 for headroom, the same for every layout. libopus allows at most 256 kbps
+# per channel.
+$OpusKbps = @{ 1 = 96; 2 = 192; 6 = 480; 8 = 672 }
 $CheckClipCount       = 6     # comparison clips per title, spread over 15-80% of the runtime...
 $CheckOpeningClip     = $true # ...plus one starting 5 s in: the opening is often quiet in the
                               # film, while commentators introduce themselves right away
@@ -674,6 +680,38 @@ function Get-TrackDesc($Track) {
 function Get-OpusKbps([int]$Channels) {
     if ($OpusKbps.ContainsKey($Channels)) { return $OpusKbps[$Channels] }
     return [Math]::Min(256 * $Channels, 64 * [Math]::Max(1, $Channels))
+}
+
+# A source track's short name for track names: "Opus 5.1 from <this>".
+function Get-SourceLabel([string]$Name) {
+    switch ($Name) {
+        'Dolby TrueHD + Dolby Atmos' { return 'TrueHD Atmos' }
+        'Dolby TrueHD'               { return 'TrueHD' }
+        'DTS-HD MA + DTS:X'          { return 'DTS:X' }
+        'DTS-HD MA + DTS:X IMAX'     { return 'DTS:X IMAX' }
+        'PCM'                        { return 'LPCM' }
+        'Meridian Lossless Packing'  { return 'MLP' }
+    }
+    $Name
+}
+
+# Names the planned tracks after where they came from (see "Track names" in the help).
+function Set-SourceTitles($Outputs, $Audio) {
+    foreach ($o in $Outputs) {
+        if ($o.IsCommentary) { continue }
+        $s = $Audio[$o.SrcPos]
+        if ($o.From -eq 'encode') {
+            $outCh = [int](($o.Layout -split ' ')[1])
+            $from = Get-SourceLabel $s.Name
+            if ($s.Channels -ne $outCh) { $from += " $(Get-ChannelLabel $s.Channels)" }
+            $o.Title = "$($o.Title) from $from"
+        } elseif ($s.Keep -and $s.Keep -match '\bfrom (.+?) (\d\.\d|\d+ ch) master\s*$') {
+            # An Opus master from an earlier run: its tag says what it was made from.
+            $o.Title = "$($o.Title) from $(Get-SourceLabel $Matches[1])"
+        } elseif ($s.Title -and $s.Title -like "$($o.Title) from *") {
+            $o.Title = $s.Title
+        }
+    }
 }
 
 # Why a lossless master can't be stored as Opus ('' = it can). Opus is for channel-based
@@ -1357,13 +1395,12 @@ function Invoke-AudioRebuild([string]$SourceFile, [string]$DestFile) {
             $outputs.Add((New-OutputTrack 'source' $m.Pos 'copy' 0 0 "$($m.Name) $(Get-ChannelLabel $m.Channels)" $note $layout))
         }
     }
+    Set-SourceTitles $outputs $audio
     $plannedLayout = @($outputs | ForEach-Object { $_.Layout })
     $usedPos = @($outputs | ForEach-Object { $_.SrcPos })
 
-    # e.g. "Dolby Digital 5.1 (from DTS-HD MA 5.1), Commentary, DTS-HD MA 5.1"
-    $trackLabel = (@($outputs | ForEach-Object {
-        if ($_.From -eq 'encode' -and -not $_.IsCommentary -and ($_.SrcPos -eq $pick.Pos -or $_ -in $compats)) { "$($_.Title) (from $($audio[$_.SrcPos].Name) $(Get-ChannelLabel $audio[$_.SrcPos].Channels))" } else { $_.Title }
-    })) -join ', '
+    # e.g. "Dolby Digital 5.1 from DTS-HD MA, Commentary, Opus 5.1 from DTS-HD MA"
+    $trackLabel = (@($outputs | ForEach-Object { $_.Title })) -join ', '
 
     # For -Plumbing: the planned tracks with their roles, and what was dropped and why.
     $script:PlanTracks = @(for ($i = 0; $i -lt $outputs.Count; $i++) {
