@@ -283,7 +283,7 @@ param(
     [ValidateRange(1, 4)][int]$DoviThreads = 1,
 
     # VMAF bar a variant must meet to pass.
-    [double]$MinMean = 93.5,
+    [double]$MinMean = 94,
     [double]$MinP1 = 80,
     [double]$MinMin = 75,
 

@@ -36,7 +36,7 @@ Credit where it is due, FastFlix helped me solve one component of how to do Dolb
 
 Search the internet and you'll find countless (aging or repeated) comments of "Hardware encoding bad, software only one true god". I did not find that the case. All of my NVENCs have been phenominal on quality and space savings (with some caveats on harder grainier film). I didn't do exhaustive testing, but the software encoding I did do came out with _larger_ files than with NVENC, while of course taking much, much longer.
 
-That said, I'm sure NVENC has gotten better over time, and I'm only comparing with my RTX 4090. So I only have a newer version to test with, and I like the results and the speed. 
+That said, I'm sure NVENC has gotten better over time, and I'm only comparing with my RTX 4090. So I only have a newer version to test with, and I like the results and the speed.
 
 ## Where AV1?
 
@@ -68,7 +68,7 @@ Further, if the video is well under the target of 20% and passing the bar, it'll
 
 ```
 bar:
-mean: >= 93.5
+mean: >= 94
 p1: >= 80
 min: >= 75
 video stream size: <= 70% of the source's
@@ -80,11 +80,11 @@ p1: >= 85
 min: >= 80.
 ```
 
-### Why a Mean of 93.5 and not 95?
+### Why a Mean of 94 and not 95?
 
-Storage is (no longer) cheap. Simple as that. I also have not seen a good reason to increase it on my encodes. But you've probably read online that 95 is a good target for archival purposes. If you want 95, and have the storage needed to achieve it, then set it. You do you. My NAS just isn't as large as I'd like and it was still a small fortune.
+Storage is (no longer) cheap. Simple as that. You've probably read online that 95 is a good target for archival purposes. If you want 95, and have the storage needed to achieve it, then set it. You do you. My NAS just isn't as large as I'd like and it was still a small fortune.
 
-Netflix says a score difference of 6 is noticeable by your eyes. That would mean 94 is a better target Mean. I may do that in the future but 93.5 has suited me well. And again, it's just a bar, the encode has to be _greater_ than that. They usually are 94+.
+Netflix says a score difference of 6 is noticeable by your eyes. So I landed on >=94.
 
 ### Compatibility
 1. Audio is re-organized so an AC3 5.1 track is always available and is the default (unless the masters are \<6 channels). Stereo-only masters will get either AC3 2.0 or AAC depending on if they are Dolby or other (DTS, LPCM, etc). See the audio matrix in the Audio section below for what happens to each kind of track.
