@@ -566,6 +566,32 @@ PYEOF
 # points; flat animation only by ~8-10, as a neighbouring frame looks much the same.)
 clear_win() { awk -v a="$1" -v b="$2" 'BEGIN { exit !((a >= 90 && a - b >= 5) || (a >= 70 && a - b >= 10)) }'; }
 
+# decisive <best> <next best>: whether an alignment check tells the shifts apart at all. In a
+# still or near-still shot the frames either side look the same, so every shift scores within a
+# fraction of a point and the "best" is noise (it once read as the shift changing near the end
+# of a film, sending the drift search after a change that wasn't there). Moving picture
+# separates them by 8+ points even in flat animation. DECISIVE_MARGIN overrides the 2 points.
+decisive() { awk -v a="$1" -v b="$2" -v m="${DECISIVE_MARGIN:-2}" 'BEGIN { exit !(a - b >= m) }'; }
+
+# probe_near <seconds> <lo> <hi> <step>: probe_shift at <seconds>; when that can't tell the
+# shifts apart (see decisive), the same <step> seconds later, earlier, then 2 and 3 steps away,
+# staying within <lo>..<hi>, until a check can. Prints "<shift> <score> <next best> <at> <1|0>"
+# (1: decisive; 0: nothing nearby was, and the shift is a guess).
+probe_near() {
+  local off=$1 lo=$2 hi=$3 step=$4 k at S=0 SC=0 SB=0 said=0
+  for k in 0 1 -1 2 -2 3 -3; do
+    at=$(( off + k * step ))
+    { [ "$at" -lt "$lo" ] || [ "$at" -gt "$hi" ]; } && continue
+    read -r S SC SB <<< "$(probe_shift "$at")"
+    if decisive "$SC" "$SB"; then echo "$S $SC $SB $at 1"; return; fi
+    if [ "$said" -eq 0 ]; then
+      echo "  -> at ${at}s every shift scores about the same (a still or near-still shot?): it can't tell them apart; trying ${step}s either side ..." >&2
+      said=1
+    fi
+  done
+  echo "$S $SC $SB $off 0"
+}
+
 # Given a frame-shift integer, echoes "<enc_trim>|<ref_trim>" filter-chain fragments (either
 # may be empty) that compensate for it. Read back with: IFS='|' read -r DT RT. (A space as the
 # separator loses an empty first field, which put a negative shift's trim on the wrong file.)
@@ -748,10 +774,26 @@ score_pair() {
   if [ "$FULL" -eq 1 ]; then
     P10=$(( DO * 10 / 100 )); P50=$(( DO / 2 )); P90=$(( DO * 90 / 100 ))
     echo "Full-file mode: checking alignment at 10% (${P10}s), 50% (${P50}s), and 90% (${P90}s) ..."
-    read -r S10 SC10 _ <<< "$(probe_shift "$P10")"
-    read -r S50 SC50 _ <<< "$(probe_shift "$P50")"
-    read -r S90 SC90 _ <<< "$(probe_shift "$P90")"
-    echo "  10%: shift ${S10} (score ${SC10})   50%: shift ${S50} (score ${SC50})   90%: shift ${S90} (score ${SC90})"
+    # A point that can't tell the shifts apart moves up to 3 minutes either way to one that can
+    # (P10 / P50 / P90 become where the check was made). One that still can't is left out: it
+    # takes another point's shift, as any shift scores the same there.
+    local D10 D50 D90 A10 A50 A90 REFS
+    read -r S10 SC10 _ A10 D10 <<< "$(probe_near "$P10" 0 $(( P50 - 30 )) 60)"
+    read -r S50 SC50 _ A50 D50 <<< "$(probe_near "$P50" $(( P10 + 30 )) $(( P90 - 30 )) 60)"
+    read -r S90 SC90 _ A90 D90 <<< "$(probe_near "$P90" $(( P50 + 30 )) $(( DO - ${PROBE_LEN:-20} - 5 )) 60)"
+    P10=$A10; P50=$A50; P90=$A90
+    if [ "$D10$D50$D90" != "111" ]; then
+      if [ "$D50" = 1 ]; then REFS=$S50; elif [ "$D10" = 1 ]; then REFS=$S10; elif [ "$D90" = 1 ]; then REFS=$S90
+      else
+        echo "  WARNING: none of the three checks could tell the shifts apart (a very still film?); assuming the midpoint's shift (${S50})."
+        REFS=$S50
+      fi
+      local why="it's taken to line up like the rest (shift ${REFS}): any shift scores the same there."
+      [ "$D10" = 1 ] || { echo "  -> nothing near 10% tells the shifts apart; ${why}"; S10=$REFS; }
+      [ "$D50" = 1 ] || { echo "  -> nothing near 50% tells the shifts apart; ${why}"; S50=$REFS; }
+      [ "$D90" = 1 ] || { echo "  -> nothing near 90% tells the shifts apart; ${why}"; S90=$REFS; }
+    fi
+    echo "  10% (${P10}s): shift ${S10} (score ${SC10})   50% (${P50}s): shift ${S50} (score ${SC50})   90% (${P90}s): shift ${S90} (score ${SC90})"
     if ! { [ "$S10" = "$S50" ] && [ "$S50" = "$S90" ]; } && [ "$REF_CFR" = "auto" ] && [ -z "$RFPS" ]; then
       [ -z "$REALFPS" ] && REALFPS=$(grid_fps "$ENC")
       GRID=$REALFPS
@@ -827,7 +869,14 @@ score_pair() {
         lo=${PTS[$i]}; hi=${PTS[$((i + 1))]}
         while [ $(( hi - lo )) -gt 20 ]; do
           mid=$(( (lo + hi) / 2 ))
-          read -r SM _ _ <<< "$(probe_shift "$mid")"
+          local DM
+          read -r SM _ _ mid DM <<< "$(probe_near "$mid" $(( lo + 5 )) $(( hi - 5 )) $(( (hi - lo) / 8 > 5 ? (hi - lo) / 8 : 5 )))"
+          if [ "$DM" != 1 ]; then
+            # Nothing between here can tell the shifts apart, so it scores the same with either:
+            # the change is put in the middle.
+            echo "  -> between ${lo}s and ${hi}s no check can tell the shifts apart; the change is put in the middle (either shift scores the same there)."
+            break
+          fi
           if [ "$SM" = "$a" ]; then lo=$mid
           elif [ "$SM" = "$b" ]; then hi=$mid
           else ok=0; echo "  -> at ${mid}s the shift is ${SM}, neither ${a} nor ${b}: more than one change here."; break; fi
