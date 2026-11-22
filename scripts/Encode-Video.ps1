@@ -89,9 +89,9 @@ param(
 if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
 . (Join-Path $PSScriptRoot 'Shared.ps1')
 $script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
-foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
-foreach ($n in 'Source', 'Output', 'VmafFile', 'TempDir', 'LogPath', 'StatusFile') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly)) }
-foreach ($n in 'NVEncC') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly) -Program) }
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value -WhatIf:$false }
+foreach ($n in 'Source', 'Output', 'VmafFile', 'TempDir', 'LogPath', 'StatusFile') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly)) -WhatIf:$false }
+foreach ($n in 'NVEncC') { Set-Variable -Name $n -Value (Resolve-InputPath (Get-Variable -Name $n -ValueOnly) -Program) -WhatIf:$false }
 
 # 'Continue', not 'Stop': in Windows PowerShell, 2>&1 on a native program raises terminating
 # errors under 'Stop'. Failures are checked explicitly.

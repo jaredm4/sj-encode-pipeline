@@ -50,7 +50,7 @@ function Expand-SettingValue([string]$Value) {
 # Each script, right after its param() block:
 #   . (Join-Path $PSScriptRoot 'Shared.ps1')
 #   $script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
-#   foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
+#   foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value -WhatIf:$false }
 function Get-ScriptSettings {
     param(
         [Parameter(Mandatory)]$Command,

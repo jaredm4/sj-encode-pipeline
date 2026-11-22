@@ -426,7 +426,7 @@ param(
 if (-not [IO.File]::Exists((Join-Path $PSScriptRoot 'Shared.ps1'))) { throw "Shared.ps1 not found next to this script ($PSScriptRoot); keep the scripts together." }
 . (Join-Path $PSScriptRoot 'Shared.ps1')
 $script:SettingsUsed = @(Get-ScriptSettings $MyInvocation.MyCommand $PSBoundParameters)
-foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value }
+foreach ($setting in $script:SettingsUsed) { Set-Variable -Name $setting.Name -Value $setting.Value -WhatIf:$false }
 
 $ErrorActionPreference = 'Stop'
 $started = Get-Date
