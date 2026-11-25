@@ -119,7 +119,9 @@
       keep all their variants for review; after reviewing them, re-run with -UseSourceFallback
       to finish those titles with their source instead (the local copy, or a fresh copy of the
       source, goes through the same steps, and the failed encodes are deleted). For Dolby
-      Vision 7 titles the converted "<name> - p8.1.mkv" is used. A Dolby Vision 7 title's
+      Vision 7 titles the converted "<name> - p8.1.mkv" is used. A baked Dolby Vision 7 title
+      (FEL) with no passing variant is never finished this way: its variants, baked copy and
+      profile 7 copy are all kept for a manual check, even with -UseSourceFallback. A Dolby Vision 7 title's
       p8.1 copy is deleted once it's finished. -NoAudio / -NoSubtitles / -KeepVariants skip
       steps 1 / 2 / 4. Fixed mode (-Variants) never does any of this.
 
@@ -508,9 +510,11 @@ $BatchHelpers = {
         $res
     }
 
+    # -SourceGB: the original's video stream (GB of 10^9 bytes), when compare_encode's "original"
+    # isn't it (a Dolby Vision 7 title scored against its 8.1 copy); Pct is measured against it.
     function Read-VmafResult {
-        param([string[]]$Lines)
-        $r = [ordered]@{ Mean = $null; P1 = $null; Min = $null; VideoGB = $null; SourceGB = $null; Pct = $null; Mbps = $null; Model = ''; Warning = $false; StartFrame = $null }
+        param([string[]]$Lines, [double]$SourceGB = 0)
+        $r = [ordered]@{ Mean = $null; P1 = $null; Min = $null; VideoGB = $null; SourceGB = $null; RefGB = $null; Pct = $null; Mbps = $null; Model = ''; Warning = $false; StartFrame = $null }
         foreach ($l in $Lines) {
             if ($l -match '^\s*pooled\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)') {
                 $r.Mean = [double]$Matches[1]; $r.P1 = [double]$Matches[2]; $r.Min = [double]$Matches[3]
@@ -527,6 +531,10 @@ $BatchHelpers = {
             }
         }
         if ($null -ne $r.P1 -and $r.P1 -le 0) { $r.Warning = $true }
+        if ($SourceGB -gt 0 -and $null -ne $r.VideoGB) {
+            $r.RefGB = $r.SourceGB; $r.SourceGB = [Math]::Round($SourceGB, 2)
+            $r.Pct = [Math]::Round($r.VideoGB / $SourceGB * 100, 1)
+        }
         [pscustomobject]$r
     }
 
@@ -1067,7 +1075,17 @@ $VmafBody = {
             [IO.File]::WriteAllLines($vmafFile, $lines, $script:Utf8)
             if ($r.ExitCode -ne 0) { $row.Error = "compare_encode exit $($r.ExitCode)" }
         }
-        $vm = Read-VmafResult $lines
+        # A Dolby Vision 7 title is scored against its 8.1 copy: its size is measured against the
+        # original's video stream instead (a bake is far bigger, a converted MEL smaller).
+        $srcGB = 0.0
+        if ($Cfg.SizeRef) {
+            $srcGB = Get-SourceVideoGB $Cfg.SizeRef $Cfg.SizeCache $wsl $tmp
+            if ($srcGB -le 0) { Write-Log "WARNING: couldn't measure the original's video stream ($($Cfg.SizeRef)); % of source is against the 8.1 copy VMAF compares with, which can be far off." }
+        }
+        $vm = Read-VmafResult $lines $srcGB
+        if ($srcGB -gt 0 -and $null -ne $vm.RefGB) {
+            Write-Log ("% of source: against the original profile 7 video stream, {0:N2} GB (not the {1:N2} GB 8.1 copy VMAF compares against)" -f $srcGB, $vm.RefGB)
+        }
         foreach ($k in 'Mean', 'P1', 'Min', 'VideoGB', 'Pct', 'Mbps', 'Model', 'Warning', 'StartFrame') { $row | Add-Member -NotePropertyName $k -NotePropertyValue $vm.$k -Force }
         if ($null -eq $row.Mean) {
             if (-not $row.Error) { $row.Error = 'no VMAF score in output' }
@@ -1723,6 +1741,16 @@ function New-Row($spec, [string]$file) {
     }
 }
 
+# A Dolby Vision 7 title's original video stream size (GB of 10^9 bytes), to measure its encodes
+# against (see Get-SourceVideoGB); 0 for every other title, measured against compare_encode's
+# original. Cached in "<name>.source-size.json".
+function Get-TitleSourceGB($t) {
+    if ($t.IsDerived) { return 0.0 }
+    if (-not $t.Info) { try { $t.Info = Get-SourceInfo $t.File } catch { return 0.0 } }
+    if ($t.Info.Dv -ne 'P7') { return 0.0 }
+    Get-SourceVideoGB $t.File (Join-Path $t.TitleDir "$($t.Base).source-size.json") $wsl $tempDir
+}
+
 # A variant is finished when its encode exists and (unless -SkipVmaf) its .vmaf.txt has a score.
 # Returns the row for a finished variant, or $null.
 function Get-FinishedRow($t, $spec) {
@@ -1733,7 +1761,7 @@ function Get-FinishedRow($t, $spec) {
     if ($SkipVmaf) { $row.Status = 'Done'; return $row }
     $vf = Join-Path $vdir "$($t.Base).vmaf.txt"
     if (-not [IO.File]::Exists($vf)) { return $null }
-    $vm = Read-VmafResult ([IO.File]::ReadAllLines($vf))
+    $vm = Read-VmafResult ([IO.File]::ReadAllLines($vf)) (Get-TitleSourceGB $t)
     if ($null -eq $vm.Mean) { return $null }
     foreach ($k in 'Mean', 'P1', 'Min', 'VideoGB', 'Pct', 'Mbps', 'Model', 'Warning', 'StartFrame') { $row | Add-Member -NotePropertyName $k -NotePropertyValue $vm.$k -Force }
     $row.Status = 'Done'
@@ -2249,6 +2277,18 @@ function Request-FinalizeP7($t, [string]$p7copy, [string]$why) {
     $t.Finalize = 'pending'
 }
 
+# A baked Dolby Vision 7 title (an FEL): with no passing rung it's never finished from "its
+# source", which would be the baked 8.1 copy (several times the original's size, and hours to
+# make again). Its variants, baked copy and profile 7 copy are all kept for a manual check,
+# even with -UseSourceFallback.
+function Test-BakedTitle($t) {
+    if ($t.IsDerived) { return $false }
+    if ([IO.File]::Exists((Get-WorkFile $t ' - baked.mkv'))) { return $true }
+    $dj = Join-Path $t.TitleDir "$($t.Base).dovi.json"
+    if ([IO.File]::Exists($dj)) { try { return ([string]([IO.File]::ReadAllText($dj) | ConvertFrom-Json).Decision -eq 'bake') } catch { } }
+    $false
+}
+
 # -UseSourceFallback: finish a title that has no passing variant with its source instead.
 function Request-FinalizeSource($t, $rows) {
     $p81 = Get-WorkFile $t ' - p8.1.mkv'
@@ -2306,10 +2346,14 @@ function Complete-Title($t) {
     Add-LogText $t.LogPath (($lines -join "`r`n") + "`r`n")
     [IO.File]::WriteAllText((Join-Path $t.TitleDir "$($t.Base).results.json"), ($res | ConvertTo-Json -Depth 5), $script:Utf8)
     if ($finishing -and $sugg) { Request-Finalize $t $rows $sugg }
-    elseif ($finishing -and $UseSourceFallback -and -not $fixedMode -and -not $SkipVmaf -and $done) { Request-FinalizeSource $t $rows }
+    elseif ($finishing -and $UseSourceFallback -and -not $fixedMode -and -not $SkipVmaf -and $done -and -not (Test-BakedTitle $t)) { Request-FinalizeSource $t $rows }
     else {
         if ($st -eq 'Done') { $t.Resolved = $(if ($fixedMode) { 'Done (fixed variants)' } elseif ($sugg) { 'Searched (finishing off)' } elseif ($SkipVmaf) { 'Encoded (no VMAF)' } else { 'No variant passed' }) }
-        if ($finishing -and -not $SkipVmaf) { Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  No suggested variant: all variants kept for review.`r`n" -f (Get-Date)) }
+        if ($finishing -and -not $SkipVmaf -and -not $sugg -and $done -and (Test-BakedTitle $t)) {
+            $why = "Baked Dolby Vision 7 with no passing rung: left as it is for a manual check (variants, the baked copy and the profile 7 copy all kept$(if ($UseSourceFallback) { '; -UseSourceFallback doesn''t apply to baked titles' }))."
+            Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  {1}`r`n" -f (Get-Date), $why)
+            Write-Log "$($t.Rel): $why" 'Yellow'
+        } elseif ($finishing -and -not $SkipVmaf) { Add-LogText $t.LogPath ("{0:yyyy-MM-dd HH:mm:ss}  No suggested variant: all variants kept for review.`r`n" -f (Get-Date)) }
         Remove-LocalCopy $t $(if ($sugg) { 'title finished' } else { 'title finished without a suggested variant' })
     }
 
@@ -2373,6 +2417,8 @@ function Start-Variant($t, $task, [int]$slot, [string]$kind) {
         BaseName = $t.Base; TitleDir = $t.TitleDir; LogPath = $t.LogPath; StatusFile = $statusFile; TempDir = $tempDir
         Info = $(if ($t.Prep.PSObject.Properties['EncodeInfo'] -and $t.Prep.EncodeInfo) { $t.Prep.EncodeInfo } else { $t.Info })
         WorkSrc = $t.Prep.WorkSrc; IsDv81 = $t.Prep.IsDv81; Crop = $t.Prep.Crop
+        SizeRef = $(if (-not $t.IsDerived -and $t.Info -and $t.Info.Dv -eq 'P7') { [string]$t.File } else { '' })
+        SizeCache = (Join-Path $t.TitleDir "$($t.Base).source-size.json")
         Variant = $task.Spec; Index = $task.Index; Count = @($t.Tasks).Count; Label = (Get-TaskLabel $t $task)
         Decoder = $Decoder; NVEncC = $NVEncC; Wsl = $wsl; SkipVmaf = [bool]$SkipVmaf; EncodeVideo = $EncodeVideo
     }
@@ -2420,7 +2466,7 @@ function Get-NextPrepTitle([switch]$DoviOnly) {
             for ($i = 0; $i -lt $specs.Count; $i++) { $fr = Get-FinishedRow $t $specs[$i]; if ($fr) { $tried[$i] = $fr } }
             if ($tried.Count -and (Get-LadderStepFor $tried @() $t.Folder $t.Base @{}) -eq -2) {
                 $best = Set-Suggestion -Rows @($tried.Values) -MinMean $MinMean -MinP1 $MinP1 -MinMin $MinMin -MaxPct $MaxPct -TargetPct $TargetPct -TopMean $TopMean -TopP1 $TopP1 -TopMin $TopMin
-                if (($best -or $UseSourceFallback) -and $finishing) {
+                if (($best -or ($UseSourceFallback -and -not (Test-BakedTitle $t))) -and $finishing) {
                     # Searched by an earlier run but not finished: finish it now (no prep needed);
                     # with -UseSourceFallback, titles where nothing passed are finished with the source.
                     $tasks = @(); foreach ($k in @($tried.Keys | Sort-Object)) { $tasks += [pscustomobject]@{ Spec = $specs[$k]; Rung = [int]$k; Index = $tasks.Count + 1; State = 'done'; Row = $tried[$k] } }

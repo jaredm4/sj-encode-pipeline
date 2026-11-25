@@ -359,6 +359,55 @@ eb_ensure_visible() {
     }
 }
 
+# The size of a file's (first) video stream, in GB of 10^9 bytes (the unit compare_encode
+# reports in). A Dolby Vision 7 title is scored against a converted or baked 8.1 copy, whose
+# size has nothing to do with the original's (a bake can be 3-4x bigger, a converted MEL
+# smaller), so its "% of source" is measured against this instead. From mediainfo's StreamSize
+# (read from the container's index, near-instant): Windows' mediainfo, else WSL's; else an
+# ffmpeg stream copy in WSL (exact, but reads the whole file). Cached in -CacheFile while the
+# file is unchanged. 0 if it can't be measured.
+function Get-SourceVideoGB([string]$Path, [string]$CacheFile = '', $Wsl = $null, [string]$TempDir = [IO.Path]::GetTempPath()) {
+    if (-not $Path -or -not [IO.File]::Exists($Path)) { return 0.0 }
+    $len = (New-Object IO.FileInfo $Path).Length
+    if ($CacheFile -and [IO.File]::Exists($CacheFile)) {
+        try {
+            $c = [IO.File]::ReadAllText($CacheFile) | ConvertFrom-Json
+            if ([string]$c.Path -eq $Path -and [int64]$c.Length -eq $len -and [int64]$c.VideoBytes -gt 0) { return [double]$c.VideoBytes / 1e9 }
+        } catch { }
+    }
+    $bytes = [int64]0; $how = ''
+    if (Get-Command mediainfo -ErrorAction SilentlyContinue) {
+        try {
+            $o = @(& mediainfo '--Output=Video;%StreamSize%\n' $Path 2>$null) | Where-Object { "$_".Trim() } | Select-Object -First 1
+            if ("$o" -match '^\s*(\d+)\s*$') { $bytes = [int64]$Matches[1]; $how = 'mediainfo' }
+        } catch { }
+    }
+    if ($bytes -le 0 -and $Wsl) {
+        $w = ConvertTo-WslPath $Path $Wsl.MountRoot
+        $body = (@'
+f=__F__
+b=$(mediainfo --Output='Video;%StreamSize%\n' "$f" 2>/dev/null | head -1 | tr -dc 0-9)
+how=mediainfo
+if [ -z "$b" ]; then
+  how='ffmpeg stream copy'
+  k=$(ffmpeg -hide_banner -nostdin -i "$f" -map 0:v:0 -c copy -f null - 2>&1 | grep -oE 'video:[0-9]+ ?[kK]i?B' | tail -1 | grep -oE '[0-9]+')
+  [ -n "$k" ] && b=$(( k * 1024 ))
+fi
+echo "EB_VIDEO_BYTES=${b:-0} ($how)"
+'@).Replace('__F__', (ConvertTo-BashQuoted $w))
+        try {
+            $r = Invoke-Wsl -Wsl $Wsl -TempDir $TempDir -NeedPaths @($w) -Body $body -Quiet
+            $m = @($r.Lines | Where-Object { $_ -match '^EB_VIDEO_BYTES=(\d+) \((.+)\)' }) | Select-Object -Last 1
+            if ($m -and $m -match '^EB_VIDEO_BYTES=(\d+) \((.+)\)') { $bytes = [int64]$Matches[1]; $how = "$($Matches[2]) in WSL" }
+        } catch { }
+    }
+    if ($bytes -le 0) { return 0.0 }
+    if ($CacheFile) {
+        try { [IO.File]::WriteAllText($CacheFile, ([ordered]@{ Path = $Path; Length = $len; VideoBytes = $bytes; How = $how; Time = (Get-Date).ToString('s') } | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false))) } catch { }
+    }
+    [double]$bytes / 1e9
+}
+
 # ffprobe (+ mediainfo when available) summary of the first video stream.
 function Get-SourceInfo {
     param([string]$Path)
